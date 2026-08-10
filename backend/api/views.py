@@ -1,0 +1,1364 @@
+import threading
+from datetime import date
+
+from django.utils import timezone
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+
+from core.models import Sector, Candle, Study, Trade, ScanResult, StudySectorResult, TrendStudy, StockDrilldown
+from api.serializers import (
+    SectorSerializer, ScanResultSerializer, StudySerializer, TradeSerializer, CandleSerializer
+)
+
+
+class SectorListView(APIView):
+    def get(self, request):
+        sectors = Sector.objects.all()
+        return Response(SectorSerializer(sectors, many=True).data)
+
+
+class ScanView(APIView):
+    def get(self, request):
+        interval = request.query_params.get("interval", "1d")
+        force = request.query_params.get("force", "false") == "true"
+
+        results = ScanResult.objects.filter(interval=interval).select_related("sector")
+
+        if not results.exists() or force:
+            # Trigger computation
+            from api.tasks import compute_scan
+            compute_scan(interval)
+            results = ScanResult.objects.filter(interval=interval).select_related("sector")
+
+        data = ScanResultSerializer(results.order_by("-rsi_spread" if results.exists() else "id"), many=True).data
+
+        spy_vals = {}
+        if data:
+            spy_vals = {
+                "spy_sortino": data[0].get("spy_sortino"),
+                "spy_omega": data[0].get("spy_omega"),
+                "spy_cvar": data[0].get("spy_cvar"),
+                "spy_ulcer": data[0].get("spy_ulcer"),
+            }
+
+        bullish_count = sum(1 for r in data if r.get("bullish"))
+
+        return Response({
+            **spy_vals,
+            "total": len(data),
+            "bullish": bullish_count,
+            "sectors": data,
+            "cached_at": results.first().computed_at.isoformat() if results.exists() else None,
+        })
+
+
+class DrilldownView(APIView):
+    def get(self, request, sector_name):
+        from api.tasks import compute_drilldown
+        sector = Sector.objects.filter(name__icontains=sector_name).first()
+        if not sector:
+            return Response({"error": f"Sector '{sector_name}' not found"}, status=404)
+
+        result = compute_drilldown(sector)
+        return Response(result)
+
+
+class ChartView(APIView):
+    def get(self, request, ticker):
+        from api.tasks import get_chart_data
+        interval = request.query_params.get("interval", "1d")
+        sector_etf = request.query_params.get("sector_etf")
+        period = request.query_params.get("period", "5y")
+
+        result = get_chart_data(ticker.upper(), interval, sector_etf, period)
+        if result is None:
+            return Response({"error": "Ticker not found"}, status=404)
+        return Response(result)
+
+
+class StudyListView(APIView):
+    def get(self, request):
+        """Serve studies from database."""
+        studies = Study.objects.filter(is_computed=True)
+        data = StudySerializer(studies, many=True).data
+        return Response({
+            "total_studies": len(data),
+            "studies": data,
+        })
+
+
+class StudyTradesView(APIView):
+    def get(self, request, study_id):
+        sig_key = request.query_params.get("signal")
+        exit_key = request.query_params.get("exit")
+        sector_filter = request.query_params.get("sector")
+
+        # Find study by ID or signal+exit keys
+        study = None
+        if sig_key and exit_key:
+            study = Study.objects.filter(signal_key=sig_key, exit_key=exit_key).first()
+        if not study:
+            try:
+                study = Study.objects.get(id=study_id)
+            except Study.DoesNotExist:
+                return Response({"error": "Study not found"}, status=404)
+
+        # Check if trades exist in DB
+        from django.db.models import Q
+        qs = Trade.objects.filter(study=study).select_related("sector")
+        if sector_filter:
+            qs = qs.filter(Q(etf=sector_filter) | Q(sector__name=sector_filter))
+        db_count = qs.count()
+
+        if db_count > 0:
+            trades = qs.order_by("-entry_date")
+            return Response({
+                "study_id": study.id,
+                "study_name": study.name,
+                "total_trades": db_count,
+                "trades": TradeSerializer(trades, many=True).data,
+            })
+
+        # Compute on-the-fly using the studies module
+        try:
+            import studies as studies_mod
+            if study.signal_key not in studies_mod.SIGNALS or study.exit_key not in studies_mod.EXITS:
+                return Response({"error": "Invalid signal/exit"}, status=400)
+
+            _, sig_fn = studies_mod.SIGNALS[study.signal_key]
+            _, exit_fn = studies_mod.EXITS[study.exit_key]
+
+            from api.tasks import _get_df, _get_dfs
+
+            # Load SPY for alpha comparison (vectorized dict build — was a row-by-row iterrows()).
+            spy_df = _get_df("SPY")
+            spy_close = {}
+            if spy_df is not None:
+                spy_close = dict(zip(spy_df.index.strftime("%Y-%m-%d"),
+                                     spy_df["Close"].astype(float)))
+
+            # Pre-compute regime lookup
+            regime_data = {}
+            try:
+                import rates as rates_mod
+                import market_regime
+                r = rates_mod.get_rates()
+                m = market_regime.get_market_data()
+                if len(r) > 0:
+                    regime_data['regime'] = r["regime"].astype(str) if "regime" in r.columns else None
+                    regime_data['curve'] = r["curve"].astype(str) if "curve" in r.columns else None
+                if len(m) > 0:
+                    regime_data['vix'] = m["vix_regime"].astype(str) if "vix_regime" in m.columns else None
+                    regime_data['spy'] = m["spy_trend"].astype(str) if "spy_trend" in m.columns else None
+            except Exception:
+                pass
+
+            def _get_regime(date):
+                res = {}
+                for key, series in regime_data.items():
+                    if series is not None:
+                        match = series[series.index <= date]
+                        if len(match) > 0:
+                            res[key] = str(match.iloc[-1])
+                month = date.month if hasattr(date, 'month') else int(str(date)[5:7])
+                res['season'] = 'NOV_APR' if month >= 11 or month <= 4 else 'MAY_OCT'
+                return res
+
+            trades = []
+            sectors = list(Sector.objects.all())
+            if sector_filter:
+                sectors = [s for s in sectors if s.etf == sector_filter or s.name == sector_filter]
+            # Bulk-load every sector ETF in ONE query (was an N+1: _get_df per sector).
+            sector_dfs = _get_dfs([s.etf for s in sectors])
+
+            for sector in sectors:
+                df = sector_dfs.get(sector.etf)
+                if df is None or len(df) < 60:
+                    continue
+                try:
+                    signals = sig_fn(df).fillna(False)
+                except Exception:
+                    continue
+
+                close = df["Close"].values
+                n = len(close)
+                for entry_date in signals[signals].index:
+                    idx = df.index.get_loc(entry_date)
+                    exit_idx = exit_fn(df, idx)
+                    if exit_idx is None or exit_idx <= idx or exit_idx >= n:
+                        continue
+                    ep = float(close[idx])
+                    if ep <= 0:
+                        continue
+                    xp = float(close[exit_idx])
+                    ret = (xp - ep) / ep * 100
+
+                    # Detect ongoing: exit is last bar or hit max_hold boundary
+                    ongoing = (exit_idx >= n - 1) or (exit_idx - idx >= 60 and exit_idx == min(idx + 90, n - 1))
+
+                    # Per-trade peak, drawdown, and 90d return
+                    max_look = min(idx + 90, n - 1)
+                    peak_ret = 0
+                    peak_day = 0
+                    max_drawdown = 0
+                    running_peak = ep
+                    for d in range(1, exit_idx - idx + 1):
+                        p = float(close[idx + d])
+                        r = (p - ep) / ep * 100
+                        if r > peak_ret:
+                            peak_ret = r
+                            peak_day = d
+                        if p > running_peak:
+                            running_peak = p
+                        dd = (p - running_peak) / running_peak * 100
+                        if dd < max_drawdown:
+                            max_drawdown = dd
+                    for d in range(exit_idx - idx + 1, max_look - idx + 1):
+                        r = (float(close[idx + d]) - ep) / ep * 100
+                        if r > peak_ret:
+                            peak_ret = r
+                            peak_day = d
+                    ret_90d = None
+                    if idx + 90 < n:
+                        ret_90d = round((float(close[idx + 90]) - ep) / ep * 100, 2)
+
+                    # SPY return for same period
+                    entry_d = str(entry_date)[:10]
+                    exit_d = str(df.index[exit_idx])[:10]
+                    spy_entry = spy_close.get(entry_d)
+                    spy_exit = spy_close.get(exit_d)
+                    spy_ret = round((spy_exit - spy_entry) / spy_entry * 100, 3) if spy_entry and spy_exit and spy_entry > 0 else None
+                    alpha = round(ret - spy_ret, 3) if spy_ret is not None else None
+
+                    trade_rec = {
+                        "sector": sector.name,
+                        "etf": sector.etf,
+                        "entry_date": entry_d,
+                        "exit_date": exit_d,
+                        "entry_price": round(ep, 2),
+                        "exit_price": round(xp, 2),
+                        "return_pct": round(ret, 3),
+                        "hold_days": exit_idx - idx,
+                        "peak_day": peak_day,
+                        "peak_ret": round(peak_ret, 2),
+                        "ret_90d": ret_90d,
+                        "max_drawdown": round(max_drawdown, 2),
+                        "ongoing": ongoing,
+                        "spy_ret": spy_ret,
+                        "alpha": alpha,
+                    }
+                    trade_rec.update(_get_regime(entry_date))
+                    trades.append(trade_rec)
+
+            trades.sort(key=lambda x: x["entry_date"], reverse=True)
+            return Response({
+                "study_id": study.id,
+                "study_name": study.name,
+                "total_trades": len(trades),
+                "trades": trades,
+            })
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+
+class RegimeView(APIView):
+    def get(self, request):
+        """Return current market regime data."""
+        try:
+            import rates as rates_mod
+            import market_regime
+            r = rates_mod.get_rates()
+            m = market_regime.get_market_data()
+            last_r = r.iloc[-1] if len(r) > 0 else {}
+            last_m = m.iloc[-1] if len(m) > 0 else {}
+            return Response({
+                "rate_3m": round(float(last_r.get("rate_3m", 0)), 2),
+                "rate_10y": round(float(last_r.get("rate_10y", 0)), 2),
+                "regime": str(last_r.get("regime", "?")),
+                "curve": str(last_r.get("curve", "?")),
+                "rate_trend": str(last_r.get("rate_trend", "?")),
+                "vix": round(float(last_m.get("vix", 0)), 1),
+                "vix_regime": str(last_m.get("vix_regime", "?")),
+                "spy_trend": str(last_m.get("spy_trend", "?")),
+                "season": str(last_m.get("sell_in_may", "?")),
+            })
+        except Exception as e:
+            return Response({"error": str(e)})
+
+
+class RegimeHistoryView(APIView):
+    def get(self, request):
+        """Return historical regime data + SPY for documentation charts."""
+        try:
+            import rates as rates_mod
+            import market_regime
+            import data_fetcher
+            import numpy as np
+
+            r = rates_mod.get_rates()
+            m = market_regime.get_market_data()
+            spy_data = data_fetcher.fetch_tickers(["SPY"], "5y", "1d")
+            spy_df = spy_data.get("SPY")
+
+            points = []
+            if spy_df is not None and len(r) > 0:
+                # Merge rate data with SPY
+                for i, (date, row) in enumerate(spy_df.iterrows()):
+                    d = str(date)[:10]
+                    rec = {
+                        "date": d,
+                        "spy": round(float(row["Close"]), 2),
+                    }
+                    # Find matching rate data
+                    rate_row = r[r.index <= date]
+                    if len(rate_row) > 0:
+                        lr = rate_row.iloc[-1]
+                        rec["rate_3m"] = round(float(lr.get("rate_3m", 0)), 2) if lr.get("rate_3m") == lr.get("rate_3m") else None
+                        rec["rate_10y"] = round(float(lr.get("rate_10y", 0)), 2) if lr.get("rate_10y") == lr.get("rate_10y") else None
+                        rec["regime"] = str(lr.get("regime", ""))
+                        rec["curve"] = str(lr.get("curve", ""))
+
+                    # Find matching market data
+                    mkt_row = m[m.index <= date]
+                    if len(mkt_row) > 0:
+                        lm = mkt_row.iloc[-1]
+                        vix_val = lm.get("vix", 0)
+                        rec["vix"] = round(float(vix_val), 1) if vix_val == vix_val else None
+                        rec["vix_regime"] = str(lm.get("vix_regime", ""))
+                        rec["spy_trend"] = str(lm.get("spy_trend", ""))
+
+                    # Season
+                    month = date.month if hasattr(date, 'month') else int(d[5:7])
+                    rec["season"] = "NOV_APR" if month >= 11 or month <= 4 else "MAY_OCT"
+
+                    points.append(rec)
+
+            return Response({"data": points})
+        except Exception as e:
+            return Response({"error": str(e)})
+
+
+class FundamentalsView(APIView):
+    def get(self, request, ticker):
+        """Return fundamental data for a ticker."""
+        from core.models import Fundamental
+        fundamentals = Fundamental.objects.filter(ticker=ticker.upper()).order_by('-date')
+        if not fundamentals.exists():
+            return Response({"error": "No fundamentals found"}, status=404)
+        latest = fundamentals.first()
+        fields = {}
+        for f in latest._meta.get_fields():
+            if f.name in ('id',):
+                continue
+            val = getattr(latest, f.name, None)
+            if val is not None:
+                fields[f.name] = val
+        # Convert date
+        if 'date' in fields:
+            fields['date'] = str(fields['date'])
+        return Response(fields)
+
+
+class FundamentalsListView(APIView):
+    def get(self, request):
+        """Return latest fundamentals for all tickers."""
+        from core.models import Fundamental
+        FIELDS = ['ticker', 'date', 'eps', 'forward_eps', 'pe_ratio', 'forward_pe', 'market_cap',
+                  'dividend_yield', 'revenue_growth', 'profit_margin', 'debt_to_equity',
+                  'short_ratio', 'short_pct_float', 'insider_pct', 'institution_pct',
+                  'analyst_rating', 'analyst_target', 'float_shares', 'shares_outstanding',
+                  'beta_5y', 'sector', 'industry', 'free_cash_flow', 'book_value']
+        # ONE query, newest-first, keep the first (latest) row per ticker. Was an N+1: a group-by
+        # for the latest date, then a .first() per ticker → ~1000 round-trips per request.
+        import math
+        result = []
+        seen = set()
+        for row in Fundamental.objects.order_by('ticker', '-date').values(*FIELDS):
+            tk = row['ticker']
+            if tk in seen:
+                continue
+            seen.add(tk)
+            row['date'] = str(row['date'])
+            # Sanitize non-finite floats (inf/-inf/nan) — some stored ratios are inf and would
+            # raise "Out of range float values are not JSON compliant" on serialization.
+            for k, v in row.items():
+                if isinstance(v, float) and not math.isfinite(v):
+                    row[k] = None
+            result.append(row)
+        return Response({'fundamentals': result, 'total': len(result)})
+
+
+class TrendStudyListView(APIView):
+    def get(self, request):
+        """Return all trend study results. Optional ?mode=etf|momentum|hibeta filter."""
+        studies = TrendStudy.objects.all()
+        mode = request.GET.get("mode")
+        if mode:
+            studies = studies.filter(hold_mode=mode)
+        data = []
+        for s in studies:
+            data.append({
+                "id": s.id,
+                "lookback_months": s.lookback_months,
+                "hold_months": s.hold_months,
+                "top_n": s.top_n,
+                "hold_mode": s.hold_mode,
+                "total_return": s.total_return,
+                "annual_return": s.annual_return,
+                "spy_total": s.spy_total,
+                "alpha": s.alpha,
+                "max_drawdown": s.max_drawdown,
+                "num_trades": s.num_trades,
+                "win_rate": s.win_rate,
+            })
+        # .order_by() clears the model's default ordering, else it pollutes DISTINCT.
+        modes = sorted(TrendStudy.objects.order_by().values_list("hold_mode", flat=True).distinct())
+        return Response({"total": len(data), "strategies": data, "modes": modes})
+
+
+class TrendStudyDetailView(APIView):
+    def get(self, request, study_id):
+        """Return a single trend study with full equity curve and trade log."""
+        try:
+            s = TrendStudy.objects.get(id=study_id)
+        except TrendStudy.DoesNotExist:
+            return Response({"error": "Not found"}, status=404)
+        return Response({
+            "id": s.id,
+            "lookback_months": s.lookback_months,
+            "hold_months": s.hold_months,
+            "top_n": s.top_n,
+            "hold_mode": s.hold_mode,
+            "total_return": s.total_return,
+            "annual_return": s.annual_return,
+            "spy_total": s.spy_total,
+            "alpha": s.alpha,
+            "max_drawdown": s.max_drawdown,
+            "num_trades": s.num_trades,
+            "win_rate": s.win_rate,
+            "equity_curve": s.equity_curve,
+            "spy_curve": s.spy_curve,
+            "trade_log": s.trade_log,
+        })
+
+
+class StockDrilldownListView(APIView):
+    def get(self, request):
+        """Return stock drilldown results for top indicator studies."""
+        drilldowns = StockDrilldown.objects.select_related('study').all()
+        data = []
+        for d in drilldowns:
+            data.append({
+                "id": d.id,
+                "study_id": d.study.id,
+                "study_name": d.study.name,
+                "signal": d.study.signal_key,
+                "signal_name": d.study.signal_name,
+                "exit": d.study.exit_key,
+                "exit_name": d.study.exit_name,
+                "category": d.study.category,
+                "etf_avg_return": d.etf_avg_return,
+                "stock_trades": d.stock_trades,
+                "stock_avg_return": d.stock_avg_return,
+                "stock_win_rate": d.stock_win_rate,
+                "alpha_vs_etf": d.alpha_vs_etf,
+                "stock_max_drawdown": d.stock_max_drawdown,
+                "best_stocks": d.best_stocks,
+                "worst_stocks": d.worst_stocks,
+            })
+        return Response({"total": len(data), "drilldowns": data})
+
+
+class RefreshView(APIView):
+    def get(self, request):
+        ScanResult.objects.all().delete()
+        return Response({"status": "cleared"})
+
+
+class ImportCandlesView(APIView):
+    def post(self, request):
+        """Trigger Yahoo Finance data import in background."""
+        from api.tasks import import_candles_task
+        thread = threading.Thread(target=import_candles_task, daemon=True)
+        thread.start()
+        return Response({"status": "import started"})
+
+
+class RunStudiesView(APIView):
+    def post(self, request):
+        """Trigger study computation in background (multithreaded)."""
+        from api.tasks import run_studies_task
+        thread = threading.Thread(target=run_studies_task, daemon=True)
+        thread.start()
+        return Response({"status": "studies started"})
+
+
+import json as _json
+import os as _os
+
+STOCK_STUDIES_PATH = "/app/.data/studies/stock_studies_all.json"
+
+
+class StockStudiesView(APIView):
+    """Serve the all-on-all stock studies sweep (every signal × exit over ~1035 stocks,
+    with fundamental-bucket breakdowns). GET reads the JSON the sweep writes; POST
+    triggers a fresh sweep in the background."""
+
+    def get(self, request):
+        from core.models import StockStudy
+        p = request.query_params
+        category = p.get("category")
+        signal = p.get("signal")
+        exit_key = p.get("exit")
+        try:
+            min_trades = int(p.get("min_trades")) if p.get("min_trades") else None
+        except ValueError:
+            min_trades = None
+        try:
+            limit = int(p.get("limit", 500))
+        except (TypeError, ValueError):
+            limit = 500
+
+        # Which dimensions are point-in-time vs snapshot-only (for UI badging). Derived
+        # from the single source of truth (DIMENSIONS); {} if the module can't import.
+        try:
+            from seq_fundamental_study import DIMENSIONS
+            dimension_meta = {d[0]: {"pit": bool(d[4])} for d in DIMENSIONS}
+        except Exception:
+            dimension_meta = {}
+
+        # Prefer Postgres (StockStudy); fall back to the JSON cache if the table is empty.
+        qs = StockStudy.objects.all()
+        n_results = qs.count()  # single query; also serves as the "is it computed" check
+        if n_results:
+            # DB-level DISTINCT (don't pull 23k category strings into Python). Clear the
+            # model's default -avg_return ordering so DISTINCT keys on category alone.
+            categories = sorted(qs.order_by().values_list("category", flat=True).distinct())
+            # Metadata from one lightweight row (values(), not a full model instance).
+            meta = qs.order_by("-computed_at").values("universe_size", "computed_at").first()
+            fq = qs
+            if category:
+                fq = fq.filter(category=category)
+            if signal:
+                fq = fq.filter(signal_key=signal)
+            if exit_key:
+                fq = fq.filter(exit_key=exit_key)
+            if min_trades:
+                fq = fq.filter(total_trades__gte=min_trades)
+            # .values() → dicts, skips model instantiation for the (up to `limit`) rows.
+            rows = fq.order_by("-avg_return").values(
+                "signal_key", "signal_name", "exit_key", "exit_name", "category",
+                "total_trades", "avg_return", "win_rate", "avg_hold", "avg_mae", "clean_pct",
+                "by_dimension")[:limit]
+            results = [{
+                "signal_key": r["signal_key"], "signal_name": r["signal_name"],
+                "exit_key": r["exit_key"], "exit_name": r["exit_name"],
+                "category": r["category"], "trades": r["total_trades"],
+                "avg_return": r["avg_return"], "win_rate": r["win_rate"],
+                "avg_hold": r["avg_hold"], "avg_mae": r["avg_mae"], "clean_pct": r["clean_pct"],
+                "by_dimension": r["by_dimension"] or {},
+            } for r in rows]
+            computed_at = meta["computed_at"] if meta else None
+            return Response({
+                "computed": True, "source": "db",
+                "universe_size": meta["universe_size"] if meta else None,
+                "n_signals": None, "n_exits": None,
+                "n_results": n_results, "categories": categories,
+                "computed_at": computed_at.isoformat() if computed_at else None,
+                "returned": len(results), "results": results,
+                "dimension_meta": dimension_meta,
+            })
+
+        # ── JSON fallback ──
+        if not _os.path.exists(STOCK_STUDIES_PATH):
+            return Response({
+                "computed": False, "results": [], "n_results": 0,
+                "message": "Stock studies not computed yet. POST to this endpoint to run the sweep.",
+            })
+        with open(STOCK_STUDIES_PATH) as f:
+            payload = _json.load(f)
+        results = payload.get("results", [])
+        if category:
+            results = [r for r in results if r.get("category") == category]
+        if signal:
+            results = [r for r in results if r.get("signal_key") == signal]
+        if exit_key:
+            results = [r for r in results if r.get("exit_key") == exit_key]
+        if min_trades:
+            results = [r for r in results if r.get("trades", 0) >= min_trades]
+        categories = sorted({r.get("category", "Other") for r in payload.get("results", [])})
+        computed_at = None
+        try:
+            computed_at = timezone.datetime.fromtimestamp(
+                _os.path.getmtime(STOCK_STUDIES_PATH), tz=timezone.get_current_timezone()
+            ).isoformat()
+        except Exception:
+            pass
+        return Response({
+            "computed": True, "source": "json",
+            "universe_size": payload.get("universe_size"),
+            "n_signals": payload.get("n_signals"), "n_exits": payload.get("n_exits"),
+            "n_results": payload.get("n_results"), "categories": categories,
+            "computed_at": computed_at,
+            "returned": min(len(results), limit), "results": results[:limit],
+            "dimension_meta": dimension_meta,
+        })
+
+    def post(self, request):
+        """Kick off a fresh all-on-all sweep in the background."""
+        from api.tasks import run_stock_studies_task
+        thread = threading.Thread(target=run_stock_studies_task, daemon=True)
+        thread.start()
+        return Response({"status": "stock studies sweep started"})
+
+
+class LiveSignalsView(APIView):
+    """Serve the 'firing now' scan: stocks currently triggering a top signal, with the
+    signal's historical edge + fundamentals + sector. GET reads LiveSignal (server-side
+    filters); POST triggers a fresh scan in the background."""
+
+    def get(self, request):
+        from core.models import LiveSignal
+        p = request.query_params
+        qs = LiveSignal.objects.all()
+        n_total = qs.count()
+        if not n_total:
+            return Response({"computed": False, "results": [], "message":
+                             "No firing scan yet. POST to run it (needs stock studies first)."})
+        signal = p.get("signal")
+        sector = p.get("sector")
+        try:
+            max_days = int(p["max_days"]) if p.get("max_days") else None
+        except ValueError:
+            max_days = None
+        try:
+            limit = int(p.get("limit", 500))
+        except (TypeError, ValueError):
+            limit = 500
+        if signal:
+            qs = qs.filter(signal_key=signal)
+        if max_days is not None:
+            qs = qs.filter(days_ago__lte=max_days)
+        if sector:
+            qs = qs.filter(sectors__contains=sector)
+        signals = sorted(LiveSignal.objects.order_by().values_list("signal_key", flat=True).distinct())
+        meta = LiveSignal.objects.order_by("-computed_at").values("computed_at").first()
+        rows = qs.order_by("days_ago", "-hist_avg_return").values(
+            "ticker", "signal_key", "signal_name", "days_ago", "last_close",
+            "best_exit_key", "hist_avg_return", "hist_win_rate", "hist_trades",
+            "hist_avg_mae", "hist_clean_pct",
+            "market_cap", "pe_ratio", "forward_pe", "profit_margin", "fund_buckets", "sectors",
+            "insider_buy_90d", "recent_13d", "recent_13g")[:limit]
+        computed_at = meta["computed_at"] if meta else None
+        import math
+        def _finite(v):
+            return None if (isinstance(v, float) and not math.isfinite(v)) else v
+        clean = [{k: _finite(v) for k, v in r.items()} for r in rows]
+        return Response({
+            "computed": True, "n_firing": n_total, "signals": signals,
+            "computed_at": computed_at.isoformat() if computed_at else None,
+            "returned": min(n_total, limit), "results": clean,
+        })
+
+    def post(self, request):
+        from api.tasks import run_live_firing_task
+        thread = threading.Thread(target=run_live_firing_task, daemon=True)
+        thread.start()
+        return Response({"status": "firing scan started"})
+
+
+class NewsHorizonSignalsView(APIView):
+    """Serve the news-horizon scan: recent material news joined to the horizon-conditioned drift
+    we measured for its TYPE. Only the FADES are robustness-validated (earnings-beat / product /
+    strong-bullish-pop, mid/small caps); the rest are WATCH. GET reads NewsHorizonSignal
+    (server-side filters); POST triggers a fresh scan in the background."""
+
+    def get(self, request):
+        from core.models import NewsHorizonSignal
+        import math
+        p = request.query_params
+        qs = NewsHorizonSignal.objects.all()
+        n_total = qs.count()
+        if not n_total:
+            return Response({"computed": False, "results": [], "message":
+                             "No news-horizon scan yet. POST to run it (needs classified news)."})
+        if p.get("stance"):
+            qs = qs.filter(stance=p["stance"].upper())
+        if p.get("robust") in ("1", "true", "True"):
+            qs = qs.filter(robust=True)
+        if p.get("cat"):
+            qs = qs.filter(cat=p["cat"])
+        if p.get("horizon"):
+            qs = qs.filter(horizon=p["horizon"])
+        if p.get("sector"):
+            qs = qs.filter(sectors__contains=p["sector"])
+        try:
+            limit = int(p.get("limit", 500))
+        except (TypeError, ValueError):
+            limit = 500
+        cats = sorted(NewsHorizonSignal.objects.order_by().values_list("cat", flat=True).distinct())
+        meta = NewsHorizonSignal.objects.order_by("-computed_at").values("computed_at").first()
+        rows = qs.order_by("-robust", "days_left", "-impact").values(
+            "ticker", "news_date", "cat", "direction", "impact", "horizon", "pop_pct",
+            "market_cap", "cap_bucket", "exp_drift", "stance", "robust", "days_since", "days_left",
+            "last_close", "title", "sectors")[:limit]
+        def _finite(v):
+            return None if (isinstance(v, float) and not math.isfinite(v)) else v
+        clean = [{k: _finite(v) for k, v in r.items()} for r in rows]
+        return Response({
+            "computed": True, "n_total": n_total, "n_fade": qs.filter(stance="FADE").count(),
+            "cats": cats, "computed_at": meta["computed_at"].isoformat() if meta and meta["computed_at"] else None,
+            "returned": len(clean), "results": clean,
+        })
+
+    def post(self, request):
+        from api.tasks import run_news_horizon_scan_task
+        thread = threading.Thread(target=run_news_horizon_scan_task, daemon=True)
+        thread.start()
+        return Response({"status": "news-horizon scan started"})
+
+
+def _signed_cat(cat, direction):
+    """Fold the local UNSIGNED category (cat_llm) + local_dir into the signed labels users expect in
+    the 'News type' column (earnings_beat/miss, guidance_up/down, upgrade/downgrade). dir>=0 -> bullish
+    variant, dir<0 -> bearish. Mirrors news_horizon_scan._signed_cat (kept local to avoid importing
+    that module's heavy candle deps into the web process)."""
+    c = (cat or "other").lower(); d = direction or 0
+    if c == "earnings":    return "earnings_beat" if d >= 0 else "earnings_miss"
+    if c == "guidance":    return "guidance_up" if d >= 0 else "guidance_down"
+    if c == "analyst":     return "upgrade" if d >= 0 else "downgrade"
+    if c in ("offering", "buyback"): return "capital"
+    if c == "partnership": return "contract"
+    if c == "insider":     return "other"
+    return c
+
+
+class NewsEffectView(APIView):
+    """Browse the classified news corpus with its same-day PRICE-EFFECT columns (day_abn = β-adj
+    abnormal move over the news's reaction session, incl. overnight/pre-market gap; day_effect =
+    moved >=2σ that day; day_suspect = bad-candle / illiquid-OTC artifact, force-excluded from
+    effect). Server-side filtered + paginated. GET only (data is computed by compute_news_effect.py)."""
+
+    def get(self, request):
+        from core.models import NewsItem
+        from django.db.models import Q
+        from django.db.models.functions import Abs
+        import math
+        p = request.query_params
+
+        def flag(name, default=False):
+            v = p.get(name)
+            if v is None:
+                return default
+            return str(v).lower() in ("1", "true", "yes", "on")
+
+        qs = NewsItem.objects.filter(day_abn__isnull=False)
+        # defaults chosen to show ONLY real events first (user: "filter out all the junk news, all
+        # the news where nothing happened"): moved that day, not editorial junk, not a bad candle.
+        if flag("effect", True):
+            qs = qs.filter(day_effect=True)
+        if flag("hide_junk", True):
+            qs = qs.exclude(junk=True)
+        if flag("hide_suspect", True):
+            qs = qs.exclude(day_suspect=True)
+        # off_ticker = the LLM judged the headline is NOT about this ticker (macro / different company
+        # in this feed). Dropped by default — functionally "the ticker was removed for this item".
+        if flag("hide_offticker", True):
+            qs = qs.exclude(off_ticker=True)
+        # "rated" now means LOCAL-LLM rated (local_rating) — the Anthropic llm_* layer is fully retired.
+        if flag("classified", True):
+            qs = qs.filter(local_rating__isnull=False)
+        try:
+            min_impact = int(p.get("min_impact", 0))
+        except (TypeError, ValueError):
+            min_impact = 0
+        if min_impact:
+            qs = qs.filter(local_impact__gte=min_impact)
+        if p.get("ticker"):
+            qs = qs.filter(ticker=p["ticker"].strip().upper())
+        if p.get("cat"):
+            qs = qs.filter(cat_llm=p["cat"])
+        if p.get("acat"):
+            x = p["acat"]  # effective category: prefer the LLM label, fall back to the title heuristic
+            qs = qs.filter(Q(cat_llm=x) | (Q(cat_llm="") & Q(cat_auto=x)))
+        if p.get("horizon"):
+            qs = qs.filter(local_horizon=p["horizon"])
+        if p.get("dir") == "up":
+            qs = qs.filter(day_abn__gt=0)
+        elif p.get("dir") == "down":
+            qs = qs.filter(day_abn__lt=0)
+        try:
+            min_abn = float(p.get("min_abn", 0) or 0)
+        except (TypeError, ValueError):
+            min_abn = 0.0
+        if min_abn > 0:
+            qs = qs.filter(Q(day_abn__gte=min_abn) | Q(day_abn__lte=-min_abn))
+
+        sort = p.get("sort", "date")
+        if sort == "abn":
+            qs = qs.annotate(_absabn=Abs("day_abn")).order_by("-_absabn", "-dt")
+        elif sort == "impact":
+            qs = qs.order_by("-local_impact", "-dt")
+        else:
+            qs = qs.order_by("-dt")
+
+        n_total = qs.count()
+        n_effect = qs.filter(day_effect=True).count()
+        try:
+            limit = min(int(p.get("limit", 200)), 1000)
+        except (TypeError, ValueError):
+            limit = 200
+        try:
+            offset = max(int(p.get("offset", 0)), 0)
+        except (TypeError, ValueError):
+            offset = 0
+
+        # distinct categories present (for the filter dropdowns) — computed once, cheap at DB level.
+        cats = sorted(c for c in NewsItem.objects.filter(local_rating__isnull=False)
+                      .order_by().values_list("cat_llm", flat=True).distinct() if c)
+        acats = sorted(c for c in NewsItem.objects.exclude(cat_auto="")
+                       .order_by().values_list("cat_auto", flat=True).distinct() if c)
+        rows = list(qs.values(
+            "ticker", "dt", "title", "local_dir", "local_impact", "local_horizon",
+            "local_rating", "day_abn", "day_effect", "day_suspect", "junk", "sentiment", "url",
+            "ret_1m", "ret_3m", "ret_1y", "cat_auto", "cat_llm", "off_ticker")[offset:offset + limit])
+
+        def _f(v):
+            return None if (isinstance(v, float) and not math.isfinite(v)) else v
+        clean = []
+        for r in rows:
+            r["dt"] = r["dt"].isoformat() if r["dt"] else None
+            for k in ("day_abn", "ret_1m", "ret_3m", "ret_1y"):
+                r[k] = round(r[k], 2) if r[k] is not None else None
+            # Serve the LOCAL labels under the historical llm_* response keys so the frontend needs no
+            # change. The Anthropic layer is retired; these ARE the on-box qwen labels now. The 'News
+            # type' column shows the SIGNED label derived from cat_llm + local_dir.
+            r["llm_cat"] = _signed_cat(r.get("cat_llm"), r.get("local_dir"))
+            r["llm_dir"] = r.pop("local_dir")
+            r["llm_impact"] = r.pop("local_impact")
+            r["llm_horizon"] = r.pop("local_horizon")
+            r["llm_rating"] = r.pop("local_rating")
+            clean.append({k: _f(v) for k, v in r.items()})
+        return Response({
+            "n_total": n_total, "n_effect": n_effect, "cats": cats, "acats": acats,
+            "returned": len(clean), "offset": offset, "limit": limit, "results": clean,
+        })
+
+
+class NewsEffectChartView(APIView):
+    """Price series for ONE ticker with every news item plotted as a marker at its reaction bar —
+    powers the click-through chart on the News Effect page (user: "make the stock clickable and
+    show all the news on a graph"). Each marker carries day_abn / direction / effect / junk /
+    suspect / category / title so the frontend can color and label it. GET only."""
+
+    def get(self, request):
+        import numpy as np
+        import pandas as pd
+        from core.models import NewsItem, Candle
+        from zoneinfo import ZoneInfo
+
+        ticker = (request.query_params.get("ticker") or "").strip().upper()
+        if not ticker:
+            return Response({"error": "ticker required"}, status=400)
+        try:
+            bars = min(int(request.query_params.get("bars", 1300)), 2000)
+        except (TypeError, ValueError):
+            bars = 1300
+
+        def flag(name, default=False):
+            v = request.query_params.get(name)
+            return default if v is None else str(v).lower() in ("1", "true", "yes", "on")
+
+        cds = (Candle.objects.filter(ticker=ticker, interval="1d")
+               .order_by("date").values_list("date", "close"))
+        cds = list(cds)
+        if len(cds) < 5:
+            return Response({"error": f"no candles for {ticker}"}, status=404)
+        cds = cds[-bars:]
+        dates = pd.to_datetime([d for d, _ in cds])
+        close = [round(float(c), 4) if c is not None else None for _, c in cds]
+        d0 = dates[0]
+
+        ET = ZoneInfo("America/New_York")
+
+        def reaction_date(dt):
+            et = pd.Timestamp(dt)
+            et = et.tz_convert(ET) if et.tzinfo else et.tz_localize("UTC").tz_convert(ET)
+            d = et.normalize().tz_localize(None)
+            return d + pd.Timedelta(days=1) if et.hour >= 16 else d
+
+        nqs = NewsItem.objects.filter(ticker=ticker, day_abn__isnull=False, dt__gte=d0)
+        # default: only real, non-junk, non-artifact events — same north-star filter as the table.
+        if flag("effect", True):
+            nqs = nqs.filter(day_effect=True)
+        if flag("hide_junk", True):
+            nqs = nqs.exclude(junk=True)
+        if flag("hide_suspect", True):
+            nqs = nqs.exclude(day_suspect=True)
+        if flag("classified", True):
+            nqs = nqs.filter(local_rating__isnull=False)
+        news = nqs.values("dt", "title", "cat_llm", "local_dir", "local_impact",
+                          "day_abn", "day_effect", "day_suspect", "junk", "sentiment", "url")
+
+        markers = []
+        for it in news:
+            rd = reaction_date(it["dt"])
+            pos = int(dates.searchsorted(np.datetime64(rd), side="left"))
+            if pos >= len(dates):
+                pos = len(dates) - 1
+            da = it["day_abn"]
+            markers.append({
+                "idx": pos,
+                "dt": it["dt"].isoformat() if it["dt"] else None,
+                "title": it["title"],
+                "cat": _signed_cat(it["cat_llm"], it["local_dir"]), "impact": it["local_impact"],
+                "day_abn": round(da, 2) if da is not None else None,
+                "dir": (1 if (da or 0) > 0 else -1 if (da or 0) < 0 else 0),
+                "effect": it["day_effect"], "suspect": it["day_suspect"], "junk": it["junk"],
+                "sentiment": it["sentiment"], "url": it["url"],
+            })
+        markers.sort(key=lambda m: m["idx"])
+        return Response({
+            "ticker": ticker,
+            "dates": [d.strftime("%Y-%m-%d") for d in dates],
+            "close": close,
+            "markers": markers,
+            "n_markers": len(markers),
+        })
+
+
+class NewsClusterView(APIView):
+    """Detect and analyze NEWS CLUSTERS — bursts of headlines on one ticker in a short window, the
+    footprint of a promotion / "propping" campaign (user: "sometimes news come in like a bunch of
+    cluster for a specific stock, like someone is propping the stock"). A cluster = a chain of items
+    on the same ticker where each is within `gap` days of the previous, with at least `min_items`.
+
+    For each cluster we surface (a) composition — count, bullish vs bearish share, junk/PR share,
+    how many actually moved the stock; (b) the net abnormal push DURING the cluster (Σ day_abn); and
+    (c) the FORWARD return AFTER the cluster (the last item's ret_1m/3m/1y) — the fade check that tells
+    a real story from a pump-and-fizzle. `prop_score` (0-100) is a transparent heuristic combining
+    volume + bullish skew + junk/PR share + a positive pop; `faded` flags pump-then-drop. GET only."""
+
+    def get(self, request):
+        import math
+        from itertools import groupby
+        from core.models import NewsItem
+        p = request.query_params
+
+        def _int(name, default):
+            try:
+                return int(p.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        gap = max(_int("gap", 3), 1)              # max quiet gap (days) that still chains a cluster
+        min_items = max(_int("min_items", 4), 2)  # a burst needs at least this many headlines
+        limit = min(_int("limit", 200), 1000)
+        include_junk = str(p.get("include_junk", "1")).lower() in ("1", "true", "yes", "on")
+        tick = (p.get("ticker") or "").strip().upper()
+
+        qs = NewsItem.objects.all()
+        if not include_junk:
+            qs = qs.exclude(junk=True)
+        # off-ticker items aren't really this ticker's news — they'd fabricate phantom "propping"
+        # clusters (a macro selloff would look like a burst on every name). Always excluded here.
+        qs = qs.exclude(off_ticker=True)
+        if tick:
+            qs = qs.filter(ticker=tick)
+        rows = qs.order_by("ticker", "dt").values_list(
+            "ticker", "dt", "title", "cat_llm", "local_dir", "day_abn", "day_effect",
+            "junk", "ret_1m", "ret_3m", "ret_1y")
+
+        clusters = []
+        for ticker, grp in groupby(rows, key=lambda r: r[0]):
+            items = list(grp)  # already sorted by dt within ticker
+            i = 0
+            n = len(items)
+            while i < n:
+                j = i
+                while j + 1 < n and (items[j + 1][1] - items[j][1]).days <= gap:
+                    j += 1
+                run = items[i:j + 1]
+                i = j + 1
+                if len(run) < min_items:
+                    continue
+                n_items = len(run)
+                n_junk = sum(1 for r in run if r[7])
+                n_moved = sum(1 for r in run if r[6])
+                n_bull = sum(1 for r in run if (r[4] or 0) > 0)
+                n_bear = sum(1 for r in run if (r[4] or 0) < 0)
+                abns = [r[5] for r in run if r[5] is not None]
+                net_abn = round(sum(abns), 2) if abns else None
+                span_days = (run[-1][1] - run[0][1]).days
+                n_dir = n_bull + n_bear
+                bull_share = (n_bull / n_dir) if n_dir else 0.0
+                junk_share = n_junk / n_items
+                # forward return AFTER the cluster = the last item's precomputed forward returns
+                last = run[-1]
+                fwd_1m, fwd_3m, fwd_1y = last[8], last[9], last[10]
+                pop = net_abn if net_abn is not None else 0.0
+                # prop_score: volume + bullish skew + junk/PR share, gated by an actual UP push
+                vol_f = min(n_items / 10.0, 1.0)
+                raw = 0.40 * bull_share + 0.30 * junk_share + 0.30 * vol_f
+                prop_score = int(round(100 * raw * (1.0 if pop > 0 else 0.35)))
+                faded = bool(pop > 0 and fwd_1m is not None and fwd_1m < 0)
+                # a couple of representative headlines for context
+                heads = [r[2] for r in run][:3]
+                clusters.append({
+                    "ticker": ticker,
+                    "start": run[0][1].date().isoformat(),
+                    "end": run[-1][1].date().isoformat(),
+                    "span_days": span_days,
+                    "n_items": n_items, "n_moved": n_moved, "n_junk": n_junk,
+                    "n_bull": n_bull, "n_bear": n_bear,
+                    "bull_share": round(bull_share, 2), "junk_share": round(junk_share, 2),
+                    "net_abn": net_abn,
+                    "ret_1m": fwd_1m, "ret_3m": fwd_3m, "ret_1y": fwd_1y,
+                    "prop_score": prop_score, "faded": faded,
+                    "headlines": heads,
+                })
+
+        sort = p.get("sort", "prop")
+        if sort == "recent":
+            clusters.sort(key=lambda c: c["end"], reverse=True)
+        elif sort == "items":
+            clusters.sort(key=lambda c: c["n_items"], reverse=True)
+        elif sort == "pop":
+            clusters.sort(key=lambda c: (c["net_abn"] or -1e9), reverse=True)
+        elif sort == "fade":
+            clusters.sort(key=lambda c: (c["ret_1m"] if c["ret_1m"] is not None else 1e9))
+        else:  # prop
+            clusters.sort(key=lambda c: (c["prop_score"], c["n_items"]), reverse=True)
+
+        n_total = len(clusters)
+        n_faded = sum(1 for c in clusters if c["faded"])
+
+        def _f(v):
+            return None if (isinstance(v, float) and not math.isfinite(v)) else v
+        out = [{k: _f(v) for k, v in c.items()} for c in clusters[:limit]]
+        return Response({
+            "n_total": n_total, "n_faded": n_faded, "returned": len(out),
+            "gap": gap, "min_items": min_items, "results": out,
+        })
+
+
+class SmartMoneyView(APIView):
+    """Full detail behind the 'Smart money' badges (13D×N / 13G×N / insider $) for ONE ticker —
+    powers the click-through popup (user: "clicking 13Gx5 should show a popup with ALL the details").
+    Lists the individual SEC ownership filings (13D activist / 13G passive 5%+ stakes) and the
+    per-day insider open-market buy/sell aggregates, newest first, plus an EDGAR deep link. GET only."""
+
+    def get(self, request):
+        from core.models import SecFiling, InsiderBuy
+        ticker = (request.query_params.get("ticker") or "").strip().upper()
+        if not ticker:
+            return Response({"error": "ticker required"}, status=400)
+
+        filings = list(SecFiling.objects.filter(ticker=ticker)
+                       .order_by("-filed_date").values("form_group", "filed_date", "accession"))
+        f13d = [{"filed_date": f["filed_date"].isoformat(), "accession": f["accession"]}
+                for f in filings if f["form_group"] == "13D"]
+        f13g = [{"filed_date": f["filed_date"].isoformat(), "accession": f["accession"]}
+                for f in filings if f["form_group"] == "13G"]
+
+        ins = list(InsiderBuy.objects.filter(ticker=ticker)
+                   .order_by("-filed_date").values("filed_date", "buy_value", "sell_value", "buy_count"))
+        insider = [{"filed_date": i["filed_date"].isoformat(), "buy_value": i["buy_value"],
+                    "sell_value": i["sell_value"], "buy_count": i["buy_count"]} for i in ins]
+
+        edgar = (f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}"
+                 f"&type=SC+13&dateb=&owner=include&count=100")
+        return Response({
+            "ticker": ticker,
+            "filings_13d": f13d, "filings_13g": f13g, "insider": insider,
+            "totals": {
+                "n_13d": len(f13d), "n_13g": len(f13g),
+                "insider_buy": sum(i["buy_value"] for i in ins),
+                "insider_sell": sum(i["sell_value"] for i in ins),
+                "insider_buy_count": sum(i["buy_count"] for i in ins),
+            },
+            "edgar_url": edgar,
+        })
+
+
+class AdDivergenceView(APIView):
+    """Serve the A/D-divergence scan: stocks whose Accumulation/Distribution line is in
+    'accum divergence' state right now. `primed` rows are also firing a capitulation signal
+    (the setup that ~tripled the edge); the rest are 'watch'. GET reads AdDivergenceSignal;
+    POST triggers a fresh in-process scan in the background."""
+
+    def get(self, request):
+        from core.models import AdDivergenceSignal
+        import math
+        qs = AdDivergenceSignal.objects.all()
+        n_total = qs.count()
+        if not n_total:
+            return Response({"computed": False, "results": [], "message":
+                             "No A/D-divergence scan yet. POST to run it (needs stock studies first)."})
+        try:
+            limit = int(request.query_params.get("limit", 1000))
+        except (TypeError, ValueError):
+            limit = 1000
+        meta = AdDivergenceSignal.objects.order_by("-computed_at").values("computed_at").first()
+        rows = qs.order_by("knife", "low_quality", "-primed", "min_days_ago", "-hist_avg_return").values(
+            "ticker", "last_close", "primed", "firing", "min_days_ago",
+            "fires_60d", "pct_above_low", "knife", "low_quality",
+            "best_signal_key", "best_signal_name", "best_exit_key",
+            "hist_avg_return", "hist_win_rate", "hist_trades",
+            "market_cap", "pe_ratio", "forward_pe", "profit_margin", "fund_buckets", "sectors",
+            "insider_buy_90d", "recent_13d", "recent_13g")[:limit]
+
+        def _finite(v):
+            return None if (isinstance(v, float) and not math.isfinite(v)) else v
+        clean = [{k: _finite(v) for k, v in r.items()} for r in rows]
+        n_primed = qs.filter(primed=True).count()
+        computed_at = meta["computed_at"] if meta else None
+        return Response({
+            "computed": True, "n_total": n_total, "n_primed": n_primed,
+            "n_watch": n_total - n_primed,
+            "computed_at": computed_at.isoformat() if computed_at else None,
+            "results": clean,
+        })
+
+    def post(self, request):
+        from api.tasks import compute_ad_divergence
+        thread = threading.Thread(target=compute_ad_divergence, daemon=True)
+        thread.start()
+        return Response({"status": "A/D-divergence scan started"})
+
+
+class AdDivergenceChartView(APIView):
+    """Price + Accumulation/Distribution LINE for one ticker over the last N bars, plus the
+    A/D-state code per bar and the capitulation-signal fire markers — everything the A/D
+    Divergence page needs to draw the divergence (price flat/down while the ADL rises)."""
+
+    def get(self, request):
+        import numpy as np
+        import pandas as pd
+        from seq_fundamental_study import load_candles
+        from pit_fundamentals import _ad_state
+        from studies import SIGNALS
+        from api.tasks import AD_CAPIT_SIGNALS
+
+        ticker = request.query_params.get("ticker")
+        if not ticker:
+            return Response({"error": "ticker required"}, status=400)
+        try:
+            bars = int(request.query_params.get("bars", 160))
+        except (TypeError, ValueError):
+            bars = 160
+        df = load_candles([ticker]).get(ticker)
+        if df is None or len(df) < 30:
+            return Response({"error": f"no candles for {ticker}"}, status=404)
+
+        h, l, c, v = df["High"], df["Low"], df["Close"], df["Volume"]
+        rng = (h - l).replace(0, np.nan)
+        mfm = (((c - l) - (h - c)) / rng).fillna(0.0)
+        adl = (mfm * v).cumsum()
+        adl_sma = adl.rolling(10).mean()
+        state = _ad_state(df)
+
+        n = len(df)
+        start = max(0, n - bars)
+        fires = []
+        for sk in AD_CAPIT_SIGNALS:
+            try:
+                sig = SIGNALS[sk][1](df).fillna(False)
+            except Exception:
+                continue
+            for pos in np.where(sig.values)[0]:
+                if pos >= start:
+                    fires.append({"idx": int(pos - start), "signal_key": sk,
+                                  "signal_name": SIGNALS[sk][0]})
+        sl = slice(start, n)
+
+        def ser(s, nd=2):
+            return [None if pd.isna(x) else round(float(x), nd) for x in s.values[sl]]
+
+        return Response({
+            "ticker": ticker,
+            "dates": [d.strftime("%Y-%m-%d") for d in df.index[sl]],
+            "close": ser(c), "adl": ser(adl), "adl_sma": ser(adl_sma),
+            "state": [None if pd.isna(x) else int(x) for x in state.values[sl]],
+            "fires": fires,
+        })
+
+
+class StrategyForwardView(APIView):
+    """Serve the two-mode sector-gated strategy's average forward path (day 1..90 from entry):
+    where a trade sits, on average/median, N days after we bought it. GET reads the saved JSON;
+    POST recomputes it in the background."""
+
+    def get(self, request):
+        from pathlib import Path
+        import json
+        p = Path(__file__).resolve().parent.parent / ".data" / "studies" / "strategy_forward.json"
+        if not p.exists():
+            return Response({"computed": False,
+                             "message": "Not computed yet. POST to run it."})
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            return Response({"computed": False, "message": f"read error: {e}"})
+        data["computed"] = True
+        return Response(data)
+
+    def post(self, request):
+        from api.tasks import compute_strategy_forward
+        thread = threading.Thread(target=compute_strategy_forward, daemon=True)
+        thread.start()
+        return Response({"status": "strategy forward-path computation started"})
+
+
+class ResearchView(APIView):
+    """Serve the Research/Lab comparisons (trigger×exit matrix, entry-timeframe, regime,
+    cap-band risk, MPT). GET reads the cached JSON; POST recomputes (heavy, background)."""
+
+    def get(self, request):
+        from pathlib import Path
+        import json
+        p = Path(__file__).resolve().parent.parent / ".data" / "studies" / "research.json"
+        if not p.exists():
+            return Response({"computed": False, "message": "Not computed yet. POST to run it (few min)."})
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            return Response({"computed": False, "message": f"read error: {e}"})
+        data["computed"] = True
+        return Response(data)
+
+    def post(self, request):
+        from api.tasks import compute_research
+        thread = threading.Thread(target=compute_research, daemon=True)
+        thread.start()
+        return Response({"status": "research recompute started (few min)"})
+
+
+class PaperTradesView(APIView):
+    """Live forward paper-trading record of Playbook picks. GET returns open + closed positions
+    and the running track record; POST snapshots today's picks / marks positions to market."""
+
+    def get(self, request):
+        from core.models import PaperTrade
+        import math
+        rows = list(PaperTrade.objects.all().values(
+            "ticker", "mode", "sector", "entry_date", "entry_price", "last_price", "peak_price",
+            "status", "exit_date", "exit_price", "ret_pct", "hist_avg_return", "opened_at", "updated_at"))
+        if not rows:
+            return Response({"computed": False, "message": "No paper trades yet. POST to snapshot today's Playbook picks."})
+        closed = [r for r in rows if r["status"] == "closed"]
+        opn = [r for r in rows if r["status"] == "open"]
+
+        def avg(xs):
+            xs = [x for x in xs if x is not None]
+            return round(sum(xs) / len(xs), 1) if xs else None
+        crets = [r["ret_pct"] for r in closed if r["ret_pct"] is not None]
+        summary = {
+            "n_open": len(opn), "n_closed": len(closed),
+            "closed_win_rate": round(sum(1 for x in crets if x > 0) / len(crets) * 100, 1) if crets else None,
+            "closed_avg_ret": avg(crets),
+            "open_unrealized_avg": avg([r["ret_pct"] for r in opn]),
+        }
+
+        def _clean(r):
+            return {k: (None if (isinstance(v, float) and not math.isfinite(v)) else v) for k, v in r.items()}
+        return Response({"computed": True, "summary": summary, "trades": [_clean(r) for r in rows]})
+
+    def post(self, request):
+        from api.tasks import update_paper_trades
+        thread = threading.Thread(target=update_paper_trades, daemon=True)
+        thread.start()
+        return Response({"status": "paper-trade snapshot started"})
+
+
+class EquityCurveView(APIView):
+    """Serve the portfolio backtest's equity curve vs SPY + metrics. GET reads the saved JSON;
+    POST recomputes (heavy — full backtest — runs in the background)."""
+
+    def get(self, request):
+        from pathlib import Path
+        import json
+        p = Path(__file__).resolve().parent.parent / ".data" / "studies" / "equity_curve.json"
+        if not p.exists():
+            return Response({"computed": False, "message": "Not computed yet. POST to run it (takes a few min)."})
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            return Response({"computed": False, "message": f"read error: {e}"})
+        data["computed"] = True
+        return Response(data)
+
+    def post(self, request):
+        from api.tasks import compute_equity_curve
+        thread = threading.Thread(target=compute_equity_curve, daemon=True)
+        thread.start()
+        return Response({"status": "equity-curve backtest started (few min)"})
+
+
+class PlaybookView(APIView):
+    """Serve the live end-to-end Playbook: the sector board (IN/TURNING/OUT) + today's ranked
+    candidates through the full funnel. GET reads the saved JSON; POST recomputes in the bg."""
+
+    def get(self, request):
+        from pathlib import Path
+        import json
+        p = Path(__file__).resolve().parent.parent / ".data" / "studies" / "playbook.json"
+        if not p.exists():
+            return Response({"computed": False, "message": "Not computed yet. POST to run it."})
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            return Response({"computed": False, "message": f"read error: {e}"})
+        data["computed"] = True
+        return Response(data)
+
+    def post(self, request):
+        from api.tasks import compute_playbook
+        thread = threading.Thread(target=compute_playbook, daemon=True)
+        thread.start()
+        return Response({"status": "playbook computation started"})
+
+
+class DimIntersectionView(APIView):
+    """Targeted multi-dimension intersection: bucket ONE signal×exit's trades by the
+    COMBINATION of chosen dimensions. GET serves the last result; POST runs a fresh one."""
+    _PATH = "/app/.data/studies/dim_intersection.json"
+
+    def get(self, request):
+        if not _os.path.exists(self._PATH):
+            return Response({"computed": False})
+        with open(self._PATH) as f:
+            data = _json.load(f)
+        data["computed"] = True
+        return Response(data)
+
+    def post(self, request):
+        d = request.data
+        signal = d.get("signal") or "obv_div_sort_pos"
+        exit_key = d.get("exit") or "6m"
+        dims = d.get("dims") or ["Market cap", "PB", "Insider buying"]
+        if isinstance(dims, str):
+            dims = [x.strip() for x in dims.split(",") if x.strip()]
+        from api.tasks import run_dim_intersection_task
+        threading.Thread(target=run_dim_intersection_task, args=(signal, exit_key, dims), daemon=True).start()
+        return Response({"status": "running", "signal": signal, "exit": exit_key, "dims": dims})
+
+
+class SectorStockDrilldownView(APIView):
+    """Turn a sector-level signal into per-stock signals: which stocks in the sector's
+    holdings backtest well on this signal×exit, and which are firing right now."""
+
+    def get(self, request):
+        sector = request.query_params.get("sector")
+        signal = request.query_params.get("signal")
+        exit_key = request.query_params.get("exit", "6m")
+        try:
+            recent = int(request.query_params.get("recent", 10))
+        except ValueError:
+            recent = 10
+        if not sector or not signal:
+            return Response({"error": "sector and signal query params required"}, status=400)
+        from api.tasks import compute_sector_drilldown
+        result = compute_sector_drilldown(sector, signal, exit_key, recent_window=recent)
+        return Response(result)

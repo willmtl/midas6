@@ -1,0 +1,150 @@
+version: "3.9"
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgres://rotation:rotation@db:5432/rotation
+  DJANGO_SETTINGS_MODULE: rotation.settings
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/0
+  # Slack (or Discord/generic) incoming webhook for "suddenly fresh" alerts.
+  # Set FRESH_ALERT_WEBHOOK in your shell/.env before `docker compose up`.
+  FRESH_ALERT_WEBHOOK: ${FRESH_ALERT_WEBHOOK:-}
+  # Polygon/Massive options+trades API key (set in .env, never hardcoded).
+  POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+  # Polygon/Massive flat-file (S3) creds for options + dark-pool history.
+  POLYGON_S3_KEY: ${POLYGON_S3_KEY:-}
+  POLYGON_S3_SECRET: ${POLYGON_S3_SECRET:-}
+  POLYGON_S3_ENDPOINT: ${POLYGON_S3_ENDPOINT:-https://files.massive.com}
+  # ThetaData v3 API key (Python lib connects direct — no terminal). EODHD for fundamentals.
+  THETADATA_API_KEY: ${THETADATA_API_KEY:-}
+  EODHD_API_KEY: ${EODHD_API_KEY:-}
+  # Anthropic key for cheap-LLM news classification (Haiku). Set in .env, never hardcoded.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+x-backend-volumes: &backend-volumes
+  - ./backend:/app
+  - ./config.py:/app/config.py
+  - ./indicators.py:/app/indicators.py
+  - ./sector_holdings.py:/app/sector_holdings.py
+  - ./studies.py:/app/studies.py
+  - ./data_fetcher.py:/app/data_fetcher.py
+  - ./data_store.py:/app/data_store.py
+  - ./rates.py:/app/rates.py
+  - ./fundamentals.py:/app/fundamentals.py
+  - ./stock_studies.py:/app/stock_studies.py
+  - ./stock_studies_v2.py:/app/stock_studies_v2.py
+  - ./market_regime.py:/app/market_regime.py
+  - ./study_curves.py:/app/study_curves.py
+  - ./trend_analyzer.py:/app/trend_analyzer.py
+  - ./drilldown.py:/app/drilldown.py
+  - ./backtest.py:/app/backtest.py
+  - ./trend_studies.py:/app/trend_studies.py
+  - ./stock_drilldown.py:/app/stock_drilldown.py
+  - ./stock_drawdown_study.py:/app/stock_drawdown_study.py
+  - ./seq_fundamental_study.py:/app/seq_fundamental_study.py
+  - ./all_on_all_study.py:/app/all_on_all_study.py
+  - ./live_firing_scan.py:/app/live_firing_scan.py
+  - ./pit_fundamentals.py:/app/pit_fundamentals.py
+  - ./fetch_financial_history.py:/app/fetch_financial_history.py
+  - ./fetch_insider.py:/app/fetch_insider.py
+  - ./fetch_sec_events.py:/app/fetch_sec_events.py
+  - ./trend_stock_studies.py:/app/trend_stock_studies.py
+  - ./dim_intersection_study.py:/app/dim_intersection_study.py
+  - ./test_pit_fundamentals.py:/app/test_pit_fundamentals.py
+  - ./.data:/app/.data
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: rotation
+      POSTGRES_USER: rotation
+      POSTGRES_PASSWORD: rotation
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rotation"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py runserver 0.0.0.0:8000"
+    volumes: *backend-volumes
+    ports:
+      - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      <<: *backend-env
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: celery -A rotation worker -l info --concurrency=4
+    volumes: *backend-volumes
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      <<: *backend-env
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: celery -A rotation beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    volumes: *backend-volumes
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      <<: *backend-env
+
+  studies-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: python -u studies.py
+    volumes: *backend-volumes
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      <<: *backend-env
+    deploy:
+      restart_policy:
+        condition: none
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3001:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
