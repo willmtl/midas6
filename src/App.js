@@ -1538,6 +1538,8 @@ function StockDrilldownPage() {
   const [sortBy, setSortBy] = useState('stock_avg_return');
   const [sortDir, setSortDir] = useState('desc');
   const [expanded, setExpanded] = useState(null);
+  const { decomp } = useSectionBacktest();
+  const pickOnly = decomp?.decomposition?.lowpb?.arm1_pick_only;
 
   useEffect(() => {
     fetch(`${API}/stock-drilldown`).then(r => r.json()).then(d => setData(d)).catch(() => {});
@@ -1560,6 +1562,11 @@ function StockDrilldownPage() {
     <div className="studies-page">
       <h1>Stock Drilldown <span className="dim">({data.total})</span></h1>
       <p className="subtitle">Top 10% indicator studies: buy highest-beta stock in sector instead of ETF. {beating}/{data.total} beat the ETF.</p>
+
+      <BacktestPanel
+        title="Cheapest-P/B stock pick vs SPY"
+        subtitle="Whole-universe backtest: each month buy the single cheapest price-to-book stock (the value pick), vs SPY buy-hold."
+        curve={pickOnly?.curve} summary={pickOnly?.summary} />
 
       <table>
         <thead>
@@ -1821,6 +1828,9 @@ function TradeJournalPage() {
   const remove = (id) => saveEntries(entries.filter(e => e.id !== id));
   const edit = (e) => { setEditing(e.id); setForm({ ...e, price: e.price?.toString() || '', exit_price: e.exit_price?.toString() || '', quantity: e.quantity?.toString() || '1' }); };
 
+  const { lab } = useSectionBacktest();
+  const p3 = lab?.phase3;
+
   // Compute P&L for closed trades
   const closed = entries.filter(e => e.exit_price);
   const totalPnl = closed.reduce((s, e) => {
@@ -1835,6 +1845,11 @@ function TradeJournalPage() {
     <div className="studies-page">
       <h1>Trade Journal</h1>
       <p className="subtitle">Log your trades and track performance.</p>
+
+      <BacktestPanel
+        title="The strategy being paper-traded vs SPY"
+        subtitle="The top-signals portfolio these picks are tracked forward against — backtested vs SPY buy-hold."
+        curve={p3?.curve} summary={p3?.summary} />
 
       {entries.length > 0 && (
         <div className="regime-bar" style={{marginBottom: 16}}>
@@ -3880,6 +3895,89 @@ function BtCurve({ curve, height = 150 }) {
   );
 }
 
+// Shared fetcher for the two small DB-backed backtest payloads. Each analytical section calls
+// this and extracts the one curve it cares about. Tolerant of failure → returns nulls (the
+// section simply renders no panel). Fetched per-page (endpoints are tiny); no cross-section cache.
+function useSectionBacktest() {
+  const [lab, setLab] = useState(null);
+  const [decomp, setDecomp] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    apiFetch('/backtest-lab').then(d => { if (alive) setLab(d); }).catch(() => {});
+    apiFetch('/backtest-decomp').then(d => { if (alive) setDecomp(d); }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
+  return { lab, decomp };
+}
+
+// Reusable embedded "backtest vs SPY" equity-curve panel. Sits at the top of an analytical section.
+// Default COLLAPSED to a one-line header (title + total-return / vs-SPY chips) so it doesn't push
+// the section's real content down; the ▸/▾ toggle expands to stat chips + legend + the curve.
+function BacktestPanel({ title, subtitle, curve, summary, collapsible = true }) {
+  const [open, setOpen] = useState(!collapsible);
+  if (!curve || curve.length < 2) return null;
+  const s = summary || {};
+  const fmtPct = (v, plus = true) => (v == null || isNaN(v)) ? '–' : `${plus && v > 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+  const fmtNum = (v, d = 2) => (v == null || isNaN(v)) ? '–' : Number(v).toFixed(d);
+  // Some summaries carry vs_spy directly; others give total_return + spy_total to subtract.
+  const vs = s.vs_spy != null ? s.vs_spy
+    : (s.total_return != null && s.spy_total != null ? s.total_return - s.spy_total : null);
+  const beat = (s.total_return != null && s.spy_total != null) ? s.total_return > s.spy_total
+    : (vs != null && vs > 0);
+  const sig = s.t_stat != null && Math.abs(s.t_stat) >= 2;
+
+  const Chip = ({ label, value, cls }) => (
+    <div className="bt-embed-chip">
+      <div className="bt-embed-chip-label">{label}</div>
+      <div className={`bt-embed-chip-val ${cls || ''}`}>{value}</div>
+    </div>
+  );
+
+  return (
+    <div className="bt-embed">
+      <div className={`bt-embed-head${collapsible ? ' clickable' : ''}`}
+           onClick={collapsible ? () => setOpen(o => !o) : undefined}>
+        {collapsible && <span className="bt-embed-toggle">{open ? '▾' : '▸'}</span>}
+        <span className="bt-embed-title">{title}</span>
+        <span className="bt-embed-head-chips">
+          <span className={`bt-embed-mini ${beat ? 'good' : 'bad'}`}>{fmtPct(s.total_return)}</span>
+          <span className={`bt-embed-mini ${vs != null && vs > 0 ? 'good' : 'bad'}`}>vs SPY {fmtPct(vs)}</span>
+        </span>
+      </div>
+      {open && (
+        <div className="bt-embed-body">
+          <div className="bt-embed-chips">
+            <Chip label="Total Return" value={fmtPct(s.total_return)} cls={beat ? 'good' : 'bad'} />
+            <Chip label="vs SPY" value={fmtPct(vs)} cls={vs != null && vs > 0 ? 'good' : 'bad'} />
+            <Chip label="Sharpe" value={fmtNum(s.sharpe)} />
+            <Chip label="Max DD" value={fmtPct(s.max_drawdown, false)} cls="bad" />
+            <Chip label="Sig (t)" value={fmtNum(s.t_stat)} cls={sig ? 'good' : ''} />
+          </div>
+          <div className="bt-curve-head">
+            <span className="bt-legend"><span className="bt-swatch strat" /> strategy</span>
+            <span className="bt-legend"><span className="bt-swatch spy" /> SPY buy-hold</span>
+          </div>
+          <BtCurve curve={curve} height={120} />
+          {subtitle && <p className="subtitle bt-embed-note">{subtitle}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Dashboard-section wrapper: the live board's own RSI+Omega BULLISH rotation rule vs SPY.
+function DashboardBacktestPanel() {
+  const { lab } = useSectionBacktest();
+  const strat = (lab?.phase1?.strategies || []).find(s => (s.label || '').toLowerCase().includes('dashboard rule'));
+  if (!strat) return null;
+  return (
+    <BacktestPanel
+      title="Does the live dashboard rule actually beat SPY?"
+      subtitle="This is the RSI(10)>SMA(10) + Omega(10)>1 sector-rotation rule the board below scores every sector on — backtested vs SPY buy-hold."
+      curve={strat.curve} summary={strat.summary} />
+  );
+}
+
 // Backtest Lab — read-only view of /backtest-lab. Three phases: (1) rank the rotation RULES,
 // (2) check each signal in- vs out-of-sample, (3) a combined portfolio — all vs SPY buy-hold.
 // POST triggers a (re)compute; we poll until `computed` flips.
@@ -4292,11 +4390,21 @@ function HubTabs({ tabs, initKey }) {
 }
 
 function LiveSignalsHub() {
-  return <HubTabs initKey="playbook" tabs={[
-    { key: 'playbook', label: '▶ Playbook', hash: '/live/playbook', match: ['playbook'], el: <PlaybookPage /> },
-    { key: 'firing', label: '⚡ Firing Now', hash: '/live/firing', match: ['firing'], el: <FiringNowPage /> },
-    { key: 'addiv', label: 'A/D Divergence', hash: '/live/addiv', match: ['addiv'], el: <AdDivergencePage /> },
-  ]} />;
+  const { lab } = useSectionBacktest();
+  const p3 = lab?.phase3;
+  return (
+    <div>
+      <BacktestPanel
+        title="Top-signals portfolio vs SPY"
+        subtitle="Combined portfolio of the top-ranked signals — the strategy behind the live playbook — backtested vs SPY buy-hold."
+        curve={p3?.curve} summary={p3?.summary} />
+      <HubTabs initKey="playbook" tabs={[
+        { key: 'playbook', label: '▶ Playbook', hash: '/live/playbook', match: ['playbook'], el: <PlaybookPage /> },
+        { key: 'firing', label: '⚡ Firing Now', hash: '/live/firing', match: ['firing'], el: <FiringNowPage /> },
+        { key: 'addiv', label: 'A/D Divergence', hash: '/live/addiv', match: ['addiv'], el: <AdDivergencePage /> },
+      ]} />
+    </div>
+  );
 }
 
 function NewsEventStudyPage() {
@@ -4526,24 +4634,52 @@ function IvCalibrationPage() {
 }
 
 function NewsHub() {
-  return <HubTabs initKey="newsfx" tabs={[
-    { key: 'newsfx', label: 'News Effect', hash: '/news/effect', match: ['effect', 'newsfx'], el: <NewsEffectPage /> },
-    { key: 'newscl', label: 'Clusters', hash: '/news/clusters', match: ['clusters', 'newscl'], el: <NewsClusterPage /> },
-    { key: 'newshz', label: 'News Horizon', hash: '/news/horizon', match: ['horizon', 'newshz'], el: <NewsHorizonPage /> },
-    { key: 'newsev', label: 'Event Study', hash: '/news/eventstudy', match: ['eventstudy', 'newsev'], el: <NewsEventStudyPage /> },
-    { key: 'ivcal', label: 'IV Calibration', hash: '/news/ivcal', match: ['ivcal'], el: <IvCalibrationPage /> },
-  ]} />;
+  const { decomp } = useSectionBacktest();
+  const vxt = decomp?.value_x_technical;
+  // Prefer a news-catalyst signal combined with the cheapest-P/B pick; else the P/B pick alone.
+  const sig = (vxt?.signals || []).find(sg => sg?.signal_plus_lowpb?.curve);
+  const combo = sig?.signal_plus_lowpb;
+  const src = combo || vxt?.lowpb_alone;
+  return (
+    <div>
+      <BacktestPanel
+        title={combo ? 'News-catalyst signal + cheapest-P/B vs SPY' : 'Cheapest-P/B pick vs SPY'}
+        subtitle={combo
+          ? 'Among stocks firing a technical/news catalyst each month, buy the single cheapest-P/B one — backtested vs SPY buy-hold.'
+          : 'No signal+P/B curve available; showing the cheapest-P/B pick alone vs SPY buy-hold.'}
+        curve={src?.curve} summary={src?.summary} />
+      <HubTabs initKey="newsfx" tabs={[
+        { key: 'newsfx', label: 'News Effect', hash: '/news/effect', match: ['effect', 'newsfx'], el: <NewsEffectPage /> },
+        { key: 'newscl', label: 'Clusters', hash: '/news/clusters', match: ['clusters', 'newscl'], el: <NewsClusterPage /> },
+        { key: 'newshz', label: 'News Horizon', hash: '/news/horizon', match: ['horizon', 'newshz'], el: <NewsHorizonPage /> },
+        { key: 'newsev', label: 'Event Study', hash: '/news/eventstudy', match: ['eventstudy', 'newsev'], el: <NewsEventStudyPage /> },
+        { key: 'ivcal', label: 'IV Calibration', hash: '/news/ivcal', match: ['ivcal'], el: <IvCalibrationPage /> },
+      ]} />
+    </div>
+  );
 }
 
 function ResearchHub() {
-  return <HubTabs initKey="sectors" tabs={[
-    { key: 'sectors', label: 'Sectors', hash: '/research/sectors', match: ['sectors'], el: <StudiesPage /> },
-    { key: 'stocks', label: 'Stock Indicator Studies', hash: '/research/stocks', match: ['stocks'], el: <StockStudiesPage /> },
-    { key: 'trends', label: 'Trend Studies', hash: '/research/trends', match: ['trends', 'trend'], el: <TrendStudiesPage /> },
-    { key: 'backtest', label: 'Backtest', hash: '/research/backtest', match: ['backtest'], el: <BacktestPage /> },
-    { key: 'lab', label: 'Research/Lab', hash: '/research/lab', match: ['lab'], el: <ResearchPage /> },
-    { key: 'intersect', label: 'Intersections', hash: '/research/intersect', match: ['intersect'], el: <IntersectionPage /> },
-  ]} />;
+  const { lab } = useSectionBacktest();
+  // Best rotation rule by total return.
+  const best = (lab?.phase1?.strategies || []).reduce((b, s) =>
+    (!b || (s.summary?.total_return ?? -Infinity) > (b.summary?.total_return ?? -Infinity)) ? s : b, null);
+  return (
+    <div>
+      <BacktestPanel
+        title="Best rotation rule vs SPY"
+        subtitle={`Top-performing rotation rule by total return${best?.label ? ` — ${best.label}` : ''} — backtested vs SPY buy-hold.`}
+        curve={best?.curve} summary={best?.summary} />
+      <HubTabs initKey="sectors" tabs={[
+        { key: 'sectors', label: 'Sectors', hash: '/research/sectors', match: ['sectors'], el: <StudiesPage /> },
+        { key: 'stocks', label: 'Stock Indicator Studies', hash: '/research/stocks', match: ['stocks'], el: <StockStudiesPage /> },
+        { key: 'trends', label: 'Trend Studies', hash: '/research/trends', match: ['trends', 'trend'], el: <TrendStudiesPage /> },
+        { key: 'backtest', label: 'Backtest', hash: '/research/backtest', match: ['backtest'], el: <BacktestPage /> },
+        { key: 'lab', label: 'Research/Lab', hash: '/research/lab', match: ['lab'], el: <ResearchPage /> },
+        { key: 'intersect', label: 'Intersections', hash: '/research/intersect', match: ['intersect'], el: <IntersectionPage /> },
+      ]} />
+    </div>
+  );
 }
 
 // Pretty-URL navigation via the History API (no '#'). nginx serves index.html for every route
@@ -4763,6 +4899,7 @@ export default function App() {
           <StockTable sector={selectedSector} data={drilldown} onBack={handleBack} onTickerClick={(t, etf) => handleChartClick(t, etf)} />
         ) : (
           <>
+            <DashboardBacktestPanel />
             <div className="filters">
               <button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>All ({scanData?.total || 0})</button>
               <button className={filter === 'bullish' ? 'active' : ''} onClick={() => setFilter('bullish')}>Bullish ({scanData?.bullish || 0})</button>
