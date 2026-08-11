@@ -949,3 +949,101 @@ tbody tr:hover, .studies-table tbody tr:hover { background: var(--accent-weak); 
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; border: 2px solid var(--bg); }
 ::-webkit-scrollbar-thumb:hover { background: #3a4453; }
+
+/* ── Error handling: global backend-down banner + inline error banner ── */
+.backend-down-banner {
+  position: sticky; top: 0; z-index: 200;
+  display: flex; align-items: center; justify-content: center; gap: 16px;
+  background: #7f1d1d; color: #fee2e2;
+  padding: 8px 16px; font-size: 13px; font-weight: 600;
+  border-bottom: 1px solid #b91c1c;
+}
+.backend-down-banner button {
+  background: #fee2e2; color: #7f1d1d; border: none; border-radius: 4px;
+  padding: 3px 12px; font-size: 12px; font-weight: 700; cursor: pointer;
+}
+.backend-down-banner button:hover { background: #fff; }
+
+.error-banner {
+  display: flex; align-items: center; gap: 12px;
+  background: rgba(185, 28, 28, 0.12); border: 1px solid #b91c1c; border-radius: 8px;
+  color: #fca5a5; padding: 10px 14px; margin: 12px 0; font-size: 13px;
+}
+.error-banner-icon { font-size: 16px; }
+.error-banner-msg { flex: 1; }
+.error-banner-btn {
+  background: #b91c1c; color: #fff; border: none; border-radius: 4px;
+  padding: 4px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.error-banner-btn:hover { background: #dc2626; }
+.error-banner-x {
+  background: none; border: none; color: #fca5a5; font-size: 18px; line-height: 1;
+  cursor: pointer; padding: 0 4px;
+}
+.error-banner-x:hover { color: #fff; }
+
+/* ---- Last-updated chip (mirrors .cached-at, usable in any page header) ---- */
+.last-updated-chip {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 500;
+  vertical-align: middle;
+}
+
+/* ---- Backtest Lab ---- */
+.bt-section {
+  margin: 22px 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+.bt-subhead {
+  margin: 18px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.bt-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+.bt-table td, .bt-table th { white-space: nowrap; }
+.bt-table tr.bt-beat td { background: rgba(63, 185, 80, 0.07); }
+
+/* per-year beats-SPY grid */
+.bt-year-grid { font-variant-numeric: tabular-nums; }
+.bt-year-grid td.bt-cell { font-size: 12px; font-family: var(--mono); }
+.bt-cell.bt-win  { background: rgba(63, 185, 80, 0.16); color: var(--green); }
+.bt-cell.bt-lose { background: rgba(248, 81, 73, 0.12); color: var(--red); }
+
+/* inline SVG equity curve */
+.bt-curve-head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 14px 0 4px;
+  font-size: 12px;
+  color: var(--dim);
+}
+.bt-legend { display: inline-flex; align-items: center; gap: 6px; }
+.bt-swatch { display: inline-block; width: 14px; height: 3px; border-radius: 2px; }
+.bt-swatch.strat { background: var(--green); }
+.bt-swatch.spy { background: var(--dim); }
+.bt-curve {
+  display: block;
+  width: 100%;
+  height: 150px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.bt-curve .bt-line-strat { fill: none; stroke: var(--green); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.bt-curve .bt-line-spy   { fill: none; stroke: var(--dim);   stroke-width: 1.3; vector-effect: non-scaling-stroke; }

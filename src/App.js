@@ -3,6 +3,39 @@ import './App.css';
 
 const API = process.env.REACT_APP_API_URL || '/api';
 
+// Shared fetch that turns backend failures into readable messages instead of a cryptic
+// "Unexpected token < in JSON" (what a 502/504 HTML page throws on r.json()) or a dead page.
+// Callers: `apiFetch('/scan?...')` -> resolves to parsed JSON, or rejects with a friendly Error.
+async function apiFetch(path, opts) {
+  const url = path.startsWith('http') ? path : `${API}${path}`;
+  let r;
+  try {
+    r = await fetch(url, opts);
+  } catch (e) {
+    throw new Error('Backend unreachable — the server may be down or restarting.');
+  }
+  if (!r.ok) {
+    if ([502, 503, 504].includes(r.status))
+      throw new Error(`Backend unavailable (${r.status}) — it may be restarting or busy. Retry shortly.`);
+    let detail = '';
+    try { const j = await r.json(); detail = j.error || j.detail || ''; } catch (_) {}
+    throw new Error(`Request failed (${r.status})${detail ? ': ' + detail : ''}`);
+  }
+  return r.json();
+}
+
+// Reusable inline error with an optional Retry — use in place of a swallowed catch / dead "Loading…".
+function ErrorBanner({ message, onRetry, onDismiss }) {
+  return (
+    <div className="error-banner" role="alert">
+      <span className="error-banner-icon">&#9888;</span>
+      <span className="error-banner-msg">{message || 'Something went wrong.'}</span>
+      {onRetry && <button className="error-banner-btn" onClick={onRetry}>Retry</button>}
+      {onDismiss && <button className="error-banner-x" onClick={onDismiss} aria-label="Dismiss">&times;</button>}
+    </div>
+  );
+}
+
 // Site-wide plain-English glossary. Wrap any jargon in <Term k="cagr">CAGR</Term> to get a hover ?.
 const GLOSSARY = {
   cagr: ['CAGR', 'Compound Annual Growth Rate — the smoothed yearly % an investment would need to grow at to go from start value to end value over the period. Strips out the lumpiness of individual years.'],
@@ -121,16 +154,20 @@ const GLOSSARY = {
   bullbear: ['Bullish / bearish', 'Count of headlines in the cluster the model read as bullish vs bearish. A one-sided, all-bullish split is a promotion tell.'],
   avgdip: ['Avg dip (MAE)', 'Average maximum adverse excursion — the typical worst intraday drawdown a trade goes through after entry before it exits. A shallow avg dip means entries tend to work right away; a deep one means you usually have to sit underwater before it goes your way.'],
   cleanpct: ['Clean entry %', 'Share of trades whose worst dip never breached ~2% below entry — i.e. near-“perfect” entries that barely drew down. High = you tend to nail the timing; low = expect to ride out a drawdown first.'],
+  sig: ['Significance (t-stat)', 'One-sample t-stat of the per-trade returns vs 0, computed over EFFECTIVE trades — fires within a trading week are collapsed to one independent observation, so overlapping near-duplicate trades don’t inflate the sample. |t| ≥ 2 ≈ a real edge; small |t| means the average return is statistically indistinguishable from zero no matter how large the raw trade count. Hover shows the effective (deduped) trade count. Coarse overlap proxy, not a full Newey-West correction.'],
+  maxpeak: ['Max trade peak (single best)', 'The single highest intraday peak ANY ONE trade in this study reached — an order statistic (n=1), not an expectation. It is the luckiest historical outcome, NOT what a typical trade returns. Use “Avg Peak” for the expectation.'],
+  p90ret: ['P90 90-day return', 'The 90th-percentile per-trade 90-day return — only ~1 trade in 10 did this well or better. A top-decile outcome, NOT an average. Compare against “Avg 90d” for the expectation.'],
 };
 
 // column-key → glossary-key for the dynamic sortable tables (Term renders label plainly if unmapped)
 const TH_KEY = {
   id: 'rank', name: 'study', study_name: 'study', category: 'category', cat: 'category',
   exit_name: 'exit', total_trades: 'ntrades', trades: 'ntrades', stock_trades: 'ntrades',
+  t_stat: 'sig', eff_trades: 'ntrades',
   num_trades: 'ntrades', avg_return: 'avgreturn', win_rate: 'winrate', avg_hold: 'avghold',
   avg_mae: 'avgdip', clean_pct: 'cleanpct', hist_avg_mae: 'avgdip', hist_clean_pct: 'cleanpct',
-  peak_day: 'peak', peak_avg: 'peak', peak_ret: 'peak', ret_90d: 'ret90d', best_peak_ret: 'peak',
-  best_ret_90d: 'ret90d', entry_date: 'entrydate', sector: 'sector', etf: 'etf', entry_price: 'entry',
+  peak_day: 'peak', peak_avg: 'peak', peak_ret: 'peak', ret_90d: 'ret90d', best_peak_ret: 'maxpeak',
+  best_ret_90d: 'p90ret', entry_date: 'entrydate', sector: 'sector', etf: 'etf', entry_price: 'entry',
   exit_price: 'exitprice', exit_date: 'exitdate', return_pct: 'retcol', spy_ret: 'spy', alpha: 'alphacol',
   hold_days: 'avghold', max_drawdown: 'drawdown', stock_avg_return: 'avgreturn', etf_avg_return: 'avgreturn',
   alpha_vs_etf: 'alphacol', stock_win_rate: 'winrate', stock_max_drawdown: 'drawdown', hold_mode: 'mode',
@@ -1077,7 +1114,7 @@ function StudyChartView({ study, onBack }) {
 
   return (
     <div className="study-chart-page">
-      <button className="back-btn" onClick={() => { window.location.hash = '/studies'; onBack(); }}>Back to Indicator Studies</button>
+      <button className="back-btn" onClick={() => { navigate('/studies'); onBack(); }}>Back to Indicator Studies</button>
       <h2>{sector} — {study.signal_name} <span className="dim" style={{fontSize:12,fontWeight:400}}>(D)</span> &rarr; {study.exit_name}</h2>
       <p className="dim">{trades.length} trades on {sector} | {wins} wins ({trades.length > 0 ? (wins/trades.length*100).toFixed(0) : 0}% WR) | Overall: {study.avg_return > 0 ? '+' : ''}{study.avg_return?.toFixed(3)}% avg</p>
 
@@ -1204,7 +1241,9 @@ function StudiesPage() {
 
   return (
     <div className="studies-page">
-      <h1>Indicator Studies <span className="dim">({filtered.length}{filtered.length !== data.studies.length ? ` / ${data.studies.length}` : ''})</span></h1>
+      <h1>Indicator Studies <span className="dim">({filtered.length}{filtered.length !== data.studies.length ? ` / ${data.studies.length}` : ''})</span>
+        {(data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+      </h1>
       <p className="subtitle">{profitable} profitable / {data.studies.length} total across all sector ETFs (5y daily backtest).</p>
 
       {regime && (
@@ -1261,7 +1300,7 @@ function StudiesPage() {
       <table>
         <thead>
           <tr>
-            {[['id','#'],['name','Study'],['category','Cat'],['exit_name','Exit'],['total_trades','Trades'],['avg_return','Avg Ret'],['win_rate','Win%'],['avg_hold','Avg Hold'],['avg_mae','Avg Dip'],['clean_pct','Clean%'],['peak_day','Peak'],['peak_avg','Avg Peak'],['ret_90d','Avg 90d'],['best_peak_ret','Best Peak'],['best_ret_90d','Best 90d']].map(([k,l]) => (
+            {[['id','#'],['name','Study'],['category','Cat'],['exit_name','Exit'],['total_trades','Trades'],['t_stat','Sig (t)'],['avg_return','Avg Ret'],['win_rate','Win%'],['avg_hold','Avg Hold'],['avg_mae','Avg Dip'],['clean_pct','Clean%'],['peak_day','Peak'],['peak_avg','Avg Peak'],['ret_90d','Avg 90d'],['best_peak_ret','Max Tr Peak'],['best_ret_90d','P90 90d']].map(([k,l]) => (
               <th key={k} className="sortable" onClick={() => { if (sortBy === k) setSortDir(d => d === 'desc' ? 'asc' : 'desc'); else { setSortBy(k); setSortDir('desc'); } }}>
                 <Term k={TH_KEY[k]}>{l}</Term> {sortBy === k ? (sortDir === 'desc' ? '\u25BC' : '\u25B2') : ''}
               </th>
@@ -1288,6 +1327,9 @@ function StudiesPage() {
                 <td><span className="study-cat">{s.category}</span></td>
                 <td className="clickable dim" onClick={e => { e.stopPropagation(); setExitFilter(s.exit); }}>{s.exit_name}</td>
                 <td>{(s._regime_trades ?? s.total_trades).toLocaleString()}</td>
+                <td className={s.t_stat == null ? 'dim' : Math.abs(s.t_stat) >= 2 ? 'good' : Math.abs(s.t_stat) < 1 ? 'bad' : ''}
+                    title={s.eff_trades != null ? `${s.eff_trades.toLocaleString()} independent (overlap-deduped) trades` : ''}>
+                  {s.t_stat != null ? s.t_stat.toFixed(1) : '-'}</td>
                 <td className={(s._regime_return ?? s.avg_return) > 0 ? 'good' : 'bad'}>{(s._regime_return ?? s.avg_return) > 0 ? '+' : ''}{(s._regime_return ?? s.avg_return).toFixed(3)}%</td>
                 <td className={(s._regime_wr ?? s.win_rate) > 55 ? 'good' : (s._regime_wr ?? s.win_rate) < 45 ? 'bad' : ''}>{(s._regime_wr ?? s.win_rate).toFixed(1)}%</td>
                 <td className="dim">{s.avg_hold?.toFixed(0) || '-'}d</td>
@@ -1302,7 +1344,7 @@ function StudiesPage() {
               </tr>
               {expanded === s.id && (
                 <tr className="study-detail-row">
-                  <td colSpan={16}>
+                  <td colSpan={17}>
                     <div className="study-detail">
                       <div className="study-detail-section">
                         <h4>Best Sectors</h4>
@@ -1459,7 +1501,7 @@ function StudiesPage() {
                                   <td className="dim">{t.peak_day != null ? `d${t.peak_day}` : '-'}</td>
                                   <td className={t.peak_ret > 0 ? 'good' : 'dim'}>{t.peak_ret != null ? `+${t.peak_ret.toFixed(1)}%` : '-'}</td>
                                   <td className={t.ret_90d > 0 ? 'good' : t.ret_90d < 0 ? 'bad' : 'dim'}>{t.ret_90d != null ? `${t.ret_90d > 0 ? '+' : ''}${t.ret_90d.toFixed(1)}%` : '-'}</td>
-                                  <td><button className="chart-link" onClick={() => { const sec = t.etf || t.sector; window.location.hash = `/study/${encodeURIComponent(s.signal)}/${encodeURIComponent(s.exit)}/${encodeURIComponent(sec)}`; setStudyDetail({...s, chartSector: sec}); }}>chart</button></td>
+                                  <td><button className="chart-link" onClick={() => { const sec = t.etf || t.sector; navigate(`/study/${encodeURIComponent(s.signal)}/${encodeURIComponent(s.exit)}/${encodeURIComponent(sec)}`); setStudyDetail({...s, chartSector: sec}); }}>chart</button></td>
                                 </tr>
                                 );
                               })}
@@ -1704,7 +1746,9 @@ function TrendStudiesPage() {
 
   return (
     <div className="studies-page">
-      <h1>Trend Studies <span className="dim">({sorted.length})</span></h1>
+      <h1>Trend Studies <span className="dim">({sorted.length})</span>
+        {(data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+      </h1>
       <p className="subtitle">Sector momentum rotation backtests. Buy top N sectors by trailing return, hold, rebalance. 5Y backtest excluding crypto. <b>Hold mode</b> = what you buy in each winning sector: the ETF, its top-momentum stock, or its highest-beta stock (both stock picks point-in-time).</p>
 
       <div className="filters" style={{marginBottom:10}}>
@@ -1718,7 +1762,7 @@ function TrendStudiesPage() {
       <table>
         <thead>
           <tr>
-            {[['hold_mode','Hold'],['lookback_months','Lookback'],['hold_months','Hold Mo'],['top_n','Top N'],['total_return','Total Ret'],['annual_return','Annual'],['spy_total','SPY'],['alpha','Alpha'],['max_drawdown','Max DD'],['win_rate','Win%'],['num_trades','Trades']].map(([k,l]) => (
+            {[['hold_mode','Hold'],['lookback_months','Lookback'],['hold_months','Hold Mo'],['top_n','Top N'],['total_return','Total Ret'],['annual_return','Annual'],['spy_total','SPY'],['alpha','Alpha'],['max_drawdown','Max DD'],['win_rate','Win%'],['num_trades','Trades'],['t_stat','Sig (t)']].map(([k,l]) => (
               <th key={k} className="sortable" onClick={() => thClick(k)}><Term k={TH_KEY[k]}>{l}</Term>{thArrow(k)}</th>
             ))}
           </tr>
@@ -1739,6 +1783,9 @@ function TrendStudiesPage() {
               <td className="bad">{s.max_drawdown.toFixed(1)}%</td>
               <td>{s.win_rate.toFixed(0)}%</td>
               <td className="dim">{s.num_trades}</td>
+              <td className={s.robust ? 'good' : (s.t_stat == null ? 'dim' : '')}
+                  title={s.robust ? 'robust: >=12 non-overlapping periods AND |t|>=2' : `${s.num_trades} periods (not robust)`}>
+                {s.t_stat != null ? s.t_stat.toFixed(1) : '–'}{s.robust ? ' ✓' : ''}</td>
             </tr>
           ))}
         </tbody>
@@ -2285,7 +2332,9 @@ function StockStudiesPage() {
 
   return (
     <div className="studies-page">
-      <h1>Stock Indicator Studies <span className="dim">({rows.length} / {data.n_results})</span></h1>
+      <h1>Stock Indicator Studies <span className="dim">({rows.length} / {data.n_results})</span>
+        {(data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+      </h1>
       <p className="subtitle">
         {data.n_signals} signals × {data.n_exits} exits over {data.universe_size} stocks (5y daily).
         Expand a row for the fundamental-bucket breakdown.
@@ -2334,6 +2383,7 @@ function StockStudiesPage() {
             <th onClick={() => setSort('avg_return')} style={{cursor:'pointer', textAlign:'right'}}><Term k="avgreturn">Avg Ret</Term>{arrow('avg_return')}</th>
             <th onClick={() => setSort('win_rate')} style={{cursor:'pointer', textAlign:'right'}}><Term k="winrate">Win%</Term>{arrow('win_rate')}</th>
             <th onClick={() => setSort('trades')} style={{cursor:'pointer', textAlign:'right'}}><Term k="ntrades">Trades</Term>{arrow('trades')}</th>
+            <th onClick={() => setSort('t_stat')} style={{cursor:'pointer', textAlign:'right'}}><Term k="sig">Sig (t)</Term>{arrow('t_stat')}</th>
             <th onClick={() => setSort('avg_hold')} style={{cursor:'pointer', textAlign:'right'}}><Term k="avghold">Hold</Term>{arrow('avg_hold')}</th>
             <th onClick={() => setSort('avg_mae')} style={{cursor:'pointer', textAlign:'right'}}><Term k="avgdip">Avg Dip</Term>{arrow('avg_mae')}</th>
             <th onClick={() => setSort('clean_pct')} style={{cursor:'pointer', textAlign:'right'}}><Term k="cleanpct">Clean%</Term>{arrow('clean_pct')}</th>
@@ -2354,6 +2404,8 @@ function StockStudiesPage() {
                   <td style={{textAlign:'right'}} className={m.avg_return > 0 ? 'good' : 'bad'}><b>{m.avg_return > 0 ? '+' : ''}{m.avg_return}%</b></td>
                   <td style={{textAlign:'right'}}>{m.win_rate}%</td>
                   <td style={{textAlign:'right'}}>{m.trades}</td>
+                  <td style={{textAlign:'right'}} className={r.t_stat == null ? 'dim' : Math.abs(r.t_stat) >= 2 ? 'good' : Math.abs(r.t_stat) < 1 ? 'bad' : ''}
+                      title={r.eff_trades != null ? `${r.eff_trades.toLocaleString()} independent (overlap-deduped) trades` : ''}>{r.t_stat != null ? r.t_stat.toFixed(1) : '–'}</td>
                   <td style={{textAlign:'right'}}>{r.avg_hold}d</td>
                   <td style={{textAlign:'right'}} className={m.avg_mae == null ? 'dim' : m.avg_mae >= -3 ? 'good' : m.avg_mae >= -8 ? '' : 'bad'}>{m.avg_mae != null ? `${m.avg_mae.toFixed(1)}%` : '–'}</td>
                   <td style={{textAlign:'right'}} className={m.clean_pct == null ? 'dim' : m.clean_pct >= 40 ? 'good' : m.clean_pct < 20 ? 'bad' : ''}>{m.clean_pct != null ? `${m.clean_pct.toFixed(0)}%` : '–'}</td>
@@ -2361,7 +2413,7 @@ function StockStudiesPage() {
                 </tr>
                 {isOpen && (
                   <tr className="study-detail-row">
-                    <td colSpan={11}>
+                    <td colSpan={12}>
                       <div className="fund-dim-title" style={{marginBottom:8}}>Fundamental buckets</div>
                       <div className="fund-buckets">
                         {Object.keys(r.by_dimension || {}).length === 0 && <span className="dim">No fundamental buckets cleared the trade floor.</span>}
@@ -2492,7 +2544,9 @@ function FiringNowPage() {
 
   return (
     <div className="studies-page">
-      <h1>Firing Now <span className="dim">({rows.length} shown / {data.n_firing})</span></h1>
+      <h1>Firing Now <span className="dim">({rows.length} shown / {data.n_firing})</span>
+        {(data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+      </h1>
       <p className="subtitle">
         Stocks triggering a top signal within the last {maxDays} bars, with the signal's historical edge + fundamentals.
         {data.computed_at && <span className="dim"> · scanned {new Date(data.computed_at).toLocaleString()}</span>}
@@ -2749,7 +2803,9 @@ function NewsEffectPage() {
 
   return (
     <div className="studies-page">
-      <h1>News Effect {data && <span className="dim">({rows.length} shown / {data.n_total} match, {data.n_effect} moved)</span>}</h1>
+      <h1>News Effect {data && <span className="dim">({rows.length} shown / {data.n_total} match, {data.n_effect} moved)</span>}
+        {data && (data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+      </h1>
       <p className="subtitle">
         Real news events — <b>headlines that actually moved the stock</b>. <b>Day move</b> = β-adjusted abnormal return over the
         news's reaction session (prior close → close, so it includes the overnight / pre-market gap). <b>Moved</b> = ≥2σ
@@ -3801,6 +3857,254 @@ function BacktestPage() {
   );
 }
 
+// Lightweight inline SVG equity curve (strategy vs SPY), both normalized together to the
+// same y-range. Intentionally NO charting library (CSP/deps forbidden) — a plain <svg>
+// with two <polyline>s that scales to its container. Colors come from CSS (theme-agnostic).
+function BtCurve({ curve, height = 150 }) {
+  if (!curve || curve.length < 2) return null;
+  const W = 1000, H = height; // viewBox units; the element scales to container width
+  const strat = curve.map(p => p.strat);
+  const spy = curve.map(p => p.spy);
+  const all = strat.concat(spy).filter(v => v != null);
+  if (!all.length) return null;
+  const mn = Math.min(...all), mx = Math.max(...all), rg = (mx - mn) || 1;
+  const n = curve.length;
+  const X = i => (i / (n - 1)) * W;
+  const Y = v => H - ((v - mn) / rg) * (H - 4) - 2;
+  const pts = arr => arr.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+  return (
+    <svg className="bt-curve" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img" aria-label="Equity curve: strategy vs SPY">
+      <polyline className="bt-line-spy" points={pts(spy)} />
+      <polyline className="bt-line-strat" points={pts(strat)} />
+    </svg>
+  );
+}
+
+// Backtest Lab — read-only view of /backtest-lab. Three phases: (1) rank the rotation RULES,
+// (2) check each signal in- vs out-of-sample, (3) a combined portfolio — all vs SPY buy-hold.
+// POST triggers a (re)compute; we poll until `computed` flips.
+function BacktestLabPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [sortBy, setSortBy] = useState('total_return');
+  const [sortDir, setSortDir] = useState('desc');
+
+  const load = () => {
+    setLoading(true); setErr(null);
+    apiFetch('/backtest-lab')
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { setErr(e.message); setLoading(false); });
+  };
+  useEffect(() => { load(); }, []);
+
+  const run = () => {
+    setRunning(true);
+    fetch(`${API}/backtest-lab`, { method: 'POST' }).then(() => {
+      const t = setInterval(() => {
+        apiFetch('/backtest-lab').then(j => {
+          if (j.computed) { clearInterval(t); setRunning(false); setData(j); }
+        }).catch(() => {});
+      }, 15000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><h1>Backtest Lab</h1><ErrorBanner message={err} onRetry={load} /></div>;
+  if (loading || !data) return <div className="loading">Loading backtest lab...</div>;
+
+  if (!data.computed) {
+    return (
+      <div className="studies-page">
+        <h1>Backtest Lab</h1>
+        <p className="subtitle">Validates the rotation rules, then checks each signal in- vs out-of-sample, then a combined portfolio — all vs SPY buy-hold.</p>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={run} disabled={running}>{running ? 'Running (few min)…' : 'Run backtest'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const fmtPct = (v, plus = true) => (v == null || isNaN(v)) ? '–' : `${plus && v > 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+  const fmtNum = (v, d = 2) => (v == null || isNaN(v)) ? '–' : Number(v).toFixed(d);
+
+  const p1 = data.phase1 || {};
+  const strategies = (p1.strategies || []).slice();
+  const setSort = (col) => { if (sortBy === col) setSortDir(x => x === 'desc' ? 'asc' : 'desc'); else { setSortBy(col); setSortDir('desc'); } };
+  const arrow = (col) => sortBy === col ? (sortDir === 'desc' ? ' ▼' : ' ▲') : '';
+  const accessor = (s) => {
+    const su = s.summary || {};
+    switch (sortBy) {
+      case 'label': return s.label || '';
+      case 'hold_months': return s.hold_months ?? 0;
+      case 'total_return': return su.total_return ?? 0;
+      case 'vs_spy': return (su.total_return ?? 0) - (su.spy_total ?? 0);
+      case 'annual_return': return su.annual_return ?? 0;
+      case 'sharpe': return su.sharpe ?? 0;
+      case 'max_drawdown': return su.max_drawdown ?? 0;
+      case 't_stat': return su.t_stat ?? 0;
+      case 'periods': return su.periods ?? 0;
+      default: return 0;
+    }
+  };
+  strategies.sort((a, b) => {
+    const av = accessor(a), bv = accessor(b);
+    if (typeof av === 'string') return sortDir === 'desc' ? String(bv).localeCompare(String(av)) : String(av).localeCompare(String(bv));
+    return sortDir === 'desc' ? bv - av : av - bv;
+  });
+
+  // Years union across all strategies' by_year, for the per-year beats-SPY grid.
+  const years = [...new Set(strategies.flatMap(s => Object.keys(s.by_year || {})))].sort();
+
+  // Best strategy by total return, for the equity-curve preview.
+  const topStrat = (p1.strategies || []).reduce((best, s) =>
+    (!best || (s.summary?.total_return ?? -Infinity) > (best.summary?.total_return ?? -Infinity)) ? s : best, null);
+
+  const p2 = data.phase2;
+  const p3 = data.phase3;
+  const updated = data.last_updated || data.computed_at;
+
+  return (
+    <div className="studies-page">
+      <h1>Backtest Lab <span className="dim" style={{ fontSize: 13 }}>— rules, robustness &amp; portfolio vs SPY</span>
+        {updated && <span className="last-updated-chip">Updated: {new Date(updated).toLocaleString()}</span>}
+      </h1>
+      <p className="subtitle">
+        Three phases: (1) rank the rotation <b>rules</b>, (2) check each <b>signal</b> in- vs out-of-sample, (3) a combined <b>portfolio</b> — all against SPY buy-hold.
+        {data.universe != null && <> Universe: {data.universe}.</>}
+        <button className="refresh-btn" style={{ marginLeft: 10 }} onClick={run} disabled={running}>{running ? 'Running (few min)…' : 'Re-run'}</button>
+      </p>
+
+      {strategies.length > 0 && <>
+        <h2 className="bt-section">Phase 1 — Rotation rules</h2>
+        <div className="bt-table-wrap">
+          <table className="studies-table bt-table">
+            <thead><tr>
+              <th onClick={() => setSort('label')} style={{ cursor: 'pointer' }}>Strategy{arrow('label')}</th>
+              <th onClick={() => setSort('hold_months')} style={{ cursor: 'pointer', textAlign: 'right' }}>Hold (mo){arrow('hold_months')}</th>
+              <th onClick={() => setSort('total_return')} style={{ cursor: 'pointer', textAlign: 'right' }}>Total Return{arrow('total_return')}</th>
+              <th onClick={() => setSort('vs_spy')} style={{ cursor: 'pointer', textAlign: 'right' }}>vs SPY{arrow('vs_spy')}</th>
+              <th onClick={() => setSort('annual_return')} style={{ cursor: 'pointer', textAlign: 'right' }}><Term k="cagr">Ann%</Term>{arrow('annual_return')}</th>
+              <th onClick={() => setSort('sharpe')} style={{ cursor: 'pointer', textAlign: 'right' }}><Term k="sharpe">Sharpe</Term>{arrow('sharpe')}</th>
+              <th onClick={() => setSort('max_drawdown')} style={{ cursor: 'pointer', textAlign: 'right' }}><Term k="drawdown">Max DD</Term>{arrow('max_drawdown')}</th>
+              <th onClick={() => setSort('t_stat')} style={{ cursor: 'pointer', textAlign: 'right' }}>Sig (t){arrow('t_stat')}</th>
+              <th onClick={() => setSort('periods')} style={{ cursor: 'pointer', textAlign: 'right' }}>Periods{arrow('periods')}</th>
+            </tr></thead>
+            <tbody>
+              {strategies.map((s, i) => {
+                const su = s.summary || {};
+                const beat = (su.total_return ?? 0) > (su.spy_total ?? 0);
+                const delta = (su.total_return ?? 0) - (su.spy_total ?? 0);
+                const sig = su.t_stat != null && Math.abs(su.t_stat) >= 2;
+                return (
+                  <tr key={s.label || i} className={beat ? 'bt-beat' : ''}>
+                    <td>{s.label}</td>
+                    <td style={{ textAlign: 'right' }}>{s.hold_months ?? '–'}</td>
+                    <td style={{ textAlign: 'right' }} className={beat ? 'good' : ''}><b>{fmtPct(su.total_return)}</b></td>
+                    <td style={{ textAlign: 'right' }} className={delta > 0 ? 'good' : 'bad'} title={`SPY ${fmtPct(su.spy_total)}`}>{fmtPct(delta)}</td>
+                    <td style={{ textAlign: 'right' }}>{fmtPct(su.annual_return)}</td>
+                    <td style={{ textAlign: 'right' }}>{fmtNum(su.sharpe)}</td>
+                    <td style={{ textAlign: 'right' }} className="bad">{fmtPct(su.max_drawdown, false)}</td>
+                    <td style={{ textAlign: 'right' }} className={sig ? 'good' : su.t_stat != null && Math.abs(su.t_stat) < 1 ? 'bad' : ''}>{fmtNum(su.t_stat)}</td>
+                    <td style={{ textAlign: 'right' }}>{su.periods ?? '–'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {topStrat && topStrat.curve && topStrat.curve.length > 1 && <>
+          <div className="bt-curve-head">
+            <span className="bt-legend"><span className="bt-swatch strat" /> {topStrat.label} <span className="dim">(top)</span></span>
+            <span className="bt-legend"><span className="bt-swatch spy" /> SPY buy-hold</span>
+            <span className="dim" style={{ fontSize: 11 }}>{topStrat.curve[0].date} → {topStrat.curve[topStrat.curve.length - 1].date}</span>
+          </div>
+          <BtCurve curve={topStrat.curve} />
+        </>}
+
+        {years.length > 0 && <>
+          <h3 className="bt-subhead">Beats SPY by year <span className="dim">(green = strategy beat SPY that year)</span></h3>
+          <div className="bt-table-wrap">
+            <table className="studies-table bt-year-grid">
+              <thead><tr><th>Strategy</th>{years.map(y => <th key={y} style={{ textAlign: 'center' }}>{y}</th>)}</tr></thead>
+              <tbody>
+                {strategies.map((s, i) => (
+                  <tr key={s.label || i}>
+                    <td>{s.label}</td>
+                    {years.map(y => {
+                      const cell = (s.by_year || {})[y];
+                      if (!cell) return <td key={y} className="bt-cell dim" style={{ textAlign: 'center' }}>–</td>;
+                      return <td key={y} className={`bt-cell ${cell.beats ? 'bt-win' : 'bt-lose'}`} style={{ textAlign: 'center' }}
+                        title={`${s.label} ${y}: ${fmtPct(cell.strat)} vs SPY ${fmtPct(cell.spy)}`}>{fmtPct(cell.strat)}</td>;
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>}
+      </>}
+
+      {p2 && p2.signals && p2.signals.length > 0 && <>
+        <h2 className="bt-section">Phase 2 — Signal robustness (in vs out-of-sample)</h2>
+        <p className="subtitle">In-sample before <b>{p2.cutoff_date || '—'}</b>, out-of-sample after. A signal holds up when its out-of-sample t-stat stays ≥ 2 (green row).</p>
+        <div className="bt-table-wrap">
+          <table className="studies-table bt-table">
+            <thead><tr>
+              <th>Signal</th><th>Exit</th>
+              <th style={{ textAlign: 'right' }}>IS avg</th><th style={{ textAlign: 'right' }}>IS t</th><th style={{ textAlign: 'right' }}>IS n</th>
+              <th style={{ textAlign: 'right' }}>OOS avg</th><th style={{ textAlign: 'right' }}>OOS t</th><th style={{ textAlign: 'right' }}>OOS n</th>
+            </tr></thead>
+            <tbody>
+              {p2.signals.map((s, i) => {
+                const is = s.is || {}, oos = s.oos || {};
+                const robust = oos.t != null && Math.abs(oos.t) >= 2;
+                return (
+                  <tr key={(s.signal_key || s.signal || i) + '|' + (s.exit || i)} className={robust ? 'bt-beat' : ''}>
+                    <td title={s.signal_key}>{s.signal}</td>
+                    <td>{s.exit}</td>
+                    <td style={{ textAlign: 'right' }} className={is.avg > 0 ? 'good' : is.avg < 0 ? 'bad' : ''}>{fmtPct(is.avg)}</td>
+                    <td style={{ textAlign: 'right' }} className={is.t != null && Math.abs(is.t) >= 2 ? 'good' : ''}>{fmtNum(is.t)}</td>
+                    <td style={{ textAlign: 'right' }} className="dim">{is.n ?? '–'}</td>
+                    <td style={{ textAlign: 'right' }} className={oos.avg > 0 ? 'good' : oos.avg < 0 ? 'bad' : ''}>{fmtPct(oos.avg)}</td>
+                    <td style={{ textAlign: 'right' }} className={robust ? 'good' : oos.t != null && Math.abs(oos.t) < 1 ? 'bad' : ''}><b>{fmtNum(oos.t)}</b></td>
+                    <td style={{ textAlign: 'right' }} className="dim">{oos.n ?? '–'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </>}
+
+      {p3 && <>
+        <h2 className="bt-section">Phase 3 — Combined portfolio{p3.label ? ` — ${p3.label}` : ''}</h2>
+        {p3.summary && (
+          <p className="subtitle">
+            {p3.summary.total_return != null && <>Total <b className={(p3.summary.total_return ?? 0) > (p3.summary.spy_total ?? 0) ? 'good' : ''}>{fmtPct(p3.summary.total_return)}</b> vs SPY {fmtPct(p3.summary.spy_total)}. </>}
+            {p3.summary.annual_return != null && <>Ann {fmtPct(p3.summary.annual_return)}. </>}
+            {p3.summary.sharpe != null && <>Sharpe {fmtNum(p3.summary.sharpe)}. </>}
+            {p3.summary.max_drawdown != null && <>Max DD {fmtPct(p3.summary.max_drawdown, false)}. </>}
+            {p3.summary.t_stat != null && <>Sig (t) {fmtNum(p3.summary.t_stat)}.</>}
+          </p>
+        )}
+        {p3.curve && p3.curve.length > 1 && <>
+          <div className="bt-curve-head">
+            <span className="bt-legend"><span className="bt-swatch strat" /> Portfolio</span>
+            <span className="bt-legend"><span className="bt-swatch spy" /> SPY buy-hold</span>
+          </div>
+          <BtCurve curve={p3.curve} />
+        </>}
+        <p className="subtitle" style={{ marginTop: 6 }}>The combined portfolio blends the surviving signals into one capital-constrained book.</p>
+      </>}
+
+      <p className="subtitle" style={{ marginTop: 14 }}>⚠️ In-sample figures are survivorship-biased — use them for <i>ranking</i>, not promises. The out-of-sample column (Phase 2) is the honest robustness check.</p>
+    </div>
+  );
+}
+
 function ResearchPage() {
   const [d, setD] = useState(null);
   const [running, setRunning] = useState(false);
@@ -3883,7 +4187,7 @@ function ResearchPage() {
 // Small helper: a tab bar backed by URL hash. `tabs` = [{key,label,hash,el}].
 function HubTabs({ tabs, initKey }) {
   const pick = () => {
-    const h = window.location.hash;
+    const h = window.location.pathname;
     for (const t of tabs) if (t.match && t.match.some(m => h.includes(m))) return t.key;
     return initKey || tabs[0].key;
   };
@@ -3894,7 +4198,7 @@ function HubTabs({ tabs, initKey }) {
       <div className="studies-tabs">
         {tabs.map(t => (
           <button key={t.key} className={tab === t.key ? 'active' : ''}
-                  onClick={() => { setTab(t.key); window.location.hash = t.hash; }}>{t.label}</button>
+                  onClick={() => { setTab(t.key); navigate(t.hash); }}>{t.label}</button>
         ))}
       </div>
       {active.el}
@@ -3910,11 +4214,239 @@ function LiveSignalsHub() {
   ]} />;
 }
 
+function NewsEventStudyPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => fetch(`${API}/news-event-study`).then(r => r.json()).then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+
+  const run = () => {
+    setRunning(true);
+    fetch(`${API}/news-event-study`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/news-event-study`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="error">Error: {err}</div>;
+  if (!data) return <div className="loading">Loading news event study...</div>;
+  if (!data.computed) {
+    return (
+      <div className="studies-page">
+        <h1>News Event Study</h1>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={run} disabled={running}>{running ? 'Running...' : 'Run study'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const g = data.groupings || {};
+  const pct = v => v == null ? '–' : `${v > 0 ? '+' : ''}${v.toFixed(2)}%`;
+  const num = v => v == null ? '–' : v.toFixed(2);
+  const cls = v => v == null ? 'dim' : v > 0 ? 'good' : v < 0 ? 'bad' : 'dim';
+  const sigCls = v => (v == null ? 'dim' : Math.abs(v) >= 2 ? 'good' : 'dim');   // |t|>=2 ≈ stands out
+  const RET_COLS = [
+    { key: 'avg_ar_d0', label: 'AR d0' },
+    { key: 't_ar0', label: 'd0 t', sig: true },
+    { key: 'avg_gap1', label: 'gap +1 (AM)' },
+    { key: 'avg_car5', label: 'CAR-5' },
+    { key: 'avg_car20', label: 'CAR-20' },
+    { key: 'n_car20', label: 'n₂₀', raw: true, int: true },
+    { key: 't_car20', label: 'CAR-20 t', sig: true },
+    { key: 'avg_iv', label: 'avg IV', raw: true },
+    { key: 'avg_surprise', label: 'surprise σ', raw: true },
+  ];
+  const cell = (r, c) => c.sig
+    ? <td key={c.key} className={sigCls(r[c.key])}>{r[c.key] == null ? '–' : r[c.key].toFixed(1)}</td>
+    : c.int
+    ? <td key={c.key} className="dim">{r[c.key] == null ? '–' : r[c.key]}</td>
+    : <td key={c.key} className={c.raw ? '' : cls(r[c.key])}>{r[c.key] == null ? '–' : (c.raw ? num(r[c.key]) : pct(r[c.key]))}</td>;
+
+  const Table = ({ title, note, rows, k0, k1 }) => (
+    <div style={{ marginBottom: 26 }}>
+      <h3 style={{ marginBottom: 2 }}>{title}</h3>
+      {note && <p className="subtitle" style={{ marginTop: 0 }}>{note}</p>}
+      <div style={{ overflowX: 'auto' }}>
+        <table className="studies-table">
+          <thead><tr>
+            <th>{k0[1]}</th><th>{k1[1]}</th><th>n</th>
+            {RET_COLS.map(c => <th key={c.key}>{c.label}</th>)}
+          </tr></thead>
+          <tbody>
+            {(rows || []).map((r, i) => (
+              <tr key={i}>
+                <td>{r[k0[0]]}</td><td>{r[k1[0]]}</td><td>{r.n}</td>
+                {RET_COLS.map(c => cell(r, c))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="studies-page">
+      <h1>News Event Study <span className="dim">({data.n_events} events / {data.n_tickers} tickers)</span></h1>
+      <p className="subtitle">
+        Market-adjusted news reaction, keyed on <b>our model's read</b> (direction/impact), not EODHD sentiment.
+        <b> AR = stock return − β·SPY</b> (news effect, market stripped). <b>AR d0</b> = event-day reaction;
+        <b> gap +1</b> = next-morning (pre-market) abnormal gap; <b>CAR-5/20</b> = abnormal drift over the next 5/20
+        days (excludes day 0); <b>surprise σ</b> = day-0 move in IV-implied sigmas.
+        {data.computed_at && <span className="dim"> · {new Date(data.computed_at).toLocaleString()}</span>}
+        <button className="refresh-btn" style={{ marginLeft: 10 }} onClick={run} disabled={running}>{running ? 'Running...' : 'Re-run'}</button>
+      </p>
+      <div className="dim" style={{ border: '1px solid #7a5533', borderRadius: 6, padding: '8px 12px', margin: '0 0 18px', fontSize: 12, lineHeight: 1.5 }}>
+        <b>Caveats:</b> Universe = <b>today's listed names</b> → survivorship bias (delisted losers missing) makes returns optimistic. ·{' '}
+        <b>gap +1</b> is the overnight slice of day +1 — it's <i>inside</i> CAR-5/20, not additive. ·{' '}
+        <b>surprise</b> = raw move ÷ IV-implied 1σ (matches IV Calibration). ·{' '}
+        CAR requires a <b>full</b> forward window (recent events lacking 20 days ahead are excluded — see <b>n₂₀</b>, the true CAR-20 sample, which is smaller than n). ·{' '}
+        <b>t-columns</b> (d0 t, CAR-20 t) are one-sample t vs 0; <b>|t| ≥ 2</b> (highlighted) is a real move, small-|t| cells are noise. Same-ticker windows overlap, so t slightly overstates significance — treat as a filter, not proof. ·{' '}
+        Sample skews recent (2025–26), on-ticker classified news only; small beta/IV cells (n≈30–130) are noisy.
+      </div>
+
+      <div style={{ marginBottom: 26 }}>
+        <h3 style={{ marginBottom: 2 }}>Overall — average across ALL news events (all stocks together)</h3>
+        <p className="subtitle" style={{ marginTop: 0 }}>
+          The market-adjusted move of a typical classified on-ticker news event, blended across every stock, then split by
+          our model's direction. The <b>ALL events</b> row nets up- and down-news together (so it trends toward the up-news
+          majority); the per-direction rows are the cleaner read.
+        </p>
+        <div style={{ overflowX: 'auto' }}>
+          <table className="studies-table">
+            <thead><tr><th>scope</th><th>n</th>{RET_COLS.map(c => <th key={c.key}>{c.label}</th>)}</tr></thead>
+            <tbody>
+              {[{ label: 'ALL events', ...(g.overall || {}) }, ...(g.by_direction || []).map(d => ({ label: d.model_dir, ...d }))].map((r, i) => (
+                <tr key={i} style={i === 0 ? { fontWeight: 700 } : {}}>
+                  <td>{r.label}</td><td>{r.n == null ? '–' : r.n}</td>
+                  {RET_COLS.map(c => cell(r, c))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <Table title="Model direction × impact" note="Does our model's call + conviction predict the market-adjusted move? (down news is the bigger surprise)"
+             rows={g.by_model_dir_impact} k0={['model_dir', 'dir']} k1={['impact', 'impact']} />
+      <Table title="Model direction × beta (252-day)" note="Under-reaction (good news on low-beta drifts up over 20d) vs over-reaction (high-beta pops then fades)."
+             rows={g.by_model_dir_beta} k0={['model_dir', 'dir']} k1={['beta_bucket', 'beta 252d']} />
+      <Table title="Model direction × beta (60-day)" note="Short-window beta — catches names whose character shifted recently."
+             rows={g.by_model_dir_beta60} k0={['model_dir', 'dir']} k1={['beta60_bucket', 'beta 60d']} />
+      <Table title="IV regime × direction" note="High-IV names over-react on good news and bleed over 20d on flat/uncertain news."
+             rows={g.by_iv_dir} k0={['iv_bucket', 'IV regime']} k1={['model_dir', 'dir']} />
+      <Table title="News type × beta" note="By event category (earnings / guidance / analyst / product / …)."
+             rows={g.by_news_type_beta} k0={['news_type', 'type']} k1={['beta_bucket', 'beta 252d']} />
+    </div>
+  );
+}
+
+function IvCalibrationPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [order, setOrder] = useState('over');
+  const [q, setQ] = useState('');
+
+  const load = () => fetch(`${API}/iv-calibration`).then(r => r.json()).then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const run = () => {
+    setRunning(true);
+    fetch(`${API}/iv-calibration`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/iv-calibration`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="error">Error: {err}</div>;
+  if (!data) return <div className="loading">Loading IV calibration...</div>;
+  if (!data.computed) {
+    return (
+      <div className="studies-page"><h1>IV Calibration</h1>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={run} disabled={running}>{running ? 'Running...' : 'Run study'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const a = data.aggregate || {};
+  let rows = (data.per_ticker || []).filter(r => !q || r.ticker.toLowerCase().includes(q.toLowerCase()));
+  rows = [...rows].sort((x, y) => order === 'over' ? x.median_ratio - y.median_ratio : y.median_ratio - x.median_ratio).slice(0, 60);
+  const ratioCls = v => v < 0.5 ? 'bad' : v > 0.8 ? 'good' : 'dim';
+  const cards = [
+    ['Median ratio', a.median_ratio, 'fair ~0.67'],
+    ['% exceed 1σ', a.pct_1sig != null ? a.pct_1sig + '%' : '–', 'fair ~32%'],
+    ['% exceed 2σ', a.pct_2sig != null ? a.pct_2sig + '%' : '–', 'fair ~5%'],
+    ['% < half implied', a.pct_half != null ? a.pct_half + '%' : '–', 'IV too hot'],
+  ];
+
+  return (
+    <div className="studies-page">
+      <h1>IV Calibration <span className="dim">({a.n_days ? a.n_days.toLocaleString() : 0} stock-days / {data.n_tickers} tickers)</span></h1>
+      <p className="subtitle">
+        Is ATM implied vol a good predictor of the next-day move? Ratio = <b>actual move ÷ IV-implied 1σ daily move</b> (atm_iv/√252).
+        A calibrated normal has median ~0.67 and clears 1σ ~32% of days.
+        {data.computed_at && <span className="dim"> · {new Date(data.computed_at).toLocaleString()}</span>}
+        <button className="refresh-btn" style={{ marginLeft: 10 }} onClick={run} disabled={running}>{running ? 'Running...' : 'Re-run'}</button>
+      </p>
+
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', margin: '12px 0 16px' }}>
+        {cards.map(([label, val, ref]) => (
+          <div key={label} style={{ border: '1px solid #333', borderRadius: 8, padding: '10px 14px', minWidth: 120 }}>
+            <div className="dim" style={{ fontSize: 11 }}>{label}</div>
+            <div style={{ fontSize: 20, fontWeight: 600 }}>{val == null ? '–' : val}</div>
+            <div className="dim" style={{ fontSize: 10 }}>{ref}</div>
+          </div>
+        ))}
+      </div>
+      <p className="subtitle" style={{ marginTop: 0 }}>
+        <b>Take:</b> IV runs hot — the typical day moves ~half of what's implied and clears 1σ far less than a fair market would;
+        the 2σ tails are near-calibrated. Per-ticker below: <span className="bad">low ratio</span> = options systematically
+        over-priced (moves fizzle); <span className="good">high ratio</span> = moves blow past IV (event-prone / IV too cheap).
+        <br /><span style={{ fontSize: 11 }}>Caveats: atm_iv is ~30-day ATM annualized; ÷√252 assumes a flat term structure (standard proxy). Universe = today's listed names (survivorship).</span>
+      </p>
+
+      <div className="studies-controls">
+        <div className="filters">
+          <button className={order === 'over' ? 'active' : ''} onClick={() => setOrder('over')}>Most over-priced</button>
+          <button className={order === 'under' ? 'active' : ''} onClick={() => setOrder('under')}>Moves blow past IV</button>
+        </div>
+        <input className="studies-search" placeholder="ticker…" value={q} onChange={e => setQ(e.target.value)} />
+      </div>
+
+      <div style={{ overflowX: 'auto' }}>
+        <table className="studies-table">
+          <thead><tr><th>Ticker</th><th>days</th><th>median ratio</th><th>% exceed 1σ</th><th>avg IV</th></tr></thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r.ticker}>
+                <td>{r.ticker}</td><td>{r.n}</td>
+                <td className={ratioCls(r.median_ratio)}>{r.median_ratio.toFixed(2)}</td>
+                <td>{r.pct_1sig}%</td><td>{r.avg_iv}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function NewsHub() {
   return <HubTabs initKey="newsfx" tabs={[
     { key: 'newsfx', label: 'News Effect', hash: '/news/effect', match: ['effect', 'newsfx'], el: <NewsEffectPage /> },
     { key: 'newscl', label: 'Clusters', hash: '/news/clusters', match: ['clusters', 'newscl'], el: <NewsClusterPage /> },
     { key: 'newshz', label: 'News Horizon', hash: '/news/horizon', match: ['horizon', 'newshz'], el: <NewsHorizonPage /> },
+    { key: 'newsev', label: 'Event Study', hash: '/news/eventstudy', match: ['eventstudy', 'newsev'], el: <NewsEventStudyPage /> },
+    { key: 'ivcal', label: 'IV Calibration', hash: '/news/ivcal', match: ['ivcal'], el: <IvCalibrationPage /> },
   ]} />;
 }
 
@@ -3929,10 +4461,20 @@ function ResearchHub() {
   ]} />;
 }
 
+// Pretty-URL navigation via the History API (no '#'). nginx serves index.html for every route
+// (SPA fallback already in nginx.conf), so deep links and refreshes work. Browser back/forward is
+// handled by the popstate listener in App. Empty/'' means the home route ('/').
+function navigate(to) {
+  const path = to && to !== '' ? to : '/';
+  if (window.location.pathname !== path) window.history.pushState({}, '', path);
+}
+
+// NOTE: name kept as parseHash for minimal churn; it now reads window.location.pathname (pretty URLs).
 function parseHash() {
-  const h = window.location.hash.slice(1);
+  const h = window.location.pathname;
   if (h.startsWith('/settings')) return { view: 'settings' };
   if (h.startsWith('/live')) return { view: 'live' };
+  if (h.startsWith('/backtest')) return { view: 'backtestlab' };
   if (h.startsWith('/news')) return { view: 'news' };
   if (h.startsWith('/research')) return { view: 'research' };
   // back-compat: the old single Studies hub is now split; land in Research.
@@ -3966,18 +4508,29 @@ export default function App() {
   const [filter, setFilter] = useState('all');
   const [dashInterval, setDashInterval] = useState('1d');
 
+  const [backendDown, setBackendDown] = useState(false);
+
   const loadScan = (force = false, interval = dashInterval) => {
     setLoading(true);
     setError(null);
     const p = new URLSearchParams();
     if (force) p.set('force', 'true');
     if (interval !== '1d') p.set('interval', interval);
-    const url = `${API}/scan?${p.toString()}`;
-    fetch(url)
-      .then(r => r.json())
-      .then(d => { setScanData(d); setLoading(false); })
+    apiFetch(`/scan?${p.toString()}`)
+      .then(d => { setScanData(d); setBackendDown(false); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
   };
+
+  // Global backend-health poll — drives a persistent banner on EVERY page when the API is
+  // unreachable (so a 502/restart shows a clear message + retry instead of dead/blank pages).
+  useEffect(() => {
+    let stop = false;
+    const ping = () => apiFetch('/sectors')
+      .then(() => { if (!stop) setBackendDown(false); })
+      .catch(() => { if (!stop) setBackendDown(true); });
+    const t = setInterval(ping, 20000);
+    return () => { stop = true; clearInterval(t); };
+  }, []);
 
   const handleIntervalChange = (iv) => {
     setDashInterval(iv);
@@ -3986,16 +4539,20 @@ export default function App() {
 
   useEffect(() => {
     loadScan();
-    const init = parseHash();
-    if (init.view === 'settings') setPage('settings');
-    if (init.view === 'live') setPage('live');
-    if (init.view === 'news') setPage('news');
-    if (init.view === 'research') setPage('research');
-    if (init.view === 'journal') setPage('journal');
-    if (init.view === 'drilldown') setPage('drilldown');
-    if (init.view === 'docs') setPage('docs');
-    if (init.view === 'sector') handleSectorClick(init.sector);
-    if (init.view === 'chart') setChartTicker(init.ticker);
+    // Apply the current URL to app state — runs on mount (deep links) and on browser back/forward
+    // (popstate). Pretty URLs come from navigate()'s pushState; this keeps state in sync.
+    const applyRoute = () => {
+      const r = parseHash();
+      const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
+                       journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab' };
+      if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
+      else if (r.view === 'sector') { setPage('dashboard'); handleSectorClick(r.sector); }
+      else if (r.view === 'chart') { setPage('dashboard'); setChartTicker(r.ticker); }
+      else { setPage('dashboard'); setSelectedSector(null); setChartTicker(null); }
+    };
+    applyRoute();
+    window.addEventListener('popstate', applyRoute);
+    return () => window.removeEventListener('popstate', applyRoute);
     // eslint-disable-next-line
   }, []);
 
@@ -4010,14 +4567,14 @@ export default function App() {
     setSelectedSector(sector);
     setDrilldown(null);
     setChartTicker(null);
-    window.location.hash = `/sector/${encodeURIComponent(sector)}`;
+    navigate(`/sector/${encodeURIComponent(sector)}`);
     fetch(`${API}/drilldown/${encodeURIComponent(sector)}`)
       .then(r => r.json())
       .then(d => {
         if (!d.stocks || d.stocks.length === 0) {
           setSelectedSector(null);
           setChartTicker(etf);
-          window.location.hash = `/chart/${etf}`;
+          navigate(`/chart/${etf}`);
         } else {
           setDrilldown(d);
         }
@@ -4028,13 +4585,13 @@ export default function App() {
   const handleChartClick = (ticker, sectorEtf = null) => {
     setChartTicker(ticker);
     setChartSectorEtf(sectorEtf);
-    window.location.hash = `/chart/${ticker}`;
+    navigate(`/chart/${ticker}`);
   };
 
   const handleBack = () => {
     setSelectedSector(null);
     setChartTicker(null);
-    window.location.hash = '';
+    navigate('');
   };
 
   const handleSort = (col) => {
@@ -4052,49 +4609,57 @@ export default function App() {
     })
   } : null;
 
-  if (error) return <div className="error">Error: {error}</div>;
-
   return (
     <div className="layout">
+      {backendDown && (
+        <div className="backend-down-banner" role="alert">
+          <span>&#9888; Backend unavailable — the server may be restarting or busy. Data may be stale.</span>
+          <button onClick={() => { loadScan(true); }}>Retry now</button>
+        </div>
+      )}
       <nav className="sidebar">
         <div className="sidebar-logo">Rotation</div>
         <ul className="sidebar-menu">
-          <li className={`sidebar-item ${page === 'dashboard' ? 'active' : ''}`} onClick={() => { setPage('dashboard'); setSelectedSector(null); setChartTicker(null); setChartSectorEtf(null); window.location.hash = ''; }}>
+          <li className={`sidebar-item ${page === 'dashboard' ? 'active' : ''}`} onClick={() => { setPage('dashboard'); setSelectedSector(null); setChartTicker(null); setChartSectorEtf(null); navigate(''); }}>
             <span className="sidebar-icon">&#9678;</span>
             Rotation Dashboard
           </li>
-          <li className={`sidebar-item ${page === 'live' ? 'active' : ''}`} onClick={() => { setPage('live'); window.location.hash = '/live'; }}>
+          <li className={`sidebar-item ${page === 'live' ? 'active' : ''}`} onClick={() => { setPage('live'); navigate('/live'); }}>
             <span className="sidebar-icon">&#9889;</span>
             Live Signals
           </li>
-          <li className={`sidebar-item ${page === 'news' ? 'active' : ''}`} onClick={() => { setPage('news'); window.location.hash = '/news'; }}>
+          <li className={`sidebar-item ${page === 'news' ? 'active' : ''}`} onClick={() => { setPage('news'); navigate('/news'); }}>
             <span className="sidebar-icon">&#128240;</span>
             News
           </li>
-          <li className={`sidebar-item ${page === 'research' ? 'active' : ''}`} onClick={() => { setPage('research'); window.location.hash = '/research'; }}>
+          <li className={`sidebar-item ${page === 'research' ? 'active' : ''}`} onClick={() => { setPage('research'); navigate('/research'); }}>
             <span className="sidebar-icon">&#9733;</span>
             Research
           </li>
-          <li className={`sidebar-item ${page === 'drilldown' ? 'active' : ''}`} onClick={() => { setPage('drilldown'); window.location.hash = '/drilldown'; }}>
+          <li className={`sidebar-item ${page === 'backtestlab' ? 'active' : ''}`} onClick={() => { setPage('backtestlab'); navigate('/backtest'); }}>
+            <span className="sidebar-icon">&#128200;</span>
+            Backtest
+          </li>
+          <li className={`sidebar-item ${page === 'drilldown' ? 'active' : ''}`} onClick={() => { setPage('drilldown'); navigate('/drilldown'); }}>
             <span className="sidebar-icon">&#9660;</span>
             Stock Drilldown
           </li>
-          <li className={`sidebar-item ${page === 'journal' ? 'active' : ''}`} onClick={() => { setPage('journal'); window.location.hash = '/journal'; }}>
+          <li className={`sidebar-item ${page === 'journal' ? 'active' : ''}`} onClick={() => { setPage('journal'); navigate('/journal'); }}>
             <span className="sidebar-icon">&#9998;</span>
             Trade Journal
           </li>
-          <li className={`sidebar-item ${page === 'docs' ? 'active' : ''}`} onClick={() => { setPage('docs'); window.location.hash = '/docs'; }}>
+          <li className={`sidebar-item ${page === 'docs' ? 'active' : ''}`} onClick={() => { setPage('docs'); navigate('/docs'); }}>
             <span className="sidebar-icon">&#9776;</span>
             Docs
           </li>
-          <li className={`sidebar-item ${page === 'settings' ? 'active' : ''}`} onClick={() => { setPage('settings'); window.location.hash = '/settings'; }}>
+          <li className={`sidebar-item ${page === 'settings' ? 'active' : ''}`} onClick={() => { setPage('settings'); navigate('/settings'); }}>
             <span className="sidebar-icon">&#9881;</span>
             Settings
           </li>
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
@@ -4107,7 +4672,8 @@ export default function App() {
             </div>
           </div>
         </header>
-        {chartTicker && <ChartView ticker={chartTicker} sectorEtf={chartSectorEtf} onClose={() => { setChartTicker(null); setChartSectorEtf(null); if (!selectedSector) window.location.hash = ''; }} />}
+        {error && <ErrorBanner message={error} onRetry={() => loadScan(true)} onDismiss={() => setError(null)} />}
+        {chartTicker && <ChartView ticker={chartTicker} sectorEtf={chartSectorEtf} onClose={() => { setChartTicker(null); setChartSectorEtf(null); if (!selectedSector) navigate(''); }} />}
         {selectedSector ? (
           <StockTable sector={selectedSector} data={drilldown} onBack={handleBack} onTickerClick={(t, etf) => handleChartClick(t, etf)} />
         ) : (
