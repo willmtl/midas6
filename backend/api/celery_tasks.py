@@ -409,6 +409,34 @@ def run_congress_trades():
 
 
 @shared_task
+def run_congress_study():
+    """Nightly: PIT market-adjusted forward-return study of congressional trades vs SPY →
+    BacktestResult[congress_study] (the script persists to DB itself)."""
+    import subprocess, os
+    if not os.path.exists("/app/congress_study.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/congress_study.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("congress_study failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
+def run_delisted_survivorship():
+    """Weekly: survivorship-bias audit of the universe vs the delisted list →
+    BacktestResult[delisted_survivorship]."""
+    import subprocess, os
+    if not os.path.exists("/app/delisted_survivorship.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/delisted_survivorship.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0:
+        logger.error("delisted_survivorship failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_backtest_decomp():
     """Nightly: rotation-edge decomposition (pick vs rotation vs both, 200MA both-numbers,
     value×technical) → BacktestResult[decomposition]. Runs AFTER candles/fundamentals refresh."""

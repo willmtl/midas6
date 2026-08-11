@@ -212,6 +212,16 @@ def main():
     with open(OUT_PATH, "w") as f:
         json.dump(r, f, indent=2)
 
+    try:   # persist to Postgres like every other study
+        from core.models import BacktestResult
+        from django.utils import timezone
+        payload = json.loads(json.dumps(r, default=str))
+        BacktestResult.objects.update_or_create(
+            kind="delisted_survivorship", defaults={"payload": payload, "computed_at": timezone.now()})
+        print("[delisted] saved to DB (BacktestResult kind=delisted_survivorship)")
+    except Exception as e:
+        print("[delisted] DB save failed:", e)
+
     print_summary(r)
     print("\nWrote", OUT_PATH)
 

@@ -200,4 +200,12 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_eodhd_analyst_ratings",
         "schedule": crontab(hour=21, minute=12, day_of_week=0),
     },
+    "congress-study-nightly": {         # legislator-trade forward-return study (after data refresh)
+        "task": "api.celery_tasks.run_congress_study",
+        "schedule": crontab(hour=23, minute=20),
+    },
+    "delisted-survivorship-weekly": {   # survivorship-bias audit
+        "task": "api.celery_tasks.run_delisted_survivorship",
+        "schedule": crontab(hour=21, minute=20, day_of_week=0),
+    },
 }

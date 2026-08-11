@@ -380,7 +380,9 @@ class FundamentalsListView(APIView):
                   'dividend_yield', 'revenue_growth', 'profit_margin', 'debt_to_equity',
                   'short_ratio', 'short_pct_float', 'insider_pct', 'institution_pct',
                   'analyst_rating', 'analyst_target', 'float_shares', 'shares_outstanding',
-                  'beta_5y', 'sector', 'industry', 'free_cash_flow', 'book_value']
+                  'beta_5y', 'sector', 'industry', 'free_cash_flow', 'book_value',
+                  'analyst_strong_buy', 'analyst_buy', 'analyst_hold', 'analyst_sell',
+                  'analyst_strong_sell', 'analyst_rating_mean', 'cusip', 'cik', 'isin']
         # ONE query, newest-first, keep the first (latest) row per ticker. Was an N+1: a group-by
         # for the latest date, then a .first() per ticker → ~1000 round-trips per request.
         import math
@@ -1552,3 +1554,54 @@ class BacktestDecompView(APIView):
                 pass
         threading.Thread(target=_run, daemon=True).start()
         return Response({"status": "decomposition recompute started"})
+
+
+class _StudyResultView(APIView):
+    """Serve a persisted analysis payload from BacktestResult by `kind` (DB-first, JSON fallback).
+    POST re-runs the backing script in the background."""
+    kind = None
+    script = None
+    json_path = None
+
+    def get(self, request):
+        import os as _os, json as _json
+        from core.models import BacktestResult
+        row = BacktestResult.objects.filter(kind=self.kind).first()
+        if row:
+            data = dict(row.payload or {})
+            data["computed"] = True
+            data["last_updated"] = row.computed_at.isoformat()
+            return Response(data)
+        if self.json_path and _os.path.exists(self.json_path):
+            with open(self.json_path) as f:
+                data = _json.load(f)
+            data["computed"] = True
+            data["last_updated"] = data.get("computed_at")
+            return Response(data)
+        return Response({"computed": False, "message": f"{self.kind} not computed yet. POST to run it."})
+
+    def post(self, request):
+        import threading, subprocess
+        script = self.script
+
+        def _run():
+            try:
+                subprocess.run(["python", "-u", script], cwd="/app", timeout=3600)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+        return Response({"status": f"{self.kind} recompute started"})
+
+
+class CongressStudyView(_StudyResultView):
+    """Congressional-trades forward-return study (PIT, market-adjusted vs SPY)."""
+    kind = "congress_study"
+    script = "congress_study.py"
+    json_path = "/app/.data/studies/congress_study.json"
+
+
+class DelistedSurvivorshipView(_StudyResultView):
+    """Survivorship-bias audit of the study universe vs the EODHD delisted list."""
+    kind = "delisted_survivorship"
+    script = "delisted_survivorship.py"
+    json_path = "/app/.data/studies/delisted_survivorship.json"

@@ -57,6 +57,8 @@ x-backend-volumes: &backend-volumes
   - ./fetch_delisted.py:/app/fetch_delisted.py
   - ./fetch_ust_rates.py:/app/fetch_ust_rates.py
   - ./fetch_congress.py:/app/fetch_congress.py
+  - ./congress_study.py:/app/congress_study.py
+  - ./delisted_survivorship.py:/app/delisted_survivorship.py
   - ./.data:/app/.data
 
 services:

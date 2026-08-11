@@ -324,6 +324,16 @@ def main():
         json.dump(out, f, indent=2, default=str)
     print(f"\n[congress] wrote {outpath}")
 
+    try:   # persist to Postgres like every other study (JSON-roundtrip for JSONField safety)
+        from core.models import BacktestResult
+        from django.utils import timezone
+        payload = json.loads(json.dumps(out, default=str))
+        BacktestResult.objects.update_or_create(
+            kind="congress_study", defaults={"payload": payload, "computed_at": timezone.now()})
+        print("[congress] saved to DB (BacktestResult kind=congress_study)")
+    except Exception as e:
+        print("[congress] DB save failed:", e)
+
     print_summary(out)
 
 
