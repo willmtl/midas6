@@ -80,6 +80,15 @@ class Fundamental(models.Model):
     analyst_rating = models.CharField(max_length=20, null=True, blank=True)
     analyst_target = models.FloatField(null=True, blank=True)
     analyst_count = models.IntegerField(null=True, blank=True)
+    # Analyst rating DISTRIBUTION (EODHD fundamentals AnalystRatings block) — the buy/hold/sell spread
+    # behind the consensus, so we can measure conviction (e.g. StrongBuy-heavy vs split) not just an
+    # average. rating_mean is EODHD's 1(StrongBuy)–5(StrongSell) numeric consensus.
+    analyst_strong_buy = models.IntegerField(null=True, blank=True)
+    analyst_buy = models.IntegerField(null=True, blank=True)
+    analyst_hold = models.IntegerField(null=True, blank=True)
+    analyst_sell = models.IntegerField(null=True, blank=True)
+    analyst_strong_sell = models.IntegerField(null=True, blank=True)
+    analyst_rating_mean = models.FloatField(null=True, blank=True)   # EODHD 1–5, HIGHER = more bullish (≈5 StrongBuy … 1 StrongSell)
     # Balance sheet
     total_cash = models.BigIntegerField(null=True, blank=True)
     total_debt = models.BigIntegerField(null=True, blank=True)

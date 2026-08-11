@@ -305,6 +305,18 @@ def run_eodhd_estimates():
 
 
 @shared_task
+def run_eodhd_analyst_ratings():
+    """Weekly: pull the EODHD AnalystRatings distribution (StrongBuy…StrongSell + mean) → Fundamental."""
+    import os
+    if not os.environ.get("EODHD_API_KEY"):
+        return {"skipped": "no key"}
+    from api.tasks import import_eodhd_analyst_ratings
+    r = import_eodhd_analyst_ratings()
+    logger.info(f"EODHD analyst ratings import: {r}")
+    return r
+
+
+@shared_task
 def run_backtest_lab():
     """Nightly: regenerate the backtest lab (root backtest_concept.py → .data/studies/backtest_concept.json)
     as a clean SUBPROCESS.

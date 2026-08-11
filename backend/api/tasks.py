@@ -1393,6 +1393,53 @@ def import_eodhd_estimates(tickers=None):
     return {"saved": saved}
 
 
+def import_eodhd_analyst_ratings(tickers=None):
+    """Pull the EODHD fundamentals AnalystRatings block → Fundamental analyst distribution columns
+    (StrongBuy/Buy/Hold/Sell/StrongSell counts + 1–5 rating mean + target). Updates the latest
+    Fundamental row per ticker (leaves ticker + everything else untouched)."""
+    from core.models import Fundamental
+    from seq_fundamental_study import build_universe
+    if not os.environ.get("EODHD_API_KEY"):
+        return {"error": "EODHD_API_KEY not set"}
+    tickers = tickers or build_universe()
+    saved = 0
+    for tk in tickers:
+        sym = _eodhd_sym(tk)
+        if not sym:
+            continue
+        d = _eodhd_get(f"fundamentals/{sym}", filter="AnalystRatings")
+        if not isinstance(d, dict) or not d:
+            continue
+        row = Fundamental.objects.filter(ticker=tk).order_by("-date").first()
+        if not row:
+            continue
+
+        def _i(x):
+            try:
+                return int(round(float(x)))
+            except (TypeError, ValueError):
+                return None
+
+        def _f(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+        row.analyst_strong_buy = _i(d.get("StrongBuy"))
+        row.analyst_buy = _i(d.get("Buy"))
+        row.analyst_hold = _i(d.get("Hold"))
+        row.analyst_sell = _i(d.get("Sell"))
+        row.analyst_strong_sell = _i(d.get("StrongSell"))
+        row.analyst_rating_mean = _f(d.get("Rating"))
+        if row.analyst_target is None:
+            row.analyst_target = _f(d.get("TargetPrice"))
+        row.save(update_fields=["analyst_strong_buy", "analyst_buy", "analyst_hold", "analyst_sell",
+                                "analyst_strong_sell", "analyst_rating_mean", "analyst_target"])
+        saved += 1
+    logger.info("import_eodhd_analyst_ratings: %d rows", saved)
+    return {"saved": saved}
+
+
 def import_eodhd_fundamentals(tickers=None, only_missing=True, yf_fallback=True):
     """Backfill historical QUARTERLY financials into FinancialReport from EODHD
     `fundamentals/{sym}` (global coverage), for tickers SEC EDGAR can't serve — foreign filers

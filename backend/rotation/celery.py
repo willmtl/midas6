@@ -196,4 +196,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_delisted",
         "schedule": crontab(hour=21, minute=5, day_of_week=0),
     },
+    "eodhd-analyst-ratings-weekly": {   # analyst buy/hold/sell distribution → Fundamental
+        "task": "api.celery_tasks.run_eodhd_analyst_ratings",
+        "schedule": crontab(hour=21, minute=12, day_of_week=0),
+    },
 }
