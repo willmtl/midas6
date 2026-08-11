@@ -3883,6 +3883,87 @@ function BtCurve({ curve, height = 150 }) {
 // Backtest Lab — read-only view of /backtest-lab. Three phases: (1) rank the rotation RULES,
 // (2) check each signal in- vs out-of-sample, (3) a combined portfolio — all vs SPY buy-hold.
 // POST triggers a (re)compute; we poll until `computed` flips.
+// Rotation-edge decomposition: is the edge the sector ROTATION, the stock PICK, or the COMBINATION?
+// Renders the 3-arm decomposition, the 200-day-MA rotation with BOTH numbers (ETF vs pick-after),
+// and the value×technical section (buy the cheapest-P/B firer).
+function DecompSection({ decomp }) {
+  if (!decomp || !decomp.computed) return null;
+  const pct = (v, plus = true) => (v == null || isNaN(v)) ? '–' : `${plus && v > 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+  const num = (v, d = 2) => (v == null || isNaN(v)) ? '–' : Number(v).toFixed(d);
+  const Row = ({ label, s, strong }) => {
+    if (!s) return null;
+    const beat = (s.vs_spy ?? 0) > 0;
+    const sig = s.t_stat != null && Math.abs(s.t_stat) >= 2;
+    return (
+      <tr className={strong ? 'bt-beat' : ''}>
+        <td>{strong ? <b>{label}</b> : label}</td>
+        <td style={{ textAlign: 'right' }} className={beat ? 'good' : ''}><b>{pct(s.total_return)}</b></td>
+        <td style={{ textAlign: 'right' }} className={beat ? 'good' : 'bad'}>{pct(s.vs_spy)}</td>
+        <td style={{ textAlign: 'right' }}>{pct(s.annual_return)}</td>
+        <td style={{ textAlign: 'right' }}>{num(s.sharpe)}</td>
+        <td style={{ textAlign: 'right' }} className="bad">{pct(s.max_drawdown, false)}</td>
+        <td style={{ textAlign: 'right' }} className={sig ? 'good' : s.t_stat != null && Math.abs(s.t_stat) < 1 ? 'bad' : ''}>{num(s.t_stat)}</td>
+        <td style={{ textAlign: 'right' }}>{s.periods ?? '–'}</td>
+      </tr>
+    );
+  };
+  const Head = () => (
+    <thead><tr>
+      <th>Arm</th><th style={{ textAlign: 'right' }}>Total</th><th style={{ textAlign: 'right' }}>vs SPY</th>
+      <th style={{ textAlign: 'right' }}>Ann%</th><th style={{ textAlign: 'right' }}>Sharpe</th>
+      <th style={{ textAlign: 'right' }}>Max DD</th><th style={{ textAlign: 'right' }}>Sig (t)</th>
+      <th style={{ textAlign: 'right' }}>Periods</th>
+    </tr></thead>
+  );
+  const dec = decomp.decomposition || {};
+  const sma = decomp.sma200_rotation;
+  const vxt = decomp.value_x_technical;
+  return (
+    <>
+      <h2 className="bt-section">Where the edge comes from — 3-arm decomposition <span className="dim" style={{ fontSize: 12 }}>(monthly, equal-weight, point-in-time)</span></h2>
+      <p className="subtitle">If <b>rotation + pick</b> ≈ <b>pick only</b>, the edge is the stock PICK; if it ≈ <b>rotation only</b>, it's the ROTATION. The cheapest-P/B (<b>lowpb</b>) pick is the standout.</p>
+      {['lowpb', 'momentum'].map(kind => dec[kind] && (
+        <div key={kind} style={{ marginBottom: 14 }}>
+          <h3 className="bt-subhead">{kind === 'lowpb' ? 'Cheapest-P/B (value) pick' : 'Momentum pick'}</h3>
+          <div className="bt-table-wrap"><table className="studies-table bt-table"><Head />
+            <tbody>
+              <Row label="Pick only (whole universe)" s={dec[kind].arm1_pick_only?.summary} strong={kind === 'lowpb'} />
+              <Row label="Rotation only (top momentum sectors, hold ETF)" s={dec[kind].arm2_rotation_only?.summary} />
+              <Row label="Rotation + pick (rotate, then pick 1 stock/sector)" s={dec[kind].arm3_rotation_plus_pick?.summary} strong={kind === 'lowpb'} />
+            </tbody>
+          </table></div>
+        </div>
+      ))}
+
+      {sma && <>
+        <h2 className="bt-section">200-day MA rotation — both numbers</h2>
+        <p className="subtitle">Rotate into sectors trading above their 200-day MA, then compare holding the <b>ETF</b> vs taking the <b>stock after</b> (the key comparison).</p>
+        <div className="bt-table-wrap"><table className="studies-table bt-table"><Head />
+          <tbody>
+            <Row label="Rotation only (hold the ETF)" s={sma.rotation_only?.summary} />
+            <Row label="+ cheapest-P/B stock pick after" s={sma.rotation_plus_pick?.lowpb?.summary} strong />
+            <Row label="+ momentum stock pick after" s={sma.rotation_plus_pick?.momentum?.summary} />
+          </tbody>
+        </table></div>
+      </>}
+
+      {vxt && (vxt.signals || []).length > 0 && <>
+        <h2 className="bt-section">Value × technical — buy the cheapest-P/B firer</h2>
+        <p className="subtitle">Among the stocks firing a technical signal each month, buy the single cheapest-P/B one, vs the signal alone.</p>
+        <div className="bt-table-wrap"><table className="studies-table bt-table"><Head />
+          <tbody>
+            <Row label="Cheapest-P/B alone (whole universe)" s={vxt.lowpb_alone?.summary} strong />
+            {(vxt.signals || []).filter(sg => sg.present && sg.signal_alone).map(sg => [
+              <Row key={sg.signal_key + '-a'} label={`${sg.signal_name} — signal alone`} s={sg.signal_alone?.summary} />,
+              <Row key={sg.signal_key + '-b'} label={`${sg.signal_name} — + cheapest-P/B pick`} s={sg.signal_plus_lowpb?.summary} strong />,
+            ])}
+          </tbody>
+        </table></div>
+      </>}
+    </>
+  );
+}
+
 function BacktestLabPage() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
@@ -3890,12 +3971,14 @@ function BacktestLabPage() {
   const [running, setRunning] = useState(false);
   const [sortBy, setSortBy] = useState('total_return');
   const [sortDir, setSortDir] = useState('desc');
+  const [decomp, setDecomp] = useState(null);
 
   const load = () => {
     setLoading(true); setErr(null);
     apiFetch('/backtest-lab')
       .then(d => { setData(d); setLoading(false); })
       .catch(e => { setErr(e.message); setLoading(false); });
+    apiFetch('/backtest-decomp').then(d => setDecomp(d)).catch(() => {});
   };
   useEffect(() => { load(); }, []);
 
@@ -4099,6 +4182,8 @@ function BacktestLabPage() {
         </>}
         <p className="subtitle" style={{ marginTop: 6 }}>The combined portfolio blends the surviving signals into one capital-constrained book.</p>
       </>}
+
+      <DecompSection decomp={decomp} />
 
       <p className="subtitle" style={{ marginTop: 14 }}>⚠️ In-sample figures are survivorship-biased — use them for <i>ranking</i>, not promises. The out-of-sample column (Phase 2) is the honest robustness check.</p>
     </div>
