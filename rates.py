@@ -25,11 +25,69 @@ from pathlib import Path
 CACHE_DIR = Path(__file__).parent / ".data"
 
 
+def _add_regime_cols(df):
+    """Given a daily df with rate_3m + rate_10y (percent), attach regime / curve / trend columns."""
+    # Rate regime by the short rate.
+    df["regime"] = pd.cut(
+        df["rate_3m"],
+        bins=[-float("inf"), 2.0, 4.0, float("inf")],
+        labels=["LOW", "MEDIUM", "HIGH"],
+    )
+    # Yield curve (10Y minus short).
+    df["spread_10y_3m"] = df["rate_10y"] - df["rate_3m"]
+    df["curve"] = df["spread_10y_3m"].apply(lambda x: "NORMAL" if x > 0 else "INVERTED")
+    # Rate trend (is the short rate rising or falling over last 20 days?).
+    df["rate_sma20"] = df["rate_3m"].rolling(20).mean()
+    # Emit NaN during the 20-bar SMA warmup instead of forcing "FALLING" (rate_3m > NaN → False →
+    # bogus FALLING). Build the labels, then NaN the warmup on an object array (np.nan + str can't
+    # share one np.where).
+    _rt_lab = np.where(df["rate_3m"] > df["rate_sma20"], "RISING", "FALLING").astype(object)
+    _rt_lab[df["rate_sma20"].isna().to_numpy()] = np.nan
+    df["rate_trend"] = _rt_lab
+    return df
+
+
+def _rates_from_db():
+    """Prefer the OFFICIAL US Treasury curve (EODHD UST → TreasuryRate) over the yfinance proxy:
+    build a daily rate_3m / rate_10y frame from the 3M + 10Y par yields. Returns None if the table
+    is empty or Django isn't importable (standalone use falls back to yfinance)."""
+    try:
+        import os
+        os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings")
+        try:
+            from core.models import TreasuryRate
+        except Exception:
+            import django
+            django.setup()
+            from core.models import TreasuryRate
+        rows = list(TreasuryRate.objects.filter(
+            series="yield", tenor__in=["3M", "10Y"]).values("date", "tenor", "rate"))
+        if not rows:
+            return None
+        raw = pd.DataFrame(rows)
+        piv = raw.pivot_table(index="date", columns="tenor", values="rate", aggfunc="last").sort_index()
+        if "3M" not in piv.columns or "10Y" not in piv.columns:
+            return None
+        out = pd.DataFrame(index=pd.to_datetime(piv.index))
+        out["rate_10y"] = piv["10Y"].to_numpy()
+        out["rate_3m"] = piv["3M"].to_numpy()
+        out = out.ffill().dropna()
+        return out if len(out) > 100 else None
+    except Exception:
+        return None
+
+
 def get_rates(period="5y"):
-    """Download and return daily interest rate data."""
+    """Return daily interest rate data. Source priority: OFFICIAL UST curve in Postgres (auto-updated
+    nightly), then the yfinance ^TNX/^IRX proxy (cached) as a fallback."""
+    # 1) Official UST curve from the DB (preferred — full curve, real yields available, auto-updated).
+    df = _rates_from_db()
+    if df is not None:
+        return _add_regime_cols(df)
+
     cache_file = CACHE_DIR / "rates.pkl"
 
-    # Try cache first
+    # 2) Cache from a prior yfinance pull.
     try:
         if cache_file.exists():
             df = pd.read_pickle(cache_file)
@@ -38,7 +96,7 @@ def get_rates(period="5y"):
     except Exception:
         pass
 
-    # Download
+    # 3) yfinance proxy download.
     tnx = yf.Ticker("^TNX")  # 10Y Treasury Yield
     irx = yf.Ticker("^IRX")  # 13W T-Bill (short-term rate proxy)
 
@@ -53,25 +111,7 @@ def get_rates(period="5y"):
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
 
-    # Compute regime
-    df["regime"] = pd.cut(
-        df["rate_3m"],
-        bins=[-float("inf"), 2.0, 4.0, float("inf")],
-        labels=["LOW", "MEDIUM", "HIGH"],
-    )
-
-    # Yield curve
-    df["spread_10y_3m"] = df["rate_10y"] - df["rate_3m"]
-    df["curve"] = df["spread_10y_3m"].apply(lambda x: "NORMAL" if x > 0 else "INVERTED")
-
-    # Rate trend (is the short rate rising or falling over last 20 days?)
-    df["rate_sma20"] = df["rate_3m"].rolling(20).mean()
-    # Emit NaN during the 20-bar SMA warmup instead of forcing "FALLING"
-    # (rate_3m > NaN → False → bogus FALLING on the first 19 rows). Build the string labels
-    # first, then NaN the warmup on an object array — np.nan (float) and str can't share one np.where.
-    _rt_lab = np.where(df["rate_3m"] > df["rate_sma20"], "RISING", "FALLING").astype(object)
-    _rt_lab[df["rate_sma20"].isna().to_numpy()] = np.nan
-    df["rate_trend"] = _rt_lab
+    df = _add_regime_cols(df)
 
     # Save cache
     try:

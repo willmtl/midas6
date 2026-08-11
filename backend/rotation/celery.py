@@ -170,4 +170,30 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_backtest_lab",
         "schedule": crontab(hour=22, minute=45),
     },
+    # rotation-edge decomposition (pick vs rotation vs both, 200MA both-numbers, value×technical)
+    "backtest-decomp-nightly": {
+        "task": "api.celery_tasks.run_backtest_decomp",
+        "schedule": crontab(hour=23, minute=5),
+    },
+    # EODHD extra data sources — split before/after the study window so they're fresh for studies.
+    "eodhd-corp-actions": {          # splits + dividends (feeds FINRA split adjustment)
+        "task": "api.celery_tasks.run_corp_actions",
+        "schedule": crontab(hour=20, minute=40),
+    },
+    "eodhd-ust-rates": {             # official Treasury curve → rates regime
+        "task": "api.celery_tasks.run_ust_rates",
+        "schedule": crontab(hour=20, minute=45),
+    },
+    "eodhd-congress-trades": {       # legislator trades
+        "task": "api.celery_tasks.run_congress_trades",
+        "schedule": crontab(hour=20, minute=50),
+    },
+    "eodhd-market-cap": {            # historical market cap + CUSIP/CIK/ISIN
+        "task": "api.celery_tasks.run_market_cap",
+        "schedule": crontab(hour=20, minute=55),
+    },
+    "eodhd-delisted-weekly": {       # survivorship-free reference (weekly)
+        "task": "api.celery_tasks.run_delisted",
+        "schedule": crontab(hour=21, minute=5, day_of_week=0),
+    },
 }

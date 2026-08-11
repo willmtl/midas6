@@ -52,6 +52,11 @@ x-backend-volumes: &backend-volumes
   - ./test_pit_fundamentals.py:/app/test_pit_fundamentals.py
   - ./backtest_concept.py:/app/backtest_concept.py
   - ./backtest_lowpb.py:/app/backtest_lowpb.py
+  - ./fetch_corp_actions.py:/app/fetch_corp_actions.py
+  - ./fetch_market_cap.py:/app/fetch_market_cap.py
+  - ./fetch_delisted.py:/app/fetch_delisted.py
+  - ./fetch_ust_rates.py:/app/fetch_ust_rates.py
+  - ./fetch_congress.py:/app/fetch_congress.py
   - ./.data:/app/.data
 
 services:

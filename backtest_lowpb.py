@@ -145,6 +145,12 @@ def build():
     stock_fwd = stock_monthly.pct_change().shift(-1)
     spy_fwd = spy_m.pct_change().shift(-1)
 
+    # 200-day MA trend per sector ETF: month-end distance of daily Close above its 200d SMA
+    # (>0 = above = uptrend). Selects which sectors the 200-MA rotation holds.
+    etf_sma200 = pd.DataFrame({
+        t: (d["Close"] / d["Close"].rolling(200).mean() - 1).resample("ME").last()
+        for t, d in etf_daily.items() if t in etf_tickers and len(d) >= 200}).reindex(midx)
+
     # Point-in-time P/B panel (mirror trend_stock_studies.run): mktcap / book equity, ffilled by
     # the report's avail_date so only already-published fundamentals are used at each rebalance.
     reps = load_financial_reports(all_holds)
@@ -234,6 +240,51 @@ def build():
             "arm3_rotation_plus_pick": _arm(_rotation_plus_pick(kind), midx, spy_fwd, warmup),
         }
 
+    # ---- 200-day MA rotation: BOTH numbers (hold the ETF vs pick the stock after) ------
+    # Rotate into sectors trading above their 200d MA (ranked by distance), then report the
+    # ETF-level return AND the stock-pick-after return so we always see both.
+    def _sma200_ranks(date):
+        if date not in etf_sma200.index:
+            return []
+        row = etf_sma200.loc[date].dropna()
+        row = row[row > 0]                       # only sectors ABOVE their 200d MA (uptrend)
+        return list(row.sort_values(ascending=False).head(TOP_N_SECTORS).index)
+
+    def _sma200_rotation_only(i):
+        date = midx[i]
+        ranks = _sma200_ranks(date)
+        if not ranks:
+            return None                           # all sectors below 200d MA -> cash (skip period)
+        fwd = etf_fwd.loc[date, [e for e in ranks if e in etf_fwd.columns]].dropna()
+        return float(fwd.mean()) if len(fwd) else None
+
+    def _sma200_rotation_plus_pick(kind):
+        panel, direction = (pb_panel, "min") if kind == "lowpb" else (stock_trail, "max")
+
+        def sel(i):
+            date, ndate = midx[i], midx[i + 1]
+            ranks = _sma200_ranks(date)
+            if not ranks:
+                return None
+            rets = []
+            for etf in ranks:
+                _, holds = sector_map.get(etf, (etf, []))
+                pick = _pick_in_sector(holds, date, panel, direction)
+                if pick is not None:
+                    r = _ret_delist(stock_monthly[pick], date, ndate)
+                    rets.append(r if r is not None else _etf_ret(etf, date, ndate))
+                else:
+                    rets.append(_etf_ret(etf, date, ndate))
+            return float(np.mean(rets)) if rets else None
+        return sel
+
+    sma200_rotation = {
+        "rotation_only": _arm(_sma200_rotation_only, midx, spy_fwd, warmup),          # ETF number
+        "rotation_plus_pick": {                                                       # stock numbers
+            kind: _arm(_sma200_rotation_plus_pick(kind), midx, spy_fwd, warmup)
+            for kind in ("lowpb", "momentum")},
+    }
+
     # ---- value INTERSECT technical -----------------------------------------
     lowpb_alone = decomposition["lowpb"]["arm1_pick_only"]
     vxt = {"lowpb_alone": lowpb_alone, "signals": []}
@@ -256,12 +307,13 @@ def build():
             vxt["signals"].append({"signal_key": key, "signal_name": name, "present": True,
                                    "fires": 0})
             continue
-        fpanel = pd.DataFrame(fired).reindex(columns=[c for c in stock_monthly.columns if c in fired])
+        fpanel = pd.DataFrame(fired).reindex(
+            columns=[c for c in stock_monthly.columns if c in fired]).fillna(False).astype(bool)
 
         def _firers(date):
             if date not in fpanel.index:
                 return []
-            frow = fpanel.loc[date]
+            frow = fpanel.loc[date].astype(bool)
             avail = set(_avail_mask(date))
             return [t for t in frow[frow].index if t in avail]
 
@@ -299,6 +351,7 @@ def build():
         "universe": {"etfs": int(etf_monthly.shape[1]), "stocks": int(stock_monthly.shape[1]),
                      "months": int(len(midx))},
         "decomposition": decomposition,
+        "sma200_rotation": sma200_rotation,
         "value_x_technical": vxt,
     }
     return payload
@@ -309,10 +362,23 @@ def _line(tag, s):
             f"Sharpe {s['sharpe']:>5.2f}  DD {s['max_drawdown']:>7.1f}%  t={s['t_stat']}  n={s['periods']}")
 
 
+def _save_db(kind, payload):
+    """Persist to Postgres (BacktestResult) so the decomposition lives in the DB, not only in JSON."""
+    try:
+        from core.models import BacktestResult
+        from django.utils import timezone
+        BacktestResult.objects.update_or_create(
+            kind=kind, defaults={"payload": payload, "computed_at": timezone.now()})
+        print(f"Saved BacktestResult[{kind}] to DB", flush=True)
+    except Exception as e:
+        print(f"DB save failed for {kind}: {e}", flush=True)
+
+
 def main():
     payload = build()
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(payload, indent=2))
+    _save_db("decomposition", payload)
 
     print("\n=== 3-ARM DECOMPOSITION (monthly, equal-weight, PIT) ===", flush=True)
     for kind, arms in payload["decomposition"].items():
@@ -320,6 +386,12 @@ def main():
         print(_line("ARM1 pick only", arms["arm1_pick_only"]["summary"]), flush=True)
         print(_line("ARM2 rotation only", arms["arm2_rotation_only"]["summary"]), flush=True)
         print(_line("ARM3 rotation + pick", arms["arm3_rotation_plus_pick"]["summary"]), flush=True)
+
+    sm = payload["sma200_rotation"]
+    print("\n=== 200-DAY MA ROTATION (both numbers: hold ETF vs pick stock after) ===", flush=True)
+    print(_line("rotation only (ETF)", sm["rotation_only"]["summary"]), flush=True)
+    for kind, arm in sm["rotation_plus_pick"].items():
+        print(_line(f"+ {kind} pick after", arm["summary"]), flush=True)
 
     print("\n=== VALUE (cheapest P/B) INTERSECT TECHNICAL ===", flush=True)
     print(_line("lowpb alone (ARM1)", payload["value_x_technical"]["lowpb_alone"]["summary"]), flush=True)

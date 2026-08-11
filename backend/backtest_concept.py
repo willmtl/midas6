@@ -106,6 +106,10 @@ def rotation_lab(dfs, spy_df):
     spread = pd.DataFrame({
         e: (lambda r: (r - r.rolling(10).mean()).resample("ME").last())(ta.momentum.rsi(df["Close"], 10))
         for e, df in dfs.items() if len(df) >= 60}).reindex(mclose.index)
+    # 200-day MA trend: month-end distance of Close above its 200d SMA (>0 = above = uptrend).
+    sma200 = pd.DataFrame({
+        e: (df["Close"] / df["Close"].rolling(200).mean() - 1).resample("ME").last()
+        for e, df in dfs.items() if len(df) >= 200}).reindex(mclose.index)
     cols = list(mclose.columns)
 
     def _run(selector, hold=1, start_i=12):
@@ -162,6 +166,12 @@ def rotation_lab(dfs, spy_df):
         ("Momentum 9mo + SPY-trend filter (cash in bear)", lambda i: (
             topn(trail[9].iloc[i], 20)
             if (pd.notna(spy_sma10.iloc[i]) and spy_m.iloc[i] > spy_sma10.iloc[i]) else []), 1),
+        ("Above 200-day MA (trend filter), all", lambda i: [
+            e for e in cols if pd.notna(sma200.iloc[i].get(e)) and sma200.iloc[i].get(e) > 0], 1),
+        ("Above 200-day MA, top 20 by distance", lambda i: [
+            e for e in topn(sma200.iloc[i], 20) if sma200.iloc[i].get(e, -9) > 0], 1),
+        ("Above 200-day MA, top 10 by distance", lambda i: [
+            e for e in topn(sma200.iloc[i], 10) if sma200.iloc[i].get(e, -9) > 0], 1),
         ("Low volatility, 20 calmest", lambda i: topn(vol.iloc[i], 20, ascending=True), 1),
         ("Mean reversion (1mo losers), bottom 20", lambda i: topn(trail[1].iloc[i], 20, ascending=True), 1),
         ("All sectors (equal-weight baseline)", lambda i: cols, 1),
@@ -271,6 +281,19 @@ def phase3(dfs, spy_df, top):
             "summary": _stats(rets, spy_rets), "curve": _curve(rets, spy_rets, idx)}
 
 
+def _save_db(kind, payload):
+    """Persist the payload to Postgres (BacktestResult) so results live in the DB like every other
+    study, not only in the .data JSON. JSON write stays as a cache/fallback."""
+    try:
+        from core.models import BacktestResult
+        from django.utils import timezone
+        BacktestResult.objects.update_or_create(
+            kind=kind, defaults={"payload": payload, "computed_at": timezone.now()})
+        print(f"Saved BacktestResult[{kind}] to DB", flush=True)
+    except Exception as e:
+        print(f"DB save failed for {kind}: {e}", flush=True)
+
+
 def main():
     import sys as _sys
     phase1_only = "--phase1" in _sys.argv
@@ -292,6 +315,7 @@ def main():
         payload["phase3"] = phase3(dfs, spy_df, top)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(payload, indent=2))
+    _save_db("rotation_lab", payload)
     print("Rotation lab (ranked by total return):", flush=True)
     for s in lab:
         print(f"  {s['label']:44} {s['summary']['total_return']:>8.1f}%  vs SPY "

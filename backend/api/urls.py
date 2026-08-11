@@ -48,6 +48,9 @@ urlpatterns = [
     path("equity-curve", views.EquityCurveView.as_view(), name="equity-curve"),
     # Sector-rotation lab: many rotation rules backtested vs SPY + OOS split + top-signals portfolio
     path("backtest-lab", views.BacktestLabView.as_view(), name="backtest-lab"),
+    # Rotation-edge decomposition: pick-only vs rotation-only vs rotation+pick, 200MA both-numbers,
+    # and value×technical (cheapest-P/B pick)
+    path("backtest-decomp", views.BacktestDecompView.as_view(), name="backtest-decomp"),
     # Forward paper-trade track record of Playbook picks
     path("paper-trades", views.PaperTradesView.as_view(), name="paper-trades"),
     # Research/Lab: trigger×exit / timeframe / regime / cap-band / MPT comparisons

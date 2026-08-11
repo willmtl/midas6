@@ -1144,7 +1144,7 @@ def import_finra_ats(tickers=None, only_missing=False, workers=10):
     FINRA answers ~0.5s for names it has but ~6s (HTTP 204) for names it lacks, and our universe has
     hundreds of the latter — so the HTTP fetch is parallelized across `workers` threads. DB writes
     stay single-threaded (in the as_completed loop) to keep Django's ORM connection thread-safe."""
-    from core.models import DarkPoolWeek
+    from core.models import DarkPoolWeek, CorporateAction
     from seq_fundamental_study import build_universe
     tickers = tickers or build_universe()
     tickers = [t for t in tickers if "." not in t]   # FINRA covers US-listed only
@@ -1165,6 +1165,23 @@ def import_finra_ats(tickers=None, only_missing=False, workers=10):
             mon = (d - pd.Timedelta(days=int(d.dayofweek))).date()
             wv[mon] = wv.get(mon, 0.0) + float(v)
         wvols[tk] = wv
+    # Split-adjust the off_pct numerator: yfinance candle VOLUME is retroactively split-adjusted
+    # (a pre-split week's volume is scaled UP by the split ratio), but FINRA totalWeeklyShareQuantity
+    # is the RAW as-reported count. So for weeks before a split the ratio ats/consolidated is
+    # understated by the cumulative split factor. Use clean CorporateAction split factors to scale
+    # the FINRA shares onto the same adjusted basis before dividing. (Fixes the known off_pct bug.)
+    split_map = {}
+    for ca in (CorporateAction.objects.filter(action_type="split", split_ratio__gt=0)
+               .values_list("ticker", "ex_date", "split_ratio")):
+        split_map.setdefault(ca[0], []).append((ca[1], float(ca[2])))
+
+    def _cum_split_factor(tk, week_date):
+        """Product of split ratios with ex_date AFTER week_date (matches the candle-volume scaling)."""
+        f = 1.0
+        for ex, ratio in split_map.get(tk, ()):
+            if ex > week_date and ratio > 0:
+                f *= ratio
+        return f
     saved = done = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_finra_ats_fetch_all, tk): tk for tk in tickers}
@@ -1184,11 +1201,12 @@ def import_finra_ats(tickers=None, only_missing=False, workers=10):
                 shares = _finra_num(r.get("totalWeeklyShareQuantity"))
                 tot = wvol.get(ws_date)
                 pub = str(r.get("initialPublishedDate") or "").strip()[:10]
+                adj_shares = shares * _cum_split_factor(tk, ws_date)   # onto split-adjusted basis
                 objs.append(DarkPoolWeek(
                     ticker=tk, week_start=ws_date, ats_shares=int(shares),
                     ats_trades=int(_finra_num(r.get("totalWeeklyTradeCount"))),
                     ats_notional=(_finra_num(r.get("totalNotionalSum")) or None),
-                    off_pct=(round(shares / tot, 4) if tot else None),
+                    off_pct=(round(adj_shares / tot, 4) if tot else None),
                     tier=str(r.get("tierDescription") or "")[:16],
                     published_date=(datetime.strptime(pub, "%Y-%m-%d").date() if len(pub) == 10 else None),
                     source="finra_ats"))

@@ -99,6 +99,11 @@ class Fundamental(models.Model):
     # EODHD TICKER.EXCHANGE symbol used to fetch this row (e.g. 7203.TSE, WIPRO.NSE, AAPL.US).
     # Distinct from `ticker` (plain/yahoo form) — recorded so global fundamentals fills are traceable.
     eodhd_symbol = models.CharField(max_length=32, null=True, blank=True)
+    # ID mapping (EODHD Symbol-Change / fundamentals General block) — cross-vendor identifiers so a
+    # name can be joined to CUSIP/CIK/ISIN feeds (SEC EDGAR uses CIK, dark-pool/13F use CUSIP).
+    cusip = models.CharField(max_length=12, null=True, blank=True, db_index=True)
+    cik = models.CharField(max_length=12, null=True, blank=True, db_index=True)
+    isin = models.CharField(max_length=16, null=True, blank=True, db_index=True)
 
     class Meta:
         ordering = ["-date"]
@@ -828,3 +833,129 @@ class EstimateRevision(models.Model):
 
     def __str__(self):
         return f"{self.ticker} {self.period_label} cur={self.eps_current}"
+
+
+class CorporateAction(models.Model):
+    """Splits + cash dividends from EODHD Corporate Actions. Clean split factors let us correctly
+    split-adjust off-exchange share volume (fixes the known FINRA off_pct split mismatch) and give a
+    PIT dividend history. action_type distinguishes the two; ex_date is the effective date."""
+    ticker = models.CharField(max_length=20, db_index=True)
+    action_type = models.CharField(max_length=12, db_index=True)   # "split" | "dividend"
+    ex_date = models.DateField(db_index=True)
+    # split: ratio = to/from (a 4-for-1 split -> 4.0); dividend rows leave these null.
+    split_ratio = models.FloatField(null=True, blank=True)
+    split_from = models.FloatField(null=True, blank=True)
+    split_to = models.FloatField(null=True, blank=True)
+    # dividend: cash per share + the associated dates.
+    dividend = models.FloatField(null=True, blank=True)
+    currency = models.CharField(max_length=8, blank=True)
+    record_date = models.DateField(null=True, blank=True)
+    pay_date = models.DateField(null=True, blank=True)
+    declaration_date = models.DateField(null=True, blank=True)
+    period = models.CharField(max_length=16, blank=True)           # Quarterly / Annual …
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ["ticker", "action_type", "ex_date"]
+        indexes = [models.Index(fields=["ticker", "ex_date"])]
+
+    def __str__(self):
+        return f"{self.ticker} {self.action_type} {self.ex_date}"
+
+
+class MarketCapHistory(models.Model):
+    """Point-in-time historical market cap from EODHD (historical-market-cap) — a real PIT size
+    factor, more honest than shares×price computed from today's share count."""
+    ticker = models.CharField(max_length=20, db_index=True)
+    date = models.DateField(db_index=True)
+    market_cap = models.BigIntegerField(null=True, blank=True)     # USD
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ["ticker", "date"]
+        indexes = [models.Index(fields=["ticker", "date"])]
+
+    def __str__(self):
+        return f"{self.ticker} {self.date} mc={self.market_cap}"
+
+
+class DelistedCompany(models.Model):
+    """Delisted / inactive tickers from EODHD (exchange 'delisted' list) — a survivorship-free
+    reference so backtests can acknowledge names that later died (delisting = a real exit)."""
+    ticker = models.CharField(max_length=20, db_index=True)        # plain/yahoo-style ticker
+    eodhd_symbol = models.CharField(max_length=32, blank=True)     # TICKER.EXCHANGE
+    name = models.CharField(max_length=255, blank=True)
+    exchange = models.CharField(max_length=32, blank=True)
+    country = models.CharField(max_length=8, blank=True)
+    currency = models.CharField(max_length=8, blank=True)
+    type = models.CharField(max_length=40, blank=True)             # Common Stock / ETF / …
+    isin = models.CharField(max_length=20, blank=True)
+    delisted_date = models.DateField(null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ["ticker", "exchange"]
+        indexes = [models.Index(fields=["ticker"])]
+
+    def __str__(self):
+        return f"{self.ticker} ({self.exchange}) delisted {self.delisted_date}"
+
+
+class TreasuryRate(models.Model):
+    """Official US Treasury yield curve from EODHD (UST API, beta) — daily par yields, T-bill rates
+    and real (TIPS) yields by tenor. Cleaner than the yfinance ^TNX/^IRX proxy for the rates regime,
+    and gives the full curve (inversion) + real yields the proxy can't."""
+    date = models.DateField(db_index=True)
+    series = models.CharField(max_length=16, db_index=True)        # yield | bill | real
+    tenor = models.CharField(max_length=8)                         # 1M,3M,6M,1Y,2Y,3Y,5Y,7Y,10Y,20Y,30Y
+    rate = models.FloatField(null=True, blank=True)                # percent
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ["date", "series", "tenor"]
+        indexes = [models.Index(fields=["series", "date"])]
+
+    def __str__(self):
+        return f"{self.date} {self.series} {self.tenor}={self.rate}"
+
+
+class CongressTrade(models.Model):
+    """US Congressional (legislator) stock trades from EODHD (congressional-trades, beta) — the
+    'follow the politicians' alt-data signal. Disclosed under the STOCK Act, so report_date lags the
+    transaction; PIT studies MUST key on report_date (when it became public), not transaction_date.
+    Amounts are disclosed as a RANGE (amount_min..amount_max), not an exact figure."""
+    ticker = models.CharField(max_length=20, db_index=True)
+    member = models.CharField(max_length=160, db_index=True)
+    chamber = models.CharField(max_length=16, blank=True)          # Senate / House
+    party = models.CharField(max_length=24, blank=True)
+    state = models.CharField(max_length=8, blank=True)
+    transaction_type = models.CharField(max_length=16, db_index=True)  # buy / sell / exchange
+    transaction_date = models.DateField(null=True, blank=True, db_index=True)
+    report_date = models.DateField(null=True, blank=True, db_index=True)   # public disclosure (PIT)
+    amount_min = models.BigIntegerField(null=True, blank=True)     # disclosed range low
+    amount_max = models.BigIntegerField(null=True, blank=True)     # disclosed range high
+    owner = models.CharField(max_length=24, blank=True)            # self / spouse / child / joint
+    asset_type = models.CharField(max_length=40, blank=True)
+    uid = models.CharField(max_length=64, unique=True)             # hash to dedupe re-imports
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["ticker", "report_date"]),
+                   models.Index(fields=["member", "report_date"])]
+
+    def __str__(self):
+        return f"{self.member} {self.transaction_type} {self.ticker} {self.report_date}"
+
+
+class BacktestResult(models.Model):
+    """Persisted backtest payloads so results live in Postgres like every other study — queryable and
+    auto-updated by the nightly recompute — instead of ONLY in a .data JSON file. `payload` is the
+    exact JSON the API serves (rotation lab, or the rotation-edge decomposition)."""
+    kind = models.CharField(max_length=32, unique=True)   # "rotation_lab" | "decomposition"
+    payload = models.JSONField()
+    computed_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.kind} @ {self.computed_at:%Y-%m-%d %H:%M}"

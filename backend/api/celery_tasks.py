@@ -340,3 +340,75 @@ def check_fresh_alert():
     result = compute_fresh_and_alert("1d")
     logger.info(f"Fresh check complete: {result}")
     return result
+
+
+# ── EODHD extra data sources (corporate actions, market cap + IDs, delisted, UST rates, congress) ──
+# Each runs the standalone /app/fetch_*.py module as a subprocess (matches the run_stock_studies /
+# run_backtest_lab pattern; keeps heavy per-ticker loops out of the worker process). Idempotent, so
+# nightly re-runs only add new rows. No-op without EODHD_API_KEY.
+def _run_fetch(script, *args, timeout=3600):
+    import os, subprocess
+    if not os.environ.get("EODHD_API_KEY"):
+        return {"skipped": "no EODHD_API_KEY"}
+    path = f"/app/{script}"
+    if not os.path.exists(path):
+        logger.error("_run_fetch: %s not found (mount it in docker-compose)", path)
+        return {"error": "not mounted"}
+    cmd = ["python", "-u", path, *args]
+    logger.info("_run_fetch: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, cwd="/app", capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        logger.error("%s failed (rc=%s): %s", script, proc.returncode, proc.stderr[-2000:])
+    else:
+        logger.info("%s done: %s", script, proc.stdout[-600:])
+    return proc.returncode
+
+
+@shared_task
+def run_corp_actions():
+    """Daily: splits + dividends → CorporateAction (also feeds the FINRA off_pct split adjustment)."""
+    return _run_fetch("fetch_corp_actions.py")
+
+
+@shared_task
+def run_market_cap():
+    """Daily: historical market cap → MarketCapHistory, and CUSIP/CIK/ISIN → Fundamental."""
+    r1 = _run_fetch("fetch_market_cap.py", "--mcap")
+    r2 = _run_fetch("fetch_market_cap.py", "--ids")
+    return {"mcap": r1, "ids": r2}
+
+
+@shared_task
+def run_delisted():
+    """Weekly: delisted/inactive US tickers → DelistedCompany (survivorship-free reference)."""
+    return _run_fetch("fetch_delisted.py", "--run")
+
+
+@shared_task
+def run_ust_rates():
+    """Daily: official US Treasury curve → TreasuryRate (feeds the rates.py regime layer)."""
+    return _run_fetch("fetch_ust_rates.py", "--run")
+
+
+@shared_task
+def run_congress_trades():
+    """Daily: congressional (legislator) trades → CongressTrade (follow-the-politicians alt-data)."""
+    return _run_fetch("fetch_congress.py", "--run")
+
+
+@shared_task
+def run_backtest_decomp():
+    """Nightly: rotation-edge decomposition (pick vs rotation vs both, 200MA both-numbers,
+    value×technical) → BacktestResult[decomposition]. Runs AFTER candles/fundamentals refresh."""
+    import os, subprocess
+    script = "/app/backtest_lowpb.py"
+    if not os.path.exists(script):
+        logger.error("run_backtest_decomp: %s not found", script)
+        return
+    proc = subprocess.run(["python", "-u", script], cwd="/app",
+                          capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("backtest decomp failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    else:
+        logger.info("backtest decomp done: %s", proc.stdout[-600:])
+    return proc.returncode

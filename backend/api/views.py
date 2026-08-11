@@ -1490,7 +1490,14 @@ class BacktestLabView(APIView):
 
     def get(self, request):
         import os as _os, json as _json
-        path = "/app/.data/studies/backtest_concept.json"
+        from core.models import BacktestResult
+        row = BacktestResult.objects.filter(kind="rotation_lab").first()
+        if row:
+            data = dict(row.payload or {})
+            data["computed"] = True
+            data["last_updated"] = row.computed_at.isoformat()
+            return Response(data)
+        path = "/app/.data/studies/backtest_concept.json"   # JSON fallback (pre-DB runs)
         if not _os.path.exists(path):
             return Response({"computed": False,
                              "message": "Backtest lab not computed yet. POST to run it."})
@@ -1509,3 +1516,39 @@ class BacktestLabView(APIView):
                 pass
         threading.Thread(target=_run, daemon=True).start()
         return Response({"status": "backtest lab recompute started"})
+
+
+class BacktestDecompView(APIView):
+    """WHERE the rotation edge comes from: the 3-arm decomposition (pick-only vs rotation-only vs
+    rotation+pick), the 200-day-MA rotation with BOTH numbers (hold the ETF vs pick the stock after),
+    and the value×technical section (cheapest-P/B pick). GET serves the JSON backtest_lowpb.py writes;
+    POST triggers a fresh recompute in the background."""
+
+    def get(self, request):
+        import os as _os, json as _json
+        from core.models import BacktestResult
+        row = BacktestResult.objects.filter(kind="decomposition").first()
+        if row:
+            data = dict(row.payload or {})
+            data["computed"] = True
+            data["last_updated"] = row.computed_at.isoformat()
+            return Response(data)
+        path = "/app/.data/studies/backtest_lowpb.json"     # JSON fallback (pre-DB runs)
+        if not _os.path.exists(path):
+            return Response({"computed": False,
+                             "message": "Decomposition not computed yet. POST to run it."})
+        with open(path) as f:
+            data = _json.load(f)
+        data["computed"] = True
+        data["last_updated"] = data.get("computed_at")
+        return Response(data)
+
+    def post(self, request):
+        import threading, subprocess
+        def _run():
+            try:
+                subprocess.run(["python", "-u", "backtest_lowpb.py"], cwd="/app", timeout=3600)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+        return Response({"status": "decomposition recompute started"})
