@@ -64,9 +64,14 @@ def get_market_data(period="5y"):
     # VIX regime
     df["vix_regime"] = pd.cut(df["vix"], bins=[0, 15, 25, 100], labels=["LOW_VIX", "MED_VIX", "HIGH_VIX"])
 
-    # SPY trend
+    # SPY trend. During the 200-bar SMA warmup spy_sma200 is NaN; comparing against NaN would
+    # silently resolve to False and stamp the whole warmup window "BEAR" (mislabeling the oldest
+    # ~10 months of history). Emit NaN there instead so those trades fall out of the spy_trend
+    # regime buckets rather than being counted as a bear regime.
     df["spy_sma200"] = df["spy_close"].rolling(200).mean()
-    df["spy_trend"] = np.where(df["spy_close"] > df["spy_sma200"], "BULL", "BEAR")
+    _spy_lab = np.where(df["spy_close"] > df["spy_sma200"], "BULL", "BEAR").astype(object)
+    _spy_lab[df["spy_sma200"].isna().to_numpy()] = np.nan   # NaN on warmup (float/str can't share one np.where)
+    df["spy_trend"] = _spy_lab
 
     # SPY SMA50
     df["spy_sma50"] = df["spy_close"].rolling(50).mean()
@@ -75,7 +80,9 @@ def get_market_data(period="5y"):
     # Dollar trend
     if "dollar" in df.columns:
         df["dollar_sma50"] = df["dollar"].rolling(50).mean()
-        df["dollar_trend"] = np.where(df["dollar"] > df["dollar_sma50"], "STRONG_USD", "WEAK_USD")
+        _usd_lab = np.where(df["dollar"] > df["dollar_sma50"], "STRONG_USD", "WEAK_USD").astype(object)
+        _usd_lab[df["dollar_sma50"].isna().to_numpy()] = np.nan
+        df["dollar_trend"] = _usd_lab
 
     # Gold/Silver ratio
     if "gold" in df.columns and "silver" in df.columns:
@@ -85,7 +92,9 @@ def get_market_data(period="5y"):
     # TLT trend (bonds)
     if "tlt" in df.columns:
         df["tlt_sma50"] = df["tlt"].rolling(50).mean()
-        df["bond_trend"] = np.where(df["tlt"] > df["tlt_sma50"], "BONDS_UP", "BONDS_DOWN")
+        _bond_lab = np.where(df["tlt"] > df["tlt_sma50"], "BONDS_UP", "BONDS_DOWN").astype(object)
+        _bond_lab[df["tlt_sma50"].isna().to_numpy()] = np.nan
+        df["bond_trend"] = _bond_lab
 
     # Seasonality
     df["month"] = df.index.month

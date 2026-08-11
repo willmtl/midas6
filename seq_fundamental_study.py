@@ -22,7 +22,7 @@ import os
 import sys
 from pathlib import Path
 
-from studies import SIGNALS, EXITS
+from studies import SIGNALS, EXITS, _episode_starts, _tstat_from_returns
 
 STUDIES_DIR = Path(__file__).parent / ".data" / "studies"
 STUDIES_DIR.mkdir(parents=True, exist_ok=True)
@@ -126,6 +126,45 @@ def load_insider(tickers):
     return out
 
 
+def load_darkpool(tickers):
+    """{ticker: DataFrame[off_pct, published_date]} of FINRA weekly ATS dark-pool volume, for the
+    point-in-time dark-pool dimensions (keyed by publish date to respect the reporting lag)."""
+    import pandas as pd
+    from core.models import DarkPoolWeek
+    qs = (DarkPoolWeek.objects.filter(ticker__in=list(tickers), off_pct__isnull=False,
+                                      published_date__isnull=False)
+          .values_list("ticker", "off_pct", "published_date"))
+    big = pd.DataFrame.from_records(list(qs), columns=["ticker", "off_pct", "published_date"])
+    out = {}
+    if big.empty:
+        return out
+    for tk, g in big.groupby("ticker", sort=False):
+        out[tk] = g[["off_pct", "published_date"]].reset_index(drop=True)
+    return out
+
+
+def load_news(tickers):
+    """{ticker: Series of sentiment polarity indexed by news datetime} for the news dimension."""
+    import pandas as pd
+    from core.models import NewsItem
+    qs = (NewsItem.objects.filter(ticker__in=list(tickers), sentiment__isnull=False)
+          .values_list("ticker", "dt", "sentiment"))
+    big = pd.DataFrame.from_records(list(qs), columns=["ticker", "dt", "sentiment"])
+    out = {}
+    if big.empty:
+        return out
+    # Convert to ET and roll news released at/after the 16:00 ET close to the NEXT session
+    # before bucketing — UTC-date bucketing folded after-close ET news (16:00-20:00 ET, still
+    # the same UTC date) into the bar that had already closed, a same-bar leak into news_sent.
+    # (Mirrors api/news_market_study.py's tz_convert+after-close shift.)
+    _dt = pd.to_datetime(big["dt"], utc=True).dt.tz_convert("America/New_York")
+    _after_close = (_dt.dt.hour >= 16).astype("int64")
+    big["dt"] = _dt.dt.tz_localize(None).dt.normalize() + pd.to_timedelta(_after_close, unit="D")
+    for tk, g in big.groupby("ticker", sort=False):
+        out[tk] = g.set_index("dt")["sentiment"].sort_index()
+    return out
+
+
 def label_trade(pit_metrics, entry_date, snap):
     """Bucket labels for one trade across all DIMENSIONS.
     PIT dims read pit_metrics via a forward-fill lookup at entry_date; snapshot dims read
@@ -224,7 +263,7 @@ from pit_fundamentals import (
     bucket_beta, bucket_avg_volume, bucket_fwd_eps, bucket_short_float, bucket_pct,
     bucket_gross_margin, bucket_rd_intensity, bucket_asset_turnover, bucket_accruals,
     bucket_fcf_yield, bucket_cash_ratio, bucket_buyback_yield, bucket_insider, bucket_stake,
-    bucket_ad,
+    bucket_ad, bucket_darkpool_level, bucket_darkpool_trend, bucket_news_sent,
 )
 
 # (name, field, bucket_fn, order, pit)
@@ -281,6 +320,18 @@ DIMENSIONS = [
     ("Institutional 13G (1y)", "stake_13g_1y", bucket_stake, ["none", "one (1y)", "multiple (1y)", "NA"], True),
     # ── A/D line state (point-in-time, slope+divergence — not sign) ──────
     ("A/D state", "ad_state", bucket_ad, ["accum divergence", "accum trend-up", "neutral", "distribution", "NA"], True),
+    # ── Alt-data amplifiers (point-in-time; validation only, NOT wired to risk rating) ──
+    # Dark pool: FINRA weekly ATS share, keyed by publish date (~3-4wk lag → lookahead-safe).
+    ("Dark-pool share", "dp_off_pct", bucket_darkpool_level,
+     ["low (<5%)", "mid (5-12%)", "high (12-20%)", "very high (>=20%)", "NA"], True),
+    ("Dark-pool trend", "dp_trend_z", bucket_darkpool_trend,
+     ["distributing (z<=-1)", "steady (-1..1)", "accumulating (1-2)", "surging (>=2)", "NA"], True),
+    # News sentiment dimension is PLUMBED (loader/PIT column/bucket in place) but held OUT of the
+    # sweep: the stored EODHD polarity is near-constant (median 0.99, 90%+ ~+1.0 → no discriminating
+    # power) and history is shallow/uneven (only 127 tickers reach 2021; most start 2025-26). Re-add
+    # after re-deriving net sentiment (pos-neg) + a deep news backfill. See News-drift/PEAD follow-up.
+    # ("News sentiment", "news_sent", bucket_news_sent,
+    #  ["negative (<=-.15)", "neutral (-.15..15)", "positive (.15-.5)", "very positive (>=.5)", "NA"], True),
     # Float, now POINT-IN-TIME: EDGAR share count as-of the filing date (not the yfinance
     # snapshot). A share-count proxy for free float; "Market cap" carries the economic size.
     ("Float", "float_shares", _bucket_float,
@@ -293,8 +344,10 @@ DIMENSIONS = [
 
 
 def _compute_trades(candles, sig_fn, exit_fn):
-    """Core per-ticker backtest loop, shared by serial and parallel paths."""
-    trades = []  # (ticker, return_pct)
+    """Core per-ticker backtest loop, shared by serial and parallel paths.
+    Returns (ticker, entry_idx, return_pct) — entry_idx is retained so the caller can
+    dedup overlapping fires into independent episodes for the eff-N / t-stat significance layer."""
+    trades = []  # (ticker, entry_idx, return_pct)
     for tk, sdf in candles.items():
         if len(sdf) < MIN_BARS:
             continue
@@ -312,7 +365,7 @@ def _compute_trades(candles, sig_fn, exit_fn):
             ep = float(close[idx])
             if ep <= 0:
                 continue
-            trades.append((tk, (float(close[exit_idx]) - ep) / ep * 100))
+            trades.append((tk, idx, (float(close[exit_idx]) - ep) / ep * 100))
     return trades
 
 
@@ -379,16 +432,35 @@ def run(signal_key, exit_key, limit=None, jobs=1):
                 print(f"  ...{done}/{len(payloads)} chunks done ({len(trades)} trades)")
     print(f"Loaded fundamentals for {len(funds)}\n")
 
-    def _agg(lst):
-        if not lst:
-            return {"trades": 0, "avg_return": 0.0, "win_rate": 0.0}
-        return {"trades": len(lst),
-                "avg_return": round(sum(lst) / len(lst), 2),
-                "win_rate": round(sum(1 for r in lst if r > 0) / len(lst) * 100, 1)}
+    # Significance layer: overlapping fires on consecutive bars share a forward window and
+    # inflate the apparent trade count. Dedup per ticker into independent episodes (>=EFFECTIVE_GAP
+    # bars apart), then report eff_trades + a one-sample t-stat on the deduped returns alongside
+    # the raw avg/win. Entries are grouped per ticker and episode-flagged ONCE here so every
+    # bucket below inherits the same flags.
+    from collections import defaultdict
+    idxs_by_tk = defaultdict(list)
+    for tk, idx, _r in trades:
+        idxs_by_tk[tk].append(idx)
+    ep_by_tk = {tk: _episode_starts(sorted(ix)) for tk, ix in idxs_by_tk.items()}
+    # Augment each trade with is_episode; buckets carry (ret, is_ep) pairs.
+    trades = [(tk, idx, r, idx in ep_by_tk[tk]) for tk, idx, r in trades]
 
-    all_rets = [r for _, r in trades]
-    overall = _agg(all_rets)
-    print(f"=== {signal_key} on ALL STOCKS ({overall['trades']} trades) ===")
+    def _agg(pairs):
+        # pairs: list of (return_pct, is_episode)
+        if not pairs:
+            return {"trades": 0, "avg_return": 0.0, "win_rate": 0.0, "eff_trades": 0, "t_stat": None}
+        rets = [r for r, _ in pairs]
+        eff = [r for r, is_ep in pairs if is_ep]
+        return {"trades": len(rets),
+                "avg_return": round(sum(rets) / len(rets), 2),
+                "win_rate": round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1),
+                "eff_trades": len(eff),
+                "t_stat": _tstat_from_returns(eff)}
+
+    all_pairs = [(r, is_ep) for _tk, _idx, r, is_ep in trades]
+    overall = _agg(all_pairs)
+    print(f"=== {signal_key} on ALL STOCKS ({overall['trades']} trades, "
+          f"eff {overall['eff_trades']}, t={overall['t_stat']}) ===")
     print(f"    avg {overall['avg_return']:+.2f}%   win {overall['win_rate']:.0f}%\n")
 
     # Bucket by each fundamental dimension
@@ -398,9 +470,9 @@ def run(signal_key, exit_key, limit=None, jobs=1):
     # here. The all-on-all engine (all_on_all_study.py) does true point-in-time bucketing.
     for dim_name, field, bucket_fn, order, _pit in DIMENSIONS:
         buckets = {}
-        for tk, r in trades:
+        for tk, _idx, r, is_ep in trades:
             fv = funds.get(tk, {}).get(field)
-            buckets.setdefault(bucket_fn(fv), []).append(r)
+            buckets.setdefault(bucket_fn(fv), []).append((r, is_ep))
         rows = []
         print(f"--- {dim_name} ---")
         for label in order:
@@ -409,7 +481,8 @@ def run(signal_key, exit_key, limit=None, jobs=1):
                 continue
             a = _agg(lst)
             rows.append({"bucket": label, **a})
-            print(f"    {label:22} {a['trades']:>5} tr   {a['avg_return']:+7.2f}%   {a['win_rate']:>4.0f}% wr")
+            print(f"    {label:22} {a['trades']:>5} tr   {a['avg_return']:+7.2f}%   "
+                  f"{a['win_rate']:>4.0f}% wr   eff {a['eff_trades']:>4}  t={a['t_stat']}")
         by_dimension[dim_name] = rows
         print()
 

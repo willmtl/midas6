@@ -12,7 +12,7 @@ from pathlib import Path
 import config
 import data_fetcher
 import sector_holdings
-from studies import SIGNALS, EXITS
+from studies import SIGNALS, EXITS, _episode_starts, _tstat_from_returns
 
 STUDIES_DIR = Path(__file__).parent / ".data" / "studies"
 STUDIES_DIR.mkdir(parents=True, exist_ok=True)
@@ -74,9 +74,14 @@ def run_one_exit(exit_key, stock_data, ticker_to_sector):
     per_sector = {}   # sector -> list[ret]
     per_stock = {}    # ticker -> list[ret]
 
+    # Collect per-ticker valid trades first, then dedup overlapping fires into independent
+    # episodes (>=EFFECTIVE_GAP bars apart) so the significance layer (eff_trades + t_stat)
+    # isn't inflated by consecutive-bar entries sharing one forward window. rets/per_* carry
+    # (ret, is_episode) pairs.
     for ticker, sdf in stock_data.items():
         close = sdf["Close"].values
         n = len(close)
+        tk_trades = []  # (idx, ret, hold)
         for idx in _entries(sdf):
             exit_idx = exit_fn(sdf, idx)
             if exit_idx is None or exit_idx <= idx or exit_idx >= n:
@@ -85,17 +90,25 @@ def run_one_exit(exit_key, stock_data, ticker_to_sector):
             if entry_p <= 0:
                 continue
             ret = (float(close[exit_idx]) - entry_p) / entry_p * 100
-            rets.append(ret)
-            holds.append(exit_idx - idx)
-            sec = ticker_to_sector.get(ticker, "?")
+            tk_trades.append((idx, ret, exit_idx - idx))
+        if not tk_trades:
+            continue
+        epi = _episode_starts([t[0] for t in tk_trades])   # idxs already ascending from _entries
+        sec = ticker_to_sector.get(ticker, "?")
+        for idx, ret, hold in tk_trades:
+            pair = (ret, idx in epi)
+            rets.append(pair)
+            holds.append(hold)
             sectors_hit.add(sec)
-            per_sector.setdefault(sec, []).append(ret)
-            per_stock.setdefault(ticker, []).append(ret)
+            per_sector.setdefault(sec, []).append(pair)
+            per_stock.setdefault(ticker, []).append(pair)
 
-    def _agg(name, lst):
-        return {"name": name, "trades": len(lst),
-                "win_rate": round(sum(1 for r in lst if r > 0) / len(lst) * 100, 1),
-                "avg_return": round(sum(lst) / len(lst), 3)}
+    def _agg(name, pairs):
+        eff = [r for r, is_ep in pairs if is_ep]
+        return {"name": name, "trades": len(pairs),
+                "win_rate": round(sum(1 for r, _ in pairs if r > 0) / len(pairs) * 100, 1),
+                "avg_return": round(sum(r for r, _ in pairs) / len(pairs), 3),
+                "eff_trades": len(eff), "t_stat": _tstat_from_returns(eff)}
 
     sector_aggs = [_agg(s, l) for s, l in per_sector.items()]
     sector_aggs.sort(key=lambda a: a["avg_return"], reverse=True)
@@ -103,12 +116,15 @@ def run_one_exit(exit_key, stock_data, ticker_to_sector):
     stock_aggs.sort(key=lambda a: a["avg_return"], reverse=True)
 
     total = len(rets)
+    all_eff = [r for r, is_ep in rets if is_ep]
     return {
         "exit_key": exit_key,
         "exit_name": exit_name,
         "total_trades": total,
-        "avg_return": round(sum(rets) / total, 3) if total else 0.0,
-        "win_rate": round(sum(1 for r in rets if r > 0) / total * 100, 1) if total else 0.0,
+        "eff_trades": len(all_eff),
+        "t_stat": _tstat_from_returns(all_eff),
+        "avg_return": round(sum(r for r, _ in rets) / total, 3) if total else 0.0,
+        "win_rate": round(sum(1 for r, _ in rets if r > 0) / total * 100, 1) if total else 0.0,
         "avg_hold": round(sum(holds) / len(holds), 1) if holds else 0.0,
         "sector_count": len(sectors_hit),
         "best_sectors": sector_aggs[:5],

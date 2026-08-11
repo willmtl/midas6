@@ -82,7 +82,9 @@ def main():
             if s is None or abs(s) < MIN_ABS_SURPRISE:
                 continue
             rd = pd.Timestamp(e["report_date"]); pos = int(idx.searchsorted(rd))
-            after = "After" in (e["before_after"] or "")
+            # "After" and unknown/empty before_after (~19%) -> next-day reprice; only explicit BMO
+            # uses the report day (empty->BMO was a lookahead — see earnings_drift_study).
+            after = "Before" not in (e["before_after"] or "")
             rfrom, rto = (pos, pos + 1) if after else (pos - 1, pos)
             if rfrom < BETA_WIN or rto >= n or rto + max(DRIFTS) >= n:
                 continue

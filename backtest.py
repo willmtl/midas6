@@ -250,10 +250,17 @@ def _sharpe(returns: pd.Series) -> float:
 def _sortino_ratio(returns: pd.Series) -> float:
     daily_rf = config.RISK_FREE_RATE / config.TRADING_DAYS
     excess = returns - daily_rf
-    downside = excess[excess < 0]
-    if len(downside) < 2 or downside.std() == 0:
+    if len(excess) < 2:
         return 0.0
-    return float(excess.mean() / downside.std() * np.sqrt(config.TRADING_DAYS))
+    # Target downside deviation = RMS of the shortfalls below MAR=0 over the
+    # FULL window, not the sample std (ddof=1) of only the negative days centered
+    # on their own mean (which understates the denominator → inflates Sortino,
+    # and returns 0 when all losses are equal). Matches indicators.rolling_sortino
+    # and calc_rolling_sortino above.
+    downside_dev = float(np.sqrt(np.mean(np.minimum(excess, 0) ** 2)))
+    if downside_dev == 0:
+        return 0.0
+    return float(excess.mean() / downside_dev * np.sqrt(config.TRADING_DAYS))
 
 
 # ── Report ──

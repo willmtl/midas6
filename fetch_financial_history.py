@@ -92,11 +92,11 @@ def _collect_flow(g, aliases):
             days = (_d(end) - _d(start)).days
             if 80 <= days <= 100:
                 prev = quarterly.get(end)
-                if prev is None or (filed and filed < prev[1]):
+                if prev is None or (filed and (prev[1] is None or filed < prev[1])):
                     quarterly[end] = (val, filed)
             elif 350 <= days <= 380:
                 prev = annual.get(end)
-                if prev is None or (filed and filed < prev[1]):
+                if prev is None or (filed and (prev[1] is None or filed < prev[1])):
                     annual[end] = (val, filed)
     # Derive Q4 for fiscal-year ends that have an annual but no standalone quarter.
     q_ends = sorted(quarterly)
@@ -135,14 +135,21 @@ def _collect_flow_cumulative(g, aliases):
     for start, ends in by_start.items():
         seq = sorted(ends.items(), key=lambda kv: _d(kv[0]))
         prev_val = 0.0
+        prev_days = 0
         for end, (val, filed) in seq:
             days = (_d(end) - _d(start)).days
+            step = days - prev_days          # gap from the previous cumulative point
             q = val - prev_val
             prev_val = val
-            if not (80 <= days <= 400):   # skip anything not a plausible cumulative step
+            prev_days = days
+            # Emit only when this is ONE clean ~quarter past the previous point (and the first
+            # point is a true Q1 ~90d). If a YTD step is missing (e.g. Q1 absent, Q2 present), the
+            # 6-month value would otherwise be differenced against 0 and booked as a single quarter
+            # = TWO quarters of flow double-counted. Skip the ambiguous step instead.
+            if not (60 <= step <= 100):
                 continue
             prevout = out.get(end)
-            if prevout is None or (filed and filed < prevout[1]):
+            if prevout is None or (filed and (prevout[1] is None or filed < prevout[1])):
                 out[end] = (q, filed)
     return out
 
@@ -160,7 +167,7 @@ def _collect_instant(g, aliases):
                     continue
                 end, filed = f["end"], f.get("filed")
                 prev = out.get(end)
-                if prev is None or (filed and filed < prev[1]):
+                if prev is None or (filed and (prev[1] is None or filed < prev[1])):
                     out[end] = (f["val"], filed)
     return out
 

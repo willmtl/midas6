@@ -92,10 +92,19 @@ def import_candles_task():
     for ch in _chunks(need_full):
         _batch_import(ch, period="5y")
 
-    # Incremental — refetch from just before the OLDEST stale bar (ignore_conflicts de-dupes).
+    # Incremental — refetch from just before the OLDEST stale bar. Candle is a managed=False
+    # TimescaleDB hypertable (no id col), so bulk_create(update_conflicts=...) can't upsert and
+    # plain ignore_conflicts would KEEP the existing row. That silently FREEZES a bar first written
+    # mid-session: the hourly job runs during US hours, writes the current day's partial (wrong
+    # close/high/low/volume) bar, and every later refetch of that date is dropped as a conflict — so
+    # the most decision-relevant bar (latest) never gets its final values. Delete the trailing window
+    # first, then re-insert the fresh bars so finals replace partials. (Self-heals next run if a
+    # fetch blips.)
     if need_incremental:
-        start = (min(need_incremental.values()) - timedelta(days=2)).isoformat()
+        start_date = min(need_incremental.values()) - timedelta(days=2)
+        start = start_date.isoformat()
         for ch in _chunks(list(need_incremental.keys())):
+            Candle.objects.filter(ticker__in=ch, interval="1d", date__gte=start_date).delete()
             _batch_import(ch, start=start)
 
     # Also seed Sector table if empty
@@ -151,15 +160,20 @@ def _batch_import(tickers, period=None, start=None):
             df = df.dropna(how="all")
             for dt, row in df.iterrows():
                 d = dt.date() if hasattr(dt, 'date') else dt
-                if pd.isna(row.get("Close")):
+                cl = row.get("Close")
+                if pd.isna(cl):
                     continue
+                cl = float(cl)
+                # O/H/L can be NaN even when Close is present (partial vendor rows); float(nan)
+                # would store NaN and poison any rolling max/min. Coalesce to the valid close.
+                o, h, lo, vol = row.get("Open"), row.get("High"), row.get("Low"), row.get("Volume")
                 bulk.append(Candle(
                     ticker=ticker, date=d, interval="1d",
-                    open=float(row.get("Open", 0)),
-                    high=float(row.get("High", 0)),
-                    low=float(row.get("Low", 0)),
-                    close=float(row.get("Close", 0)),
-                    volume=int(row.get("Volume", 0)),
+                    open=float(o) if not pd.isna(o) else cl,
+                    high=float(h) if not pd.isna(h) else cl,
+                    low=float(lo) if not pd.isna(lo) else cl,
+                    close=cl,
+                    volume=int(vol) if not pd.isna(vol) else 0,
                 ))
         except Exception as e:
             logger.warning(f"Failed to import {ticker}: {e}")
@@ -270,8 +284,10 @@ def compute_sector_drilldown(sector_name, signal_key, exit_key, recent_window=10
         low = df["Low"].values
         n = len(close)
         entry_idxs = [df.index.get_loc(d) for d in sig[sig].index]
+        from studies import _episode_starts, _tstat_from_returns
+        episode = _episode_starts(entry_idxs)   # overlap-dedup for the significance stat
 
-        rets, holds, maes = [], [], []
+        rets, holds, maes, eff = [], [], [], []
         for idx in entry_idxs:
             try:
                 exit_idx = exit_fn(df, idx)
@@ -282,9 +298,12 @@ def compute_sector_drilldown(sector_name, signal_key, exit_key, recent_window=10
             ep = float(close[idx])
             if ep <= 0:
                 continue
-            rets.append((float(close[exit_idx]) - ep) / ep * 100)
+            ret = (float(close[exit_idx]) - ep) / ep * 100
+            rets.append(ret)
             holds.append(exit_idx - idx)
             maes.append(trade_mae(ep, low[idx + 1:exit_idx + 1]))
+            if idx in episode:
+                eff.append(ret)
 
         # Currently firing? True anywhere in the last recent_window bars.
         recent = sig.iloc[-recent_window:]
@@ -298,6 +317,8 @@ def compute_sector_drilldown(sector_name, signal_key, exit_key, recent_window=10
         row = {
             "ticker": tk,
             "trades": len(rets),
+            "eff_trades": len(eff),
+            "t_stat": _tstat_from_returns(eff),
             "avg_return": round(sum(rets) / len(rets), 2) if rets else 0.0,
             "win_rate": round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1) if rets else 0.0,
             "avg_hold": round(sum(holds) / len(holds), 1) if holds else 0.0,
@@ -975,23 +996,251 @@ def collect_darkpool_polygon(tickers, day=None, block_min=5000):
     return {"saved": saved, "errors": errs, "day": day}
 
 
-def backfill_darkpool_flatfiles(dates, tickers=None, block_min=5000):
-    """BULK historical dark-pool backfill from Polygon's daily trade FLAT FILES (S3). Each day's
-    file (s3://flatfiles/us_stocks_sip/trades_v1/YYYY/MM/YYYY-MM-DD.csv.gz) has every trade with an
-    exchange code; filter exchange==4 & trf_id → off-exchange volume per ticker, aggregate to
-    DarkPoolDay. Needs the flat-file S3 credentials from the Polygon dashboard (POLYGON_S3_KEY /
-    POLYGON_S3_SECRET) + boto3. Far faster than the REST trades endpoint for years of history.
-    Structured but NOT yet run — finalize S3 creds + column names on subscribe. See POLYGON_SETUP.md."""
-    raise NotImplementedError("Dark-pool flat-file backfill: add S3 creds + boto3 on subscribe. "
-                              "See POLYGON_SETUP.md.")
+def backfill_darkpool_flatfiles(dates, tickers=None, block_min=5000, chunk_rows=4_000_000):
+    """BULK historical dark-pool backfill from Polygon's daily trade FLAT FILES (S3 — the whole US
+    consolidated tape, ~3.4GB gzip/day). For each day, STREAM the gzip and pandas-parse in chunks
+    (memory-safe), summing off-exchange (exchange==4 & trf_id!=0) vs total volume per ticker →
+    DarkPoolDay. ONE S3 GET per day covers all tickers (vs 668 REST calls/day).
+
+    RESUMABLE: any date already present in DarkPoolDay is skipped, so this can grind through years
+    of history across restarts without redoing work — process most-recent-first so the useful data
+    lands early. `dates` = iterable of 'YYYY-MM-DD'. Needs POLYGON_S3_KEY/POLYGON_S3_SECRET + boto3
+    + pandas. Schema: ticker,conditions,correction,exchange,id,participant_timestamp,price,
+    sequence_number,sip_timestamp,size,tape,trf_id,trf_timestamp (size is float-formatted)."""
+    import os, gzip
+    import pandas as pd
+    from core.models import DarkPoolDay
+    if not (os.environ.get("POLYGON_S3_KEY") and os.environ.get("POLYGON_S3_SECRET")):
+        return {"error": "POLYGON_S3_KEY/POLYGON_S3_SECRET not set"}
+    if tickers is None:
+        from seq_fundamental_study import build_universe, load_fundamentals
+        tks = build_universe(); f = load_fundamentals(tks)
+        tickers = [t for t in tks if "." not in t and (f.get(t, {}).get("market_cap") or 0) >= 2e9]
+    tset = set(tickers)
+    s3 = _s3_massive()
+    # The endpoint caps a SINGLE stream at ~1 MB/s but 8-way parallel hits ~6-7 MB/s, so use boto3's
+    # managed multipart transfer (concurrent ranged GETs) to download each day → ~9 min vs ~60 min.
+    import tempfile
+    from boto3.s3.transfer import TransferConfig
+    xfer = TransferConfig(max_concurrency=8, multipart_threshold=16 * 1024 * 1024,
+                          multipart_chunksize=16 * 1024 * 1024, use_threads=True)
+    days_done = skipped = missing = saved = 0
+    for day in dates:
+        # Resumable, but only skip days THIS backfiller already did — a day with just partial
+        # REST rows (source='polygon') must still be fully backfilled from the flat file.
+        if DarkPoolDay.objects.filter(date=day, source="polygon_flatfile").exists():
+            skipped += 1; continue
+        y, m, _d = day.split("-")
+        key = f"us_stocks_sip/trades_v1/{y}/{m}/{day}.csv.gz"
+        tmp = os.path.join(tempfile.gettempdir(), f"dp_{day}.csv.gz")
+        try:
+            s3.download_file("flatfiles", key, tmp, Config=xfer)   # parallel multipart → disk
+        except Exception as e:
+            missing += 1
+            logger.info("darkpool flatfile %s absent (holiday/weekend?): %s", day, str(e)[:60])
+            continue
+        tot = {}; off = {}; boff = {}
+        try:
+            for chunk in pd.read_csv(tmp, compression="gzip",
+                                     usecols=["ticker", "size", "exchange", "trf_id"],
+                                     dtype={"ticker": "string"}, chunksize=chunk_rows):
+                chunk = chunk[chunk["ticker"].isin(tset)]
+                if chunk.empty:
+                    continue
+                sz = chunk["size"].astype("float64")
+                isoff = (chunk["exchange"] == 4) & (chunk["trf_id"].fillna(0) != 0)
+                for t, v in sz.groupby(chunk["ticker"]).sum().items():
+                    tot[t] = tot.get(t, 0.0) + float(v)
+                for t, v in sz[isoff].groupby(chunk["ticker"][isoff]).sum().items():
+                    off[t] = off.get(t, 0.0) + float(v)
+                blk = isoff & (sz >= block_min)
+                for t, v in sz[blk].groupby(chunk["ticker"][blk]).sum().items():
+                    boff[t] = boff.get(t, 0.0) + float(v)
+        except Exception as e:
+            logger.warning("darkpool flatfile %s parse err: %s", day, str(e)[:150])
+            continue
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        rows = [DarkPoolDay(
+            ticker=t, date=day, total_vol=int(tot[t]), off_vol=int(off.get(t, 0)),
+            off_pct=round(off.get(t, 0) / tot[t], 4) if tot[t] else None,
+            block_off_vol=int(boff.get(t, 0)), block_min=block_min, source="polygon_flatfile")
+            for t in tot]
+        # Clean-replace the day (drops any partial REST rows) so coverage is uniform & full.
+        DarkPoolDay.objects.filter(date=day).delete()
+        DarkPoolDay.objects.bulk_create(rows, batch_size=1000, ignore_conflicts=True)
+        saved += len(rows); days_done += 1
+        logger.info("darkpool flatfile %s: %d tickers | %d days done, %d skipped, %d missing",
+                    day, len(rows), days_done, skipped, missing)
+    return {"days": days_done, "skipped": skipped, "missing": missing, "rows": saved}
+
+
+# ── FINRA OTC Transparency (weekly ATS / dark-pool volume — public, no auth) ──
+_FINRA_WEEKLY_URL = "https://api.finra.org/data/group/otcMarket/name/weeklySummary"
+
+
+def _finra_num(x):
+    """CSV cell → float, treating blank/NaN/garbage as 0.0."""
+    try:
+        v = float(x)
+        return 0.0 if v != v else v   # NaN != NaN
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _finra_ats_get(symbol, offset=0, limit=5000):
+    """POST FINRA weeklySummary for ONE symbol's ATS per-symbol weekly rows (summaryTypeCode
+    ATS_W_SMBL = dark-pool total across all venues). Public, no auth. Returns list-of-dict rows
+    (CSV parsed) or None on transport error."""
+    import io, urllib.request
+    body = json.dumps({
+        "limit": limit, "offset": offset,
+        "compareFilters": [
+            {"compareType": "EQUAL", "fieldName": "issueSymbolIdentifier", "fieldValue": symbol},
+            {"compareType": "EQUAL", "fieldName": "summaryTypeCode", "fieldValue": "ATS_W_SMBL"},
+        ],
+    }).encode()
+    req = urllib.request.Request(
+        _FINRA_WEEKLY_URL, data=body, method="POST",
+        headers={"Content-Type": "application/json", "Accept": "text/plain",
+                 "User-Agent": "rotation/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            text = r.read().decode("utf-8", "replace")
+    except Exception as e:
+        logger.warning("finra ATS %s failed: %s", symbol, str(e)[:80])
+        return None
+    if not text.strip():
+        return []
+    return pd.read_csv(io.StringIO(text)).to_dict("records")
+
+
+def _finra_ats_fetch_all(symbol):
+    """Page through a symbol's full ATS weekly history (one 5000-row page covers ~5y). Pure I/O —
+    safe to run in a worker thread. Returns list-of-dict rows."""
+    offset, rows = 0, []
+    while True:
+        page = _finra_ats_get(symbol, offset=offset)
+        if not page:
+            break
+        rows.extend(page)
+        if len(page) < 5000:
+            break
+        offset += 5000
+    return rows
+
+
+def import_finra_ats(tickers=None, only_missing=False, workers=10):
+    """Backfill weekly ATS (dark-pool) volume per ticker from FINRA OTC Transparency → DarkPoolWeek.
+    Public API, no auth. ONE pass pulls FULL available history per ticker (a name's ~260 weekly rows
+    fit a single 5000-row page). `off_pct` = ATS shares / that week's consolidated Candle volume
+    (Monday-anchored). Idempotent: clean-replaces each ticker's finra rows. `only_missing` skips
+    tickers that already have rows (use for resuming an interrupted first backfill; leave False for
+    the weekly refresh so newly-published weeks are picked up).
+
+    FINRA answers ~0.5s for names it has but ~6s (HTTP 204) for names it lacks, and our universe has
+    hundreds of the latter — so the HTTP fetch is parallelized across `workers` threads. DB writes
+    stay single-threaded (in the as_completed loop) to keep Django's ORM connection thread-safe."""
+    from core.models import DarkPoolWeek
+    from seq_fundamental_study import build_universe
+    tickers = tickers or build_universe()
+    tickers = [t for t in tickers if "." not in t]   # FINRA covers US-listed only
+    skipped = 0
+    if only_missing:
+        have = set(DarkPoolWeek.objects.values_list("ticker", flat=True).distinct())
+        skipped = sum(1 for t in tickers if t in have)
+        tickers = [t for t in tickers if t not in have]
+    dfs = _get_dfs(tickers)                            # candles → weekly-volume denominator
+    # precompute weekly Monday-anchored consolidated volume per ticker (denominator for off_pct)
+    wvols = {}
+    for tk in tickers:
+        cdf = dfs.get(tk)
+        if cdf is None or cdf.empty:
+            continue
+        wv = {}
+        for d, v in cdf["Volume"].items():
+            mon = (d - pd.Timedelta(days=int(d.dayofweek))).date()
+            wv[mon] = wv.get(mon, 0.0) + float(v)
+        wvols[tk] = wv
+    saved = done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_finra_ats_fetch_all, tk): tk for tk in tickers}
+        for fut in as_completed(futs):
+            tk = futs[fut]
+            rows = fut.result()
+            if not rows:
+                continue
+            wvol = wvols.get(tk, {})
+            objs = []
+            for r in rows:
+                ws = str(r.get("weekStartDate") or "").strip()[:10]
+                try:
+                    ws_date = datetime.strptime(ws, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                shares = _finra_num(r.get("totalWeeklyShareQuantity"))
+                tot = wvol.get(ws_date)
+                pub = str(r.get("initialPublishedDate") or "").strip()[:10]
+                objs.append(DarkPoolWeek(
+                    ticker=tk, week_start=ws_date, ats_shares=int(shares),
+                    ats_trades=int(_finra_num(r.get("totalWeeklyTradeCount"))),
+                    ats_notional=(_finra_num(r.get("totalNotionalSum")) or None),
+                    off_pct=(round(shares / tot, 4) if tot else None),
+                    tier=str(r.get("tierDescription") or "")[:16],
+                    published_date=(datetime.strptime(pub, "%Y-%m-%d").date() if len(pub) == 10 else None),
+                    source="finra_ats"))
+            DarkPoolWeek.objects.filter(ticker=tk, source="finra_ats").delete()
+            DarkPoolWeek.objects.bulk_create(objs, batch_size=1000, ignore_conflicts=True)
+            saved += len(objs); done += 1
+            if done % 100 == 0:
+                logger.info("finra ATS: %d tickers, %d weekly rows", done, saved)
+    logger.info("import_finra_ats: %d tickers, %d weekly rows (%d skipped)", done, saved, skipped)
+    return {"tickers": done, "rows": saved, "skipped": skipped}
 
 
 # ── EODHD integration (news + sentiment, earnings surprises, estimate revisions) ──
 # Key-driven via EODHD_API_KEY. Uses the base plan (fundamentals/news/calendar), which the token
 # already has. Ticker mapping: US names → TICKER.US; foreign keep their suffix (SHOP.TO).
 
+# Yahoo-style exchange suffix → EODHD exchange code (they differ for several venues). Verified:
+# Korea .KS→.KO (Samsung), Shenzhen .SZ→.SHE, plus the standard EODHD codes for LSE/Xetra/etc.
+# Suffixes not listed pass through unchanged (.HK, .TW, .PA, .TO, .MI, .SA, .AS, .SW, … are native).
+_EODHD_SUFFIX_REMAP = {
+    "KS": "KO", "KQ": "KO",   # Korea (KOSPI / KOSDAQ)
+    "SZ": "SHE", "SS": "SHG",  # Shenzhen / Shanghai
+    "T": "TSE",                # Tokyo (yahoo .T → EODHD .TSE)
+    "NS": "NSE",               # India NSE (yahoo .NS → EODHD .NSE)
+    "BO": "BSE",               # India BSE (yahoo .BO → EODHD .BSE)
+    "L": "LSE",                # London
+    "DE": "XETRA", "F": "XETRA",  # Frankfurt / Xetra
+    "AX": "AU",                # Australia
+    "JO": "JSE",               # Johannesburg (verified)
+    "WA": "WAR",               # Warsaw (verified)
+    # Suffixes NOT listed pass through unchanged: .TO (Toronto), .HK, .PA, .SW, .MI, .SA, .AS, .TW …
+    # are already the native EODHD exchange codes.
+}
+
+# Per-ticker overrides for edge cases the suffix map can't express (populate as needed).
+_EODHD_SYM_OVERRIDE = {}
+
+
 def _eodhd_sym(tk):
-    return tk if "." in tk else f"{tk}.US"
+    """Map a plain/yahoo ticker to an EODHD `TICKER.EXCHANGE` symbol.
+
+    EODHD requires the exchange-qualified form (AAPL.US, 7203.TSE, WIPRO.NSE, SHOP.TO, RIO.LSE);
+    the plain/yahoo form (AAPL, 7203.T, WIPRO.NS) will NOT resolve. Returns None for symbols that
+    have no fundamentals on EODHD (e.g. futures ending in `=F`)."""
+    if tk in _EODHD_SYM_OVERRIDE:
+        return _EODHD_SYM_OVERRIDE[tk]
+    if tk.endswith("=F"):
+        return None  # futures — no fundamentals to fetch, skip
+    if "." not in tk:
+        return f"{tk}.US"  # plain ticker → US listing
+    base, suf = tk.rsplit(".", 1)
+    return f"{base}.{_EODHD_SUFFIX_REMAP.get(suf.upper(), suf)}"
 
 
 def _eodhd_get(path, **params):
@@ -1009,7 +1258,7 @@ def _eodhd_get(path, **params):
         return None
 
 
-def import_eodhd_news(tickers=None, days=400, per=1000, max_pages=12, sleep=0.02):
+def import_eodhd_news(tickers=None, days=400, per=1000, max_pages=1000, sleep=0.02):
     """Pull EODHD news + sentiment → NewsItem, PAGINATED (EODHD returns newest-first, capped at
     `limit` per call, so we page with `offset` to reach deep history). `days` sets how far back
     (400≈13mo incremental; ~2000 ≈ 5.5y deep backfill). bulk_create(ignore_conflicts) dedupes on the
@@ -1075,9 +1324,19 @@ def import_eodhd_earnings(tickers=None):
         if not isinstance(d, dict):
             continue
         for _, e in d.items():
-            rd = e.get("reportDate") or e.get("date")
+            rd = e.get("reportDate")
             if not rd:
-                continue
+                # No announcement date — approximate PIT availability as the
+                # fiscal period-end + 45d (typical 10-Q filing deadline). Using
+                # the period-end itself (e["date"], ~4-6wk earlier) would let a
+                # backtest see the report before it was actually filed.
+                pe = e.get("date")
+                if not pe:
+                    continue
+                try:
+                    rd = (pd.Timestamp(pe) + pd.Timedelta(days=45)).date().isoformat()
+                except Exception:
+                    continue
             try:
                 EarningsEvent.objects.update_or_create(ticker=tk, report_date=rd, defaults=dict(
                     eps_actual=e.get("epsActual"), eps_estimate=e.get("epsEstimate"),
@@ -1114,6 +1373,222 @@ def import_eodhd_estimates(tickers=None):
                 pass
     logger.info("import_eodhd_estimates: %d rows", saved)
     return {"saved": saved}
+
+
+def import_eodhd_fundamentals(tickers=None, only_missing=True, yf_fallback=True):
+    """Backfill historical QUARTERLY financials into FinancialReport from EODHD
+    `fundamentals/{sym}` (global coverage), for tickers SEC EDGAR can't serve — foreign filers
+    (RMS.PA, 6367.T, …) plus any US names without a CIK match. EDGAR stays PRIMARY for US; this
+    only fills the hole so the point-in-time fundamentals layer covers the whole universe.
+
+    only_missing=True → skip tickers that already have (EDGAR-sourced) FinancialReport rows, so we
+    never clobber the authoritative US history and we spend one EODHD call only on the gap tickers.
+    EODHD stamps each period with `filing_date` → avail_date is the real point-in-time (fallback:
+    period_end + 45d if EODHD omits it). Idempotent via update_or_create(ticker, period_end)."""
+    from core.models import FinancialReport, Fundamental
+    from seq_fundamental_study import build_universe
+    if not os.environ.get("EODHD_API_KEY"):
+        return {"error": "EODHD_API_KEY not set"}
+    tickers = tickers or build_universe()
+    if only_missing:
+        have = set(FinancialReport.objects.values_list("ticker", flat=True).distinct())
+        tickers = [t for t in tickers if t not in have]
+    logger.info("import_eodhd_fundamentals: %d target tickers (only_missing=%s)", len(tickers), only_missing)
+
+    def _num(x):
+        if x in (None, "", "None", "0000-00-00"):
+            return None
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    def _int(x):
+        v = _num(x)
+        return int(v) if v is not None else None
+
+    saved = 0; tks_done = 0; gap = []; syms = {}
+    for tk in tickers:
+        sym = _eodhd_sym(tk)
+        if sym is None:
+            # No EODHD fundamentals for this symbol (e.g. futures =F) — skip entirely,
+            # don't send to the yfinance fallback either (it has no fundamentals for these).
+            continue
+        # Record the EODHD symbol used onto any existing Fundamental row(s) for this ticker,
+        # so global fills are traceable (does NOT mutate the plain `ticker` value).
+        syms[tk] = sym
+        try:
+            Fundamental.objects.filter(ticker=tk).update(eodhd_symbol=sym)
+        except Exception:
+            pass
+        d = _eodhd_get(f"fundamentals/{sym}", filter="Financials")
+        tks_done += 1
+        if not isinstance(d, dict):
+            gap.append(tk)
+            continue
+        s0 = saved
+        inc = (d.get("Income_Statement") or {}).get("quarterly") or {}
+        bal = (d.get("Balance_Sheet") or {}).get("quarterly") or {}
+        cfl = (d.get("Cash_Flow") or {}).get("quarterly") or {}
+        for pe in (set(inc) | set(bal)):
+            i = inc.get(pe) or {}; b = bal.get(pe) or {}; c = cfl.get(pe) or {}
+            try:
+                pe_d = date.fromisoformat(pe[:10])
+            except Exception:
+                continue
+            filed = i.get("filing_date") or b.get("filing_date") or c.get("filing_date")
+            try:
+                avail = date.fromisoformat(filed[:10]) if filed and filed != "0000-00-00" else pe_d + timedelta(days=45)
+            except Exception:
+                avail = pe_d + timedelta(days=45)
+            tot_debt = _num(b.get("shortLongTermDebtTotal"))
+            if tot_debt is None:
+                lt = _num(b.get("longTermDebt")); st = _num(b.get("shortTermDebt"))
+                if lt is not None or st is not None:
+                    tot_debt = (lt or 0) + (st or 0)
+            ocf = _num(c.get("totalCashFromOperatingActivities"))
+            fcf = _num(c.get("freeCashFlow"))
+            if fcf is None:
+                capex = _num(c.get("capitalExpenditures"))
+                if ocf is not None and capex is not None:
+                    fcf = ocf - abs(capex)
+            try:
+                FinancialReport.objects.update_or_create(
+                    ticker=tk, period_end=pe_d, defaults=dict(
+                        avail_date=avail,
+                        revenue=_int(i.get("totalRevenue")),
+                        net_income=_int(i.get("netIncome")),
+                        operating_income=_int(i.get("operatingIncome")),
+                        gross_profit=_int(i.get("grossProfit")),
+                        cost_of_revenue=_int(i.get("costOfRevenue")),
+                        rd_expense=_int(i.get("researchDevelopment")),
+                        eps_diluted=None,   # EODHD income statement carries no diluted EPS; leave null
+                        total_equity=_int(b.get("totalStockholderEquity")),
+                        total_debt=_int(tot_debt) if tot_debt is not None else None,
+                        current_assets=_int(b.get("totalCurrentAssets")),
+                        current_liabilities=_int(b.get("totalCurrentLiabilities")),
+                        total_assets=_int(b.get("totalAssets")),
+                        inventory=_int(b.get("inventory")),
+                        cash_and_equivalents=_int(b.get("cashAndEquivalents") or b.get("cash")),
+                        shares_outstanding=_int(b.get("commonStockSharesOutstanding")),
+                        operating_cash_flow=_int(ocf) if ocf is not None else None,
+                        free_cash_flow=_int(fcf) if fcf is not None else None,
+                    ))
+                saved += 1
+            except Exception:
+                pass
+        if saved == s0:
+            gap.append(tk)
+        if tks_done % 50 == 0:
+            logger.info("import_eodhd_fundamentals: %d/%d tickers, %d rows", tks_done, len(tickers), saved)
+    yf_res = None
+    if yf_fallback and gap:
+        logger.info("import_eodhd_fundamentals: %d tickers missed by EODHD (404/empty) -> yfinance fallback", len(gap))
+        yf_res = import_yf_fundamentals(tickers=gap, only_missing=False)
+    logger.info("import_eodhd_fundamentals: %d rows across %d tickers (%d gap -> yf)", saved, tks_done, len(gap))
+    return {"saved": saved, "tickers": tks_done, "eodhd_gap": len(gap), "yf_fallback": yf_res, "eodhd_symbols": syms}
+
+
+def import_yf_fundamentals(tickers=None, only_missing=True):
+    """Snapshot fundamentals per ticker from yfinance `.info` into core.models.Fundamental
+    (update_or_create keyed on ticker+today's date). This is the SELF-HEALING FALLBACK for names
+    that EODHD 404s on (US miners like AEM/GOLD/KGC/FNV/CCJ, small/mid-caps, etc.). EODHD/EDGAR
+    stay PRIMARY for historical point-in-time financials; this only fills the Fundamental snapshot
+    hole so the fundamentals layer covers the whole universe.
+
+    only_missing=True -> universe = distinct Candle tickers that have NO existing Fundamental row.
+    Futures (ticker ends in '=F') are skipped — commodity futures have no equity fundamentals.
+    Idempotent (update_or_create), each ticker guarded so one bad symbol never aborts the run."""
+    from core.models import Fundamental
+    if tickers is None:
+        tickers = list(Candle.objects.values_list("ticker", flat=True).distinct())
+    tickers = [t for t in tickers if not str(t).endswith("=F")]
+    if only_missing:
+        have = set(Fundamental.objects.values_list("ticker", flat=True).distinct())
+        tickers = [t for t in tickers if t not in have]
+    logger.info("import_yf_fundamentals: %d target tickers (only_missing=%s)", len(tickers), only_missing)
+
+    def _g(info, key):
+        """float or None (drops NaN)."""
+        v = info.get(key)
+        if v is None:
+            return None
+        try:
+            f = float(v)
+            return f if f == f else None
+        except (TypeError, ValueError):
+            return None
+
+    def _gi(info, key):
+        """int or None (drops NaN)."""
+        v = info.get(key)
+        if v is None:
+            return None
+        try:
+            f = float(v)
+            return int(f) if f == f else None
+        except (TypeError, ValueError):
+            return None
+
+    today = date.today()
+    saved = 0; errors = 0; no_data = 0; done = 0
+    for tk in tickers:
+        done += 1
+        try:
+            info = yf.Ticker(tk).info or {}
+            if info.get("marketCap") is None and info.get("trailingEps") is None and info.get("totalRevenue") is None:
+                no_data += 1
+                continue
+            fields = {
+                "dividend_yield": _g(info, "dividendYield"),
+                "pe_ratio": _g(info, "trailingPE"),
+                "forward_pe": _g(info, "forwardPE"),
+                "pb_ratio": _g(info, "priceToBook"),
+                "ps_ratio": _g(info, "priceToSalesTrailing12Months"),
+                "peg_ratio": _g(info, "pegRatio"),
+                "market_cap": _gi(info, "marketCap"),
+                "enterprise_value": _gi(info, "enterpriseValue"),
+                "eps": _g(info, "trailingEps"),
+                "forward_eps": _g(info, "forwardEps"),
+                "annual_revenue": _gi(info, "totalRevenue"),
+                "revenue_growth": _g(info, "revenueGrowth"),
+                "earnings_growth": _g(info, "earningsGrowth"),
+                "profit_margin": _g(info, "profitMargins"),
+                "operating_margin": _g(info, "operatingMargins"),
+                "shares_outstanding": _gi(info, "sharesOutstanding"),
+                "float_shares": _gi(info, "floatShares"),
+                "short_ratio": _g(info, "shortRatio"),
+                "short_pct_float": _g(info, "shortPercentOfFloat"),
+                "insider_pct": _g(info, "heldPercentInsiders"),
+                "institution_pct": _g(info, "heldPercentInstitutions"),
+                "analyst_rating": info.get("recommendationKey"),
+                "analyst_target": _g(info, "targetMeanPrice"),
+                "analyst_count": _gi(info, "numberOfAnalystOpinions"),
+                "total_cash": _gi(info, "totalCash"),
+                "total_debt": _gi(info, "totalDebt"),
+                "debt_to_equity": _g(info, "debtToEquity"),
+                "current_ratio": _g(info, "currentRatio"),
+                "book_value": _g(info, "bookValue"),
+                "free_cash_flow": _gi(info, "freeCashflow"),
+                "operating_cash_flow": _gi(info, "operatingCashflow"),
+                "beta_5y": _g(info, "beta"),
+                "fifty_two_wk_high": _g(info, "fiftyTwoWeekHigh"),
+                "fifty_two_wk_low": _g(info, "fiftyTwoWeekLow"),
+                "avg_volume": _gi(info, "averageVolume"),
+                "sector": info.get("sector"),
+                "industry": info.get("industry"),
+            }
+            Fundamental.objects.update_or_create(ticker=tk, date=today, defaults=fields)
+            saved += 1
+        except Exception as e:
+            errors += 1
+            logger.warning("import_yf_fundamentals: %s error %s", tk, e)
+        # yfinance throttles after many sequential .info calls
+        if done % 20 == 0:
+            time.sleep(2)
+            logger.info("import_yf_fundamentals: %d/%d (%d saved)", done, len(tickers), saved)
+    logger.info("import_yf_fundamentals: %d saved, %d no-data, %d errors", saved, no_data, errors)
+    return {"saved": saved, "no_data": no_data, "errors": errors, "tickers": done}
 
 
 def _vix_regime(vx):
@@ -1633,6 +2108,9 @@ def compute_research(save=True):
                 weekly.append({"entry": idx[loc], "conv": "A" if bool(wA.get(wd, False)) else "B",
                                "ep": float(close[loc]), "exits": exits_for(df, loc, close, n, idx)})
 
+    if not daily:
+        logger.warning("compute_research: no daily entries qualified — skipping (empty result)")
+        return {"error": "no daily entries", "matrices": {}}
     cal = spy.index[spy.index >= min(x["entry"] for x in daily)]
     oos = cal[cal >= "2025-01-01"]
 
@@ -2571,12 +3049,20 @@ def run_sec_events_task(jobs=None):
     return proc.returncode
 
 
-def run_studies_task():
-    """Generate and run all studies that haven't been computed yet."""
+def run_studies_task(rebuild_trades=True):
+    """Generate and run all studies that haven't been computed yet.
+
+    `rebuild_trades=False` skips the per-study Trade/StudySectorResult delete+rebuild — use it for
+    a pure aggregate/MAE backfill where the signal/exit logic is unchanged, so the existing Trade
+    rows are already correct. Rebuilding them is ~43M row deletes+inserts and is the whole
+    bottleneck; the Study aggregates (incl. avg_mae/clean_pct) come from the in-memory loop, not
+    the DB, so skipping the writes changes nothing but speed. Leave True for the nightly (new
+    studies genuinely need their trades built)."""
     if config is None:
         return
 
-    from studies import SIGNALS, EXITS, generate_studies, CLEAN_MAE_THRESH, trade_mae
+    from studies import (SIGNALS, EXITS, generate_studies, CLEAN_MAE_THRESH, trade_mae,
+                         _episode_starts, _tstat_from_returns)
 
     study_defs = generate_studies()
     logger.info(f"Generated {len(study_defs)} study definitions")
@@ -2613,109 +3099,146 @@ def run_studies_task():
 
     spy_df = dfs.get(config.BENCHMARK)
 
-    def _run_one(study):
-        if study.signal_key not in SIGNALS or study.exit_key not in EXITS:
-            return
-        _, sig_fn = SIGNALS[study.signal_key]
-        _, exit_fn = EXITS[study.exit_key]
-
-        sector_results = []
-        trades = []
-        total_wins = total_trades = 0
-        total_ret = 0
-        total_hold = 0
-        total_mae = 0.0
-        total_clean = 0
-
+    def _run_signal_group(signal_key, group):
+        """Compute this signal's entry series ONCE per sector (signals are ~99% of study compute),
+        then run all its exit-studies off the cached entries. The old per-study path recomputed the
+        same signal 70× (once per exit). Exit calc is negligible, so no exit memoization needed.
+        Numerics are unchanged — only the redundant signal recompute is hoisted out."""
+        if signal_key not in SIGNALS:
+            return 0
+        _, sig_fn = SIGNALS[signal_key]
+        needs_spy = signal_key in ("rsi_x_pos_updn", "rsi_sup10_x_dd50_mkt", "rsi_sup10_x_mkt")
+        # entries[etf] = list of (entry_date, idx) — computed once for this signal
+        entries = {}
         for etf, (sector, df) in all_dfs.items():
             try:
-                if study.signal_key in ("rsi_x_pos_updn", "rsi_sup10_x_dd50_mkt", "rsi_sup10_x_mkt") and spy_df is not None:
-                    signals = sig_fn(df, spy_close=spy_df["Close"]).fillna(False)
+                if needs_spy and spy_df is not None:
+                    sig = sig_fn(df, spy_close=spy_df["Close"]).fillna(False)
                 else:
-                    signals = sig_fn(df).fillna(False)
+                    sig = sig_fn(df).fillna(False)
             except Exception:
                 continue
+            entries[etf] = [(ed, df.index.get_loc(ed)) for ed in sig[sig].index]
+        # Independent-episode bars per etf (overlap-dedup for the significance stat).
+        episode_by_etf = {etf: _episode_starts([idx for _, idx in ents])
+                          for etf, ents in entries.items()}
 
-            wins = losses = strades = 0
-            sret = 0
-            shold = 0
-            max_g = max_l = 0
-            smae = 0.0        # sum of per-trade MAE (%)
-            sclean = 0        # count of clean (barely-dipped) entries
-            close_arr = df["Close"].values
-            low_arr = df["Low"].values
+        n = 0
+        for study in group:
+            if study.exit_key not in EXITS:
+                continue
+            _, exit_fn = EXITS[study.exit_key]
+            sector_results = []
+            trades = []
+            total_wins = total_trades = 0
+            total_ret = 0
+            total_hold = 0
+            total_mae = 0.0
+            total_clean = 0
+            eff = []   # one return per independent episode, pooled across etfs → significance
 
-            for entry_date in signals[signals].index:
-                idx = df.index.get_loc(entry_date)
-                exit_idx = exit_fn(df, idx)
-                if exit_idx is None or exit_idx <= idx:
+            for etf, (sector, df) in all_dfs.items():
+                ents = entries.get(etf)
+                if not ents:
                     continue
+                epi = episode_by_etf.get(etf, set())
+                wins = losses = strades = 0
+                sret = 0
+                shold = 0
+                max_g = max_l = None   # seed from first trade, not 0 (one-sided sectors)
+                smae = 0.0        # sum of per-trade MAE (%)
+                sclean = 0        # count of clean (barely-dipped) entries
+                close_arr = df["Close"].values
+                low_arr = df["Low"].values
 
-                ep = float(close_arr[idx])
-                xp = float(close_arr[exit_idx])
-                ret = (xp - ep) / ep * 100
-                hold = exit_idx - idx
-                mae = trade_mae(ep, low_arr[idx + 1:exit_idx + 1])
+                for entry_date, idx in ents:
+                    exit_idx = exit_fn(df, idx)
+                    if exit_idx is None or exit_idx <= idx:
+                        continue
 
-                strades += 1
-                sret += ret
-                shold += hold
-                smae += mae
-                if mae >= CLEAN_MAE_THRESH: sclean += 1
-                if ret > 0: wins += 1
-                else: losses += 1
-                max_g = max(max_g, ret)
-                max_l = min(max_l, ret)
+                    ep = float(close_arr[idx])
+                    xp = float(close_arr[exit_idx])
+                    ret = (xp - ep) / ep * 100
+                    hold = exit_idx - idx
+                    mae = trade_mae(ep, low_arr[idx + 1:exit_idx + 1])
 
-                trades.append(Trade(
-                    study=study, sector=sector, etf=etf,
-                    entry_date=entry_date.date() if hasattr(entry_date, 'date') else entry_date,
-                    exit_date=df.index[exit_idx].date() if hasattr(df.index[exit_idx], 'date') else df.index[exit_idx],
-                    entry_price=round(ep, 2), exit_price=round(xp, 2),
-                    return_pct=round(ret, 3), hold_days=hold,
-                ))
+                    strades += 1
+                    sret += ret
+                    shold += hold
+                    smae += mae
+                    if mae >= CLEAN_MAE_THRESH: sclean += 1
+                    if ret > 0: wins += 1
+                    else: losses += 1
+                    if idx in epi:
+                        eff.append(ret)
+                    max_g = ret if max_g is None else max(max_g, ret)
+                    max_l = ret if max_l is None else min(max_l, ret)
 
-            if strades > 0:
-                sector_results.append(StudySectorResult(
-                    study=study, sector=sector,
-                    trades=strades, avg_return=round(sret/strades, 3),
-                    total_return=round(sret, 2), win_rate=round(wins/strades*100, 1),
-                    wins=wins, losses=losses, avg_hold=round(shold/strades, 1),
-                    max_gain=round(max_g, 2), max_loss=round(max_l, 2),
-                ))
-                total_wins += wins
-                total_trades += strades
-                total_ret += sret
-                total_hold += shold
-                total_mae += smae
-                total_clean += sclean
+                    if rebuild_trades:   # skip building ~43M Trade objects on a MAE-only backfill
+                        trades.append(Trade(
+                            study=study, sector=sector, etf=etf,
+                            entry_date=entry_date.date() if hasattr(entry_date, 'date') else entry_date,
+                            exit_date=df.index[exit_idx].date() if hasattr(df.index[exit_idx], 'date') else df.index[exit_idx],
+                            entry_price=round(ep, 2), exit_price=round(xp, 2),
+                            return_pct=round(ret, 3), hold_days=hold,
+                        ))
 
-        # Save
-        if trades:
-            Trade.objects.filter(study=study).delete()
-            Trade.objects.bulk_create(trades, batch_size=5000)
-        if sector_results:
-            StudySectorResult.objects.filter(study=study).delete()
-            StudySectorResult.objects.bulk_create(sector_results)
+                if strades > 0:
+                    sector_results.append(StudySectorResult(
+                        study=study, sector=sector,
+                        trades=strades, avg_return=round(sret/strades, 3),
+                        total_return=round(sret, 2), win_rate=round(wins/strades*100, 1),
+                        wins=wins, losses=losses, avg_hold=round(shold/strades, 1),
+                        max_gain=round(max_g, 2), max_loss=round(max_l, 2),
+                    ))
+                    total_wins += wins
+                    total_trades += strades
+                    total_ret += sret
+                    total_hold += shold
+                    total_mae += smae
+                    total_clean += sclean
 
-        study.total_trades = total_trades
-        study.avg_return = round(total_ret / total_trades, 3) if total_trades else 0
-        study.win_rate = round(total_wins / total_trades * 100, 1) if total_trades else 0
-        study.avg_hold = round(total_hold / total_trades, 1) if total_trades else 0
-        study.avg_mae = round(total_mae / total_trades, 2) if total_trades else 0
-        study.clean_pct = round(total_clean / total_trades * 100, 1) if total_trades else 0
-        study.is_computed = True
-        study.computed_at = timezone.now()
-        study.save()
+            # Save (Trade/StudySectorResult rebuild skipped on a MAE-only backfill — unchanged rows)
+            if rebuild_trades:
+                if trades:
+                    Trade.objects.filter(study=study).delete()
+                    Trade.objects.bulk_create(trades, batch_size=5000)
+                if sector_results:
+                    StudySectorResult.objects.filter(study=study).delete()
+                    StudySectorResult.objects.bulk_create(sector_results)
 
-    # Run with thread pool
+            study.total_trades = total_trades
+            study.eff_trades = len(eff)
+            study.t_stat = _tstat_from_returns(eff)
+            study.avg_return = round(total_ret / total_trades, 3) if total_trades else 0
+            study.win_rate = round(total_wins / total_trades * 100, 1) if total_trades else 0
+            study.avg_hold = round(total_hold / total_trades, 1) if total_trades else 0
+            study.avg_mae = round(total_mae / total_trades, 2) if total_trades else 0
+            study.clean_pct = round(total_clean / total_trades * 100, 1) if total_trades else 0
+            study.is_computed = True
+            study.computed_at = timezone.now()
+            study.save()
+            n += 1
+        return n
+
+    # Group uncomputed studies by signal_key so each signal is computed once (not once per exit).
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for s in uncomputed:
+        groups[s.signal_key].append(s)
+    logger.info("Running %d studies across %d signal groups", uncomputed.count(), len(groups))
+
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_run_one, s): s for s in uncomputed}
-        done = 0
+        futures = {pool.submit(_run_signal_group, sk, grp): sk for sk, grp in groups.items()}
+        done_groups = done_studies = 0
         for f in as_completed(futures):
-            done += 1
-            if done % 20 == 0:
-                logger.info(f"Studies: {done}/{len(futures)} done")
+            done_groups += 1
+            try:
+                done_studies += f.result() or 0
+            except Exception as e:
+                logger.warning("signal group %s failed: %s", futures[f], str(e)[:120])
+            if done_groups % 20 == 0:
+                logger.info("Signal groups: %d/%d done (%d studies)", done_groups, len(groups), done_studies)
 
     logger.info(f"All studies complete")
 
@@ -2763,13 +3286,17 @@ def _current_fresh_map(interval="1d"):
             logger.warning(f"Fresh calc failed for {sector.name}: {e}")
             continue
 
-        m, ms = macd.get("macd"), macd.get("macd_signal")
-        green = bool(m is not None and ms is not None and m > ms)
         rsi_x, rs_x = fc.get("fresh_rsi_x_days"), fc.get("fresh_rs_x_days")
-        conds = [fc.get("fresh_sortino_pos"), rsi_x is not None, rs_x is not None, green]
+        # FRESH = 3 conditions (weekly Sortino>0 + RSI crossover + RSI-of-Sortino crossover) within
+        # the window. MACD was removed from the signal rules 2026-07-24; it must NOT gate the alert
+        # (that made the daily alert silently under-fire vs the dashboard). Kept as info-only below.
+        conds = [fc.get("fresh_sortino_pos"), rsi_x is not None, rs_x is not None]
         if all(conds):
-            fd = max(rsi_x, rs_x)
-            if fd <= FRESH_WINDOW:
+            # Gate on the EARLIER crossover (both must be inside the window),
+            # but the composite only COMPLETES on the LATER (more recent)
+            # crossover, so the displayed age is the smaller days-ago value.
+            if max(rsi_x, rs_x) <= FRESH_WINDOW:
+                fd = min(rsi_x, rs_x)
                 current[sector.etf] = {
                     "sector": sector.name,
                     "fresh_days": fd,

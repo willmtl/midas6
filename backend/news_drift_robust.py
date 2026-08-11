@@ -1,4 +1,7 @@
 """
+DEPRECATED (2026-08-10): reads the retired Anthropic/Haiku labels. Superseded by
+news_drift_robust_local.py (same methodology on LOCAL qwen labels). Kept for historical reference.
+
 Robustness gate for the ONE surviving news edge: FADE of strong bullish news.
 (Under-reaction is dead; bearish is not a clean short — see news_drift_material.py.)
 

@@ -31,7 +31,7 @@ class ScanView(APIView):
             compute_scan(interval)
             results = ScanResult.objects.filter(interval=interval).select_related("sector")
 
-        data = ScanResultSerializer(results.order_by("-rsi_spread" if results.exists() else "id"), many=True).data
+        data = ScanResultSerializer(results.order_by("-rsi_spread"), many=True).data
 
         spy_vals = {}
         if data:
@@ -49,7 +49,7 @@ class ScanView(APIView):
             "total": len(data),
             "bullish": bullish_count,
             "sectors": data,
-            "cached_at": results.first().computed_at.isoformat() if results.exists() else None,
+            "cached_at": data[0].get("computed_at") if data else None,
         })
 
 
@@ -79,13 +79,25 @@ class ChartView(APIView):
 
 class StudyListView(APIView):
     def get(self, request):
-        """Serve studies from database."""
-        studies = Study.objects.filter(is_computed=True)
-        data = StudySerializer(studies, many=True).data
-        return Response({
-            "total_studies": len(data),
-            "studies": data,
-        })
+        """Serve studies from database. Cursor-paginated when ?paginate=1 (or ?cursor=...) is sent —
+        the infinite-scroll frontend opts in; legacy callers get the full list unchanged."""
+        from django.db.models import Max
+        qs = Study.objects.filter(is_computed=True)
+        last = qs.aggregate(m=Max("computed_at"))["m"]
+        last_iso = last.isoformat() if last else None
+        if request.query_params.get("cursor") is not None or request.query_params.get("paginate") == "1":
+            from api.pagination import DashboardCursorPagination, resolve_ordering
+            STUDY_ORDER = {"avg_return": "avg_return", "win_rate": "win_rate",
+                           "trades": "total_trades", "total_trades": "total_trades",
+                           "avg_hold": "avg_hold", "avg_mae": "avg_mae", "clean_pct": "clean_pct",
+                           "peak_avg": "peak_avg", "ret_90d": "ret_90d"}
+            ordering = resolve_ordering(request, STUDY_ORDER, "avg_return")
+            paginator = DashboardCursorPagination()
+            page = paginator.paginate(qs, request, ordering=ordering, last_updated=last_iso,
+                                      extra={"total_studies": qs.count()})
+            return paginator.get_paginated_response(StudySerializer(page, many=True).data)
+        data = StudySerializer(qs, many=True).data
+        return Response({"total_studies": len(data), "studies": data, "last_updated": last_iso})
 
 
 class StudyTradesView(APIView):
@@ -109,14 +121,13 @@ class StudyTradesView(APIView):
         qs = Trade.objects.filter(study=study).select_related("sector")
         if sector_filter:
             qs = qs.filter(Q(etf=sector_filter) | Q(sector__name=sector_filter))
-        db_count = qs.count()
+        trades = list(qs.order_by("-entry_date"))  # single fetch; avoids a separate COUNT on the hit path
 
-        if db_count > 0:
-            trades = qs.order_by("-entry_date")
+        if trades:
             return Response({
                 "study_id": study.id,
                 "study_name": study.name,
-                "total_trades": db_count,
+                "total_trades": len(trades),
                 "trades": TradeSerializer(trades, many=True).data,
             })
 
@@ -199,14 +210,14 @@ class StudyTradesView(APIView):
 
                     # Per-trade peak, drawdown, and 90d return
                     max_look = min(idx + 90, n - 1)
-                    peak_ret = 0
+                    peak_ret = None   # true path max, incl. all-declining trades (not floored at 0)
                     peak_day = 0
                     max_drawdown = 0
                     running_peak = ep
                     for d in range(1, exit_idx - idx + 1):
                         p = float(close[idx + d])
                         r = (p - ep) / ep * 100
-                        if r > peak_ret:
+                        if peak_ret is None or r > peak_ret:
                             peak_ret = r
                             peak_day = d
                         if p > running_peak:
@@ -216,9 +227,11 @@ class StudyTradesView(APIView):
                             max_drawdown = dd
                     for d in range(exit_idx - idx + 1, max_look - idx + 1):
                         r = (float(close[idx + d]) - ep) / ep * 100
-                        if r > peak_ret:
+                        if peak_ret is None or r > peak_ret:
                             peak_ret = r
                             peak_day = d
+                    if peak_ret is None:
+                        peak_ret = 0.0
                     ret_90d = None
                     if idx + 90 < n:
                         ret_90d = round((float(close[idx + 90]) - ep) / ep * 100, 2)
@@ -343,10 +356,9 @@ class FundamentalsView(APIView):
     def get(self, request, ticker):
         """Return fundamental data for a ticker."""
         from core.models import Fundamental
-        fundamentals = Fundamental.objects.filter(ticker=ticker.upper()).order_by('-date')
-        if not fundamentals.exists():
+        latest = Fundamental.objects.filter(ticker=ticker.upper()).order_by('-date').first()
+        if latest is None:
             return Response({"error": "No fundamentals found"}, status=404)
-        latest = fundamentals.first()
         fields = {}
         for f in latest._meta.get_fields():
             if f.name in ('id',):
@@ -392,7 +404,9 @@ class FundamentalsListView(APIView):
 class TrendStudyListView(APIView):
     def get(self, request):
         """Return all trend study results. Optional ?mode=etf|momentum|hibeta filter."""
-        studies = TrendStudy.objects.all()
+        # defer the big JSON blobs (equity_curve/spy_curve/trade_log ~1250 pts + full trade log each) —
+        # the list loop only reads scalars, so pulling them was multi-MB fetched and discarded per request.
+        studies = TrendStudy.objects.defer("equity_curve", "spy_curve", "trade_log")
         mode = request.GET.get("mode")
         if mode:
             studies = studies.filter(hold_mode=mode)
@@ -411,6 +425,8 @@ class TrendStudyListView(APIView):
                 "max_drawdown": s.max_drawdown,
                 "num_trades": s.num_trades,
                 "win_rate": s.win_rate,
+                "t_stat": s.t_stat,
+                "robust": bool(s.num_trades >= 12 and s.t_stat is not None and abs(s.t_stat) >= 2),
             })
         # .order_by() clears the model's default ordering, else it pollutes DISTINCT.
         modes = sorted(TrendStudy.objects.order_by().values_list("hold_mode", flat=True).distinct())
@@ -546,15 +562,46 @@ class StockStudiesView(APIView):
                 fq = fq.filter(exit_key=exit_key)
             if min_trades:
                 fq = fq.filter(total_trades__gte=min_trades)
+            computed_at = meta["computed_at"] if meta else None
+            _last_iso = computed_at.isoformat() if computed_at else None
+            # Opt-in cursor pagination (infinite-scroll frontend); legacy full list otherwise.
+            if request.query_params.get("cursor") is not None or request.query_params.get("paginate") == "1":
+                from api.pagination import DashboardCursorPagination, resolve_ordering
+                STOCK_ORDER = {"avg_return": "avg_return", "win_rate": "win_rate",
+                               "trades": "total_trades", "avg_hold": "avg_hold",
+                               "avg_mae": "avg_mae", "clean_pct": "clean_pct"}
+                ordering = resolve_ordering(request, STOCK_ORDER, "avg_return")
+                vq = fq.values(
+                    "id", "signal_key", "signal_name", "exit_key", "exit_name", "category",
+                    "total_trades", "eff_trades", "t_stat",
+                    "avg_return", "win_rate", "avg_hold", "avg_mae", "clean_pct", "by_dimension")
+                paginator = DashboardCursorPagination()
+                page = paginator.paginate(vq, request, ordering=ordering, last_updated=_last_iso, extra={
+                    "computed": True, "source": "db",
+                    "universe_size": meta["universe_size"] if meta else None,
+                    "n_results": n_results, "categories": categories,
+                    "computed_at": _last_iso, "dimension_meta": dimension_meta})
+                page_rows = [{
+                    "signal_key": r["signal_key"], "signal_name": r["signal_name"],
+                    "exit_key": r["exit_key"], "exit_name": r["exit_name"],
+                    "category": r["category"], "trades": r["total_trades"],
+                    "eff_trades": r["eff_trades"], "t_stat": r["t_stat"],
+                    "avg_return": r["avg_return"], "win_rate": r["win_rate"],
+                    "avg_hold": r["avg_hold"], "avg_mae": r["avg_mae"], "clean_pct": r["clean_pct"],
+                    "by_dimension": r["by_dimension"] or {},
+                } for r in page]
+                return paginator.get_paginated_response(page_rows)
             # .values() → dicts, skips model instantiation for the (up to `limit`) rows.
             rows = fq.order_by("-avg_return").values(
                 "signal_key", "signal_name", "exit_key", "exit_name", "category",
-                "total_trades", "avg_return", "win_rate", "avg_hold", "avg_mae", "clean_pct",
+                "total_trades", "eff_trades", "t_stat",
+                "avg_return", "win_rate", "avg_hold", "avg_mae", "clean_pct",
                 "by_dimension")[:limit]
             results = [{
                 "signal_key": r["signal_key"], "signal_name": r["signal_name"],
                 "exit_key": r["exit_key"], "exit_name": r["exit_name"],
                 "category": r["category"], "trades": r["total_trades"],
+                "eff_trades": r["eff_trades"], "t_stat": r["t_stat"],
                 "avg_return": r["avg_return"], "win_rate": r["win_rate"],
                 "avg_hold": r["avg_hold"], "avg_mae": r["avg_mae"], "clean_pct": r["clean_pct"],
                 "by_dimension": r["by_dimension"] or {},
@@ -566,6 +613,7 @@ class StockStudiesView(APIView):
                 "n_signals": None, "n_exits": None,
                 "n_results": n_results, "categories": categories,
                 "computed_at": computed_at.isoformat() if computed_at else None,
+                "last_updated": computed_at.isoformat() if computed_at else None,
                 "returned": len(results), "results": results,
                 "dimension_meta": dimension_meta,
             })
@@ -600,8 +648,9 @@ class StockStudiesView(APIView):
             "universe_size": payload.get("universe_size"),
             "n_signals": payload.get("n_signals"), "n_exits": payload.get("n_exits"),
             "n_results": payload.get("n_results"), "categories": categories,
-            "computed_at": computed_at,
+            "computed_at": computed_at, "last_updated": computed_at,
             "returned": min(len(results), limit), "results": results[:limit],
+            "next": None,  # JSON fallback is single-page (DB-empty case only)
             "dimension_meta": dimension_meta,
         })
 
@@ -644,20 +693,34 @@ class LiveSignalsView(APIView):
             qs = qs.filter(sectors__contains=sector)
         signals = sorted(LiveSignal.objects.order_by().values_list("signal_key", flat=True).distinct())
         meta = LiveSignal.objects.order_by("-computed_at").values("computed_at").first()
-        rows = qs.order_by("days_ago", "-hist_avg_return").values(
-            "ticker", "signal_key", "signal_name", "days_ago", "last_close",
-            "best_exit_key", "hist_avg_return", "hist_win_rate", "hist_trades",
-            "hist_avg_mae", "hist_clean_pct",
-            "market_cap", "pe_ratio", "forward_pe", "profit_margin", "fund_buckets", "sectors",
-            "insider_buy_90d", "recent_13d", "recent_13g")[:limit]
         computed_at = meta["computed_at"] if meta else None
+        _last_iso = computed_at.isoformat() if computed_at else None
         import math
         def _finite(v):
             return None if (isinstance(v, float) and not math.isfinite(v)) else v
+        _VALS = ("ticker", "signal_key", "signal_name", "days_ago", "last_close",
+                 "best_exit_key", "hist_avg_return", "hist_win_rate", "hist_trades",
+                 "hist_avg_mae", "hist_clean_pct",
+                 "market_cap", "pe_ratio", "forward_pe", "profit_margin", "fund_buckets", "sectors",
+                 "insider_buy_90d", "recent_13d", "recent_13g")
+        # Opt-in cursor pagination (infinite-scroll frontend); legacy full list otherwise.
+        if request.query_params.get("cursor") is not None or request.query_params.get("paginate") == "1":
+            from api.pagination import DashboardCursorPagination, resolve_ordering
+            LIVE_ORDER = {"days_ago": "days_ago", "hist_avg_return": "hist_avg_return",
+                          "hist_win_rate": "hist_win_rate", "hist_trades": "hist_trades"}
+            ordering = resolve_ordering(request, LIVE_ORDER, "days_ago", default_dir="asc")
+            vq = qs.values("id", *_VALS)
+            paginator = DashboardCursorPagination()
+            page = paginator.paginate(vq, request, ordering=ordering, last_updated=_last_iso,
+                                      extra={"computed": True, "n_firing": n_total, "signals": signals,
+                                             "computed_at": _last_iso})
+            clean = [{k: _finite(v) for k, v in r.items() if k != "id"} for r in page]
+            return paginator.get_paginated_response(clean)
+        rows = qs.order_by("days_ago", "-hist_avg_return").values(*_VALS)[:limit]
         clean = [{k: _finite(v) for k, v in r.items()} for r in rows]
         return Response({
             "computed": True, "n_firing": n_total, "signals": signals,
-            "computed_at": computed_at.isoformat() if computed_at else None,
+            "computed_at": _last_iso, "last_updated": _last_iso,
             "returned": min(n_total, limit), "results": clean,
         })
 
@@ -666,6 +729,56 @@ class LiveSignalsView(APIView):
         thread = threading.Thread(target=run_live_firing_task, daemon=True)
         thread.start()
         return Response({"status": "firing scan started"})
+
+
+class NewsEventStudyView(APIView):
+    """Market-adjusted news event study (keyed on OUR model's read, not EODHD sentiment): abnormal
+    returns AR = R_stock − beta·R_spy per (dir×beta 252d/60d), (dir×impact), (IV regime×dir), and
+    (news_type×beta), with next-morning gap + IV surprise ratio. GET reads the stored blob; POST
+    recomputes in the background."""
+
+    def get(self, request):
+        from core.models import NewsEventStudy
+        row = (NewsEventStudy.objects.filter(label="latest")
+               .values("n_events", "n_tickers", "data", "computed_at").first())
+        if not row or not row["data"]:
+            return Response({"computed": False, "results": {},
+                             "message": "Not computed yet. POST to run (needs classified news)."})
+        return Response({
+            "computed": True, "n_events": row["n_events"], "n_tickers": row["n_tickers"],
+            "computed_at": row["computed_at"].isoformat() if row["computed_at"] else None,
+            "groupings": row["data"],
+        })
+
+    def post(self, request):
+        from api.news_market_study import run_and_save
+        threading.Thread(target=run_and_save, daemon=True).start()
+        return Response({"status": "news event study started"})
+
+
+class IvCalibrationView(APIView):
+    """IV calibration: is ATM implied vol a good predictor of the next-day move? Aggregate
+    variance-risk-premium stats + per-ticker ranking of over/under-priced options. GET reads the
+    stored blob; POST recomputes in the background."""
+
+    def get(self, request):
+        from core.models import IvCalibration
+        row = IvCalibration.objects.filter(label="latest").values("data", "computed_at").first()
+        if not row or not row["data"]:
+            return Response({"computed": False, "aggregate": {}, "per_ticker": [],
+                             "message": "Not computed yet. POST to run."})
+        d = row["data"]
+        return Response({
+            "computed": True,
+            "computed_at": row["computed_at"].isoformat() if row["computed_at"] else None,
+            "aggregate": d.get("aggregate", {}), "per_ticker": d.get("per_ticker", []),
+            "n_tickers": d.get("n_tickers", 0),
+        })
+
+    def post(self, request):
+        from api.iv_calibration import run_and_save
+        threading.Thread(target=run_and_save, daemon=True).start()
+        return Response({"status": "iv calibration started"})
 
 
 class NewsHorizonSignalsView(APIView):
@@ -988,8 +1101,14 @@ class NewsClusterView(APIView):
                 n_moved = sum(1 for r in run if r[6])
                 n_bull = sum(1 for r in run if (r[4] or 0) > 0)
                 n_bear = sum(1 for r in run if (r[4] or 0) < 0)
-                abns = [r[5] for r in run if r[5] is not None]
-                net_abn = round(sum(abns), 2) if abns else None
+                # One abnormal session-move per unique reaction DATE: several headlines on the same
+                # day all carry that day's move, so summing per-item multiplied a single +X% day by
+                # the headline count (a 5-PR +10% day read as +50%). r[1] is a DateTimeField, so key
+                # on its .date() — keying on the raw timestamp leaves intraday same-day headlines
+                # un-collapsed and still double-counts.
+                _abn_by_day = {(r[1].date() if hasattr(r[1], "date") else r[1]): r[5]
+                               for r in run if r[5] is not None}
+                net_abn = round(sum(_abn_by_day.values()), 2) if _abn_by_day else None
                 span_days = (run[-1][1] - run[0][1]).days
                 n_dir = n_bull + n_bear
                 bull_share = (n_bull / n_dir) if n_dir else 0.0
@@ -1362,3 +1481,31 @@ class SectorStockDrilldownView(APIView):
         from api.tasks import compute_sector_drilldown
         result = compute_sector_drilldown(sector, signal, exit_key, recent_window=recent)
         return Response(result)
+
+
+class BacktestLabView(APIView):
+    """Sector-rotation lab: many rotation rules backtested vs SPY (phase1) + in/out-of-sample split
+    (phase2) + top-signals portfolio (phase3). GET serves the precomputed JSON that
+    backtest_concept.py writes; POST triggers a fresh recompute in the background."""
+
+    def get(self, request):
+        import os as _os, json as _json
+        path = "/app/.data/studies/backtest_concept.json"
+        if not _os.path.exists(path):
+            return Response({"computed": False,
+                             "message": "Backtest lab not computed yet. POST to run it."})
+        with open(path) as f:
+            data = _json.load(f)
+        data["computed"] = True
+        data["last_updated"] = data.get("computed_at")
+        return Response(data)
+
+    def post(self, request):
+        import threading, subprocess
+        def _run():
+            try:
+                subprocess.run(["python", "-u", "backtest_concept.py"], cwd="/app", timeout=1800)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+        return Response({"status": "backtest lab recompute started"})

@@ -24,6 +24,8 @@ urlpatterns = [
 
     # Firing now: stocks currently triggering the top signals across all sectors
     path("live-signals", views.LiveSignalsView.as_view(), name="live-signals"),
+    path("news-event-study", views.NewsEventStudyView.as_view(), name="news-event-study"),
+    path("iv-calibration", views.IvCalibrationView.as_view(), name="iv-calibration"),
 
     # News horizon: recent material news joined to horizon-conditioned drift (validated fades)
     path("news-horizon", views.NewsHorizonSignalsView.as_view(), name="news-horizon"),
@@ -44,6 +46,8 @@ urlpatterns = [
     path("playbook", views.PlaybookView.as_view(), name="playbook"),
     # Portfolio backtest equity curve vs SPY
     path("equity-curve", views.EquityCurveView.as_view(), name="equity-curve"),
+    # Sector-rotation lab: many rotation rules backtested vs SPY + OOS split + top-signals portfolio
+    path("backtest-lab", views.BacktestLabView.as_view(), name="backtest-lab"),
     # Forward paper-trade track record of Playbook picks
     path("paper-trades", views.PaperTradesView.as_view(), name="paper-trades"),
     # Research/Lab: trigger×exit / timeframe / regime / cap-band / MPT comparisons

@@ -190,6 +190,37 @@ def run_darkpool_snapshot():
 
 
 @shared_task
+def run_finra_ats():
+    """Weekly: pull FINRA OTC-Transparency ATS (dark-pool) weekly volume → DarkPoolWeek. Public API,
+    no key needed. only_missing=False so newly-published weeks (FINRA lags ~3-4wk) get picked up;
+    idempotent clean-replace per ticker."""
+    from api.tasks import import_finra_ats
+    r = import_finra_ats(only_missing=False)
+    logger.info(f"FINRA ATS weekly complete: {r}")
+    return r
+
+
+@shared_task
+def run_news_event_study():
+    """Nightly: recompute the market-adjusted news event study (our-model read: dir/impact × beta ×
+    IV, market-stripped AR + drift). Run after the local news classifier so local_dir is fresh."""
+    from api.news_market_study import run_and_save
+    r = run_and_save()
+    logger.info(f"news event study: {r}")
+    return r
+
+
+@shared_task
+def run_iv_calibration_task():
+    """Weekly: recompute the IV-calibration study (implied vs realized next-day move; per-ticker
+    over/under-pricing). Slow-moving, so weekly suffices."""
+    from api.iv_calibration import run_and_save
+    r = run_and_save()
+    logger.info(f"iv calibration: {r}")
+    return r
+
+
+@shared_task
 def run_eodhd_news():
     """Daily: pull EODHD news + sentiment for the universe → NewsItem. No-op without EODHD_API_KEY."""
     import os
@@ -271,6 +302,34 @@ def run_eodhd_estimates():
     r = import_eodhd_estimates()
     logger.info(f"EODHD estimates import: {r}")
     return r
+
+
+@shared_task
+def run_backtest_lab():
+    """Nightly: regenerate the backtest lab (root backtest_concept.py → .data/studies/backtest_concept.json)
+    as a clean SUBPROCESS.
+
+    Why a subprocess and not an in-process import: the backtest scripts parallelize with
+    multiprocessing 'spawn', which re-imports the child __main__. Running inside this
+    Django/Celery process would make the spawned workers re-import the server's __main__
+    (runserver/celery) instead of the script. Launching it as `python backtest_concept.py`
+    gives spawn a clean script __main__, exactly like the manual command. Mirrors
+    api.tasks.run_stock_studies_task. Scheduled after the fundamentals + stock-studies chain
+    so candles and fundamentals are fresh."""
+    import os
+    import subprocess
+    script = "/app/backtest_concept.py"
+    if not os.path.exists(script):
+        logger.error("run_backtest_lab: %s not found (mount it in docker-compose)", script)
+        return
+    cmd = ["python", "-u", script]
+    logger.info("run_backtest_lab: launching %s", " ".join(cmd))
+    proc = subprocess.run(cmd, cwd="/app", capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("backtest lab failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    else:
+        logger.info("backtest lab done: %s", proc.stdout[-1000:])
+    return proc.returncode
 
 
 @shared_task

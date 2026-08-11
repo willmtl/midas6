@@ -63,7 +63,7 @@ def compute_betas(stock_data, spy_data, window=60):
             # Rolling beta
             cov = aligned["stock"].rolling(window).cov(aligned["spy"])
             var = aligned["spy"].rolling(window).var()
-            beta = (cov / var).reindex(df.index)
+            beta = (cov / var).replace([np.inf, -np.inf], np.nan).reindex(df.index)
             betas[ticker] = beta
         except Exception:
             continue
@@ -155,13 +155,17 @@ def run_stock_drilldown(study_obj, etf_data, stock_data, betas, etf_to_holdings)
             sdf = stock_data[best_stock]
             # Find matching dates
             try:
-                s_entry_idx = sdf.index.get_indexer([entry_date], method="nearest")[0]
+                # Entry must use the last stock bar ON/BEFORE the signal date (ffill) — "nearest"
+                # could snap FORWARD to the next session when the exact bar is missing (halt/late
+                # listing), buying at a price that didn't exist at signal time (1-bar lookahead).
+                s_entry_idx = sdf.index.get_indexer([entry_date], method="ffill")[0]
                 exit_date = df.index[exit_idx]
                 s_exit_idx = sdf.index.get_indexer([exit_date], method="nearest")[0]
             except Exception:
                 continue
 
-            if s_exit_idx <= s_entry_idx or s_entry_idx >= len(sdf) or s_exit_idx >= len(sdf):
+            if s_entry_idx < 0 or s_exit_idx < 0 or s_exit_idx <= s_entry_idx \
+                    or s_entry_idx >= len(sdf) or s_exit_idx >= len(sdf):
                 continue
 
             s_ep = float(sdf["Close"].iloc[s_entry_idx])

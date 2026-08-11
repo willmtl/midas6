@@ -35,21 +35,26 @@ SKIP_SIGNALS = set(MARKET_SIGNAL_KEYS) | {"rsi_x_pos_updn"}
 
 def top_signals(top_n, min_trades=1000):
     """Best signals by their strongest exit (from StockStudy), most robust first.
+    Per signal, prefers a SIGNIFICANT exit (|t_stat|>=2) over a merely-high avg_return one, then
+    ranks signals robust-first, then by avg_return — so the docstring's "most robust first" is real
+    (the old code sorted by raw -avg_return only). Degrades to pure avg_return when t_stat is null
+    (rows predating the significance layer), so behavior is unchanged until the sweep repopulates.
     Returns [(signal_key, best_exit_key, hist_avg, hist_wr, hist_trades, hist_avg_mae, hist_clean_pct)]."""
     from core.models import StockStudy
-    best = {}
-    for r in (StockStudy.objects.filter(total_trades__gte=min_trades)
-              .order_by("-avg_return")
-              .values_list("signal_key", "exit_key", "avg_return", "win_rate", "total_trades",
-                           "avg_mae", "clean_pct")):
-        sk, ek, avg, wr, tr, mae, clean = r
+    best = {}   # signal_key -> (rank_key, row_tuple)
+    for sk, ek, avg, wr, tr, mae, clean, ts in (
+            StockStudy.objects.filter(total_trades__gte=min_trades)
+            .values_list("signal_key", "exit_key", "avg_return", "win_rate", "total_trades",
+                         "avg_mae", "clean_pct", "t_stat")):
         if sk in SKIP_SIGNALS:
             continue
-        if sk not in best:  # first seen = highest avg_return for that signal
-            best[sk] = (sk, ek, avg, wr, tr, mae, clean)
-        if len(best) >= top_n:
-            break
-    return list(best.values())
+        robust = ts is not None and abs(ts) >= 2
+        rank_key = (1 if robust else 0, avg if avg is not None else -1e9)
+        cur = best.get(sk)
+        if cur is None or rank_key > cur[0]:   # best (robust, then avg_return) exit for this signal
+            best[sk] = (rank_key, (sk, ek, avg, wr, tr, mae, clean))
+    ranked = sorted(best.values(), key=lambda x: x[0], reverse=True)   # robust first, then avg_return
+    return [row for _, row in ranked[:top_n]]
 
 
 def _worker(payload):

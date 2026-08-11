@@ -45,7 +45,8 @@ class StudySerializer(serializers.ModelSerializer):
         model = Study
         fields = [
             "id", "name", "signal", "signal_name", "exit", "exit_name",
-            "category", "total_trades", "avg_return", "win_rate", "avg_hold",
+            "category", "total_trades", "eff_trades", "t_stat",
+            "avg_return", "win_rate", "avg_hold",
             "avg_mae", "clean_pct",
             "sector_count", "peak_day", "peak_avg", "ret_90d",
             "best_peak_day", "best_peak_ret", "best_ret_90d",

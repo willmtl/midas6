@@ -103,11 +103,15 @@ def main():
                 continue
             rd = pd.Timestamp(e["report_date"])
             pos = int(idx.searchsorted(rd))          # first trading idx >= report_date
-            after = "After" in (e["before_after"] or "")
+            # Only an explicit "Before" (BMO) report reprices on the report day itself. "After" AND
+            # unknown/empty before_after (~19% of rows) map to the NEXT session — defaulting unknown
+            # to BMO measured close[pos-1]->close[pos], a window that ENDS before an after-close
+            # report existed (a lookahead that inflated apparent PEAD drift).
+            after = "Before" not in (e["before_after"] or "")
             if after:
-                rfrom, rto = pos, pos + 1             # reported after close -> next day reprices
+                rfrom, rto = pos, pos + 1             # after close / unknown -> next day reprices
             else:
-                rfrom, rto = pos - 1, pos             # before open / unknown -> report day reprices
+                rfrom, rto = pos - 1, pos             # before open (BMO) -> report day reprices
             if rfrom < BETA_WIN or rto >= n or rto + max(DRIFTS) >= n:
                 continue
             if close[rto] < MIN_PRICE or close[rfrom] <= 0 or mkt[rfrom] <= 0 or mkt[rto] <= 0:

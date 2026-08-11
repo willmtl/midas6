@@ -96,10 +96,19 @@ def run_signal_curve(sig_key, all_data):
             "p90": round(np.percentile(rets, 90), 3),
         })
 
-    # Find peak day (highest average return)
-    peak_day = max(curve, key=lambda x: x["avg"])
-    # Find best win rate day
-    best_wr_day = max(curve, key=lambda x: x["wr"])
+    # Find peak day (highest average return) — only over horizons that retain
+    # a representative sample. Long holds keep only the oldest entries (those
+    # with MAX_HOLD forward bars), so an unfloored argmax can pick a tiny,
+    # non-independent tail cohort. Floor at >=20 trades AND >=50% of the
+    # day-1 sample so peak_day reflects the same population as the short holds.
+    day1_trades = curve[0]["trades"] if curve else 0
+    min_peak_trades = max(20, int(0.5 * day1_trades))
+    eligible = [c for c in curve if c["trades"] >= min_peak_trades]
+    if not eligible:
+        eligible = curve
+    peak_day = max(eligible, key=lambda x: x["avg"])
+    # Find best win rate day (same sample floor)
+    best_wr_day = max(eligible, key=lambda x: x["wr"])
 
     # Key intervals
     key_days = {

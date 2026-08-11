@@ -56,11 +56,14 @@ def analyze(
 
         # RSI crossover — pass omega series for validation
         rsi_data = indicators.compute_rsi_crossover(etf_df, omega_series=metrics.get("omega_series"))
-        if rsi_data.get("rsi") is None:
+        # Skip when RSI or its SMA is unavailable (SMA warmup): a None SMA
+        # coerced to 0 would make rsi_spread ≈ raw RSI (~60) and float an
+        # under-warmed ETF to the top of the bullish ranking.
+        if rsi_data.get("rsi") is None or rsi_data.get("rsi_sma") is None:
             continue
 
         rsi = rsi_data["rsi"]
-        rsi_sma = rsi_data["rsi_sma"] or 0
+        rsi_sma = rsi_data["rsi_sma"]
         rsi_spread = round(rsi - rsi_sma, 2)
         rsi_above = rsi_data.get("rsi_above_sma", False)
         crossover = rsi_data.get("rsi_crossover", False)

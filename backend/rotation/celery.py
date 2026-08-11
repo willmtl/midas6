@@ -124,6 +124,23 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_darkpool_snapshot",
         "schedule": crontab(hour=22, minute=20),
     },
+    # FINRA ATS (official weekly dark-pool volume). Public API, no key. FINRA publishes weekly with a
+    # 2-4wk lag, so a weekly Sunday pull suffices. Full history in minutes; idempotent. 22:15 UTC Sun.
+    "finra-ats-weekly": {
+        "task": "api.celery_tasks.run_finra_ats",
+        "schedule": crontab(hour=22, minute=15, day_of_week=0),
+    },
+    # Market-adjusted news event study (our-model read). After news-classify-local (23:15) so
+    # local_dir/local_impact are fresh. 23:40 UTC.
+    "news-event-study-daily": {
+        "task": "api.celery_tasks.run_news_event_study",
+        "schedule": crontab(hour=23, minute=40),
+    },
+    # IV calibration (implied vs realized move; per-ticker over/under-pricing). Slow-moving → weekly.
+    "iv-calibration-weekly": {
+        "task": "api.celery_tasks.run_iv_calibration_task",
+        "schedule": crontab(hour=23, minute=50, day_of_week=0),
+    },
     # Playbook refresh (sector board + ranked candidates). After A/D-divergence. 22:50 UTC.
     "playbook-daily": {
         "task": "api.celery_tasks.run_playbook",
@@ -146,5 +163,11 @@ app.conf.beat_schedule = {
     "research-weekly": {
         "task": "api.celery_tasks.run_research",
         "schedule": crontab(hour=23, minute=50, day_of_week=0),
+    },
+    # Backtest lab (root backtest_concept.py → .data/studies/backtest_concept.json). Runs after the
+    # fundamentals (21:30) + stock-studies (21:45) chain so candles + fundamentals are fresh. 22:45 UTC.
+    "backtest-lab-nightly": {
+        "task": "api.celery_tasks.run_backtest_lab",
+        "schedule": crontab(hour=22, minute=45),
     },
 }

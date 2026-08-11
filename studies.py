@@ -306,6 +306,43 @@ BOTH_WINDOW_W = 2       # weekly bars: same, for weekly variants
 # so the AvgDip / Clean% columns mean the same thing everywhere.
 CLEAN_MAE_THRESH = -2.0   # % — dip shallower than this counts as a clean entry
 
+# Independence gap for significance stats. Level-condition signals stay True for runs of
+# consecutive bars, so each bar opens a near-duplicate trade sharing the same forward window;
+# pooling them as i.i.d. inflates the apparent sample and overstates significance. We collapse
+# fires within EFFECTIVE_GAP trading bars of the previous accepted fire (per ticker/sector) into
+# ONE independent observation before computing the t-stat. A trading week is a coarse but
+# defensible proxy for "distinct setup" (not a full overlap/Newey-West correction).
+EFFECTIVE_GAP = 5
+
+
+def _tstat_from_returns(returns):
+    """One-sample t-stat of a return list vs 0: mean / (std_ddof1 / sqrt(n)). Returns None if
+    fewer than 3 observations or zero dispersion. |t|>=2 ≈ a real edge; small |t| = noise."""
+    n = len(returns)
+    if n < 3:
+        return None
+    arr = np.asarray(returns, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) < 3:
+        return None
+    sd = arr.std(ddof=1)
+    if not (sd > 0):
+        return None
+    return round(float(arr.mean() / (sd / np.sqrt(len(arr)))), 2)
+
+
+def _episode_starts(entry_idxs, gap=EFFECTIVE_GAP):
+    """Given ascending entry bar positions, return the subset that start a new independent
+    'episode' — the first fire, then any fire >= `gap` bars after the previous accepted one.
+    Collapses runs of consecutive/near-consecutive fires into single observations."""
+    starts = set()
+    last = -10 ** 9
+    for i in entry_idxs:
+        if i - last >= gap:
+            starts.add(i)
+            last = i
+    return starts
+
 
 def trade_mae(entry_price, low_slice):
     """Worst intraday adverse excursion (%) from entry over the hold, vectorized.
@@ -577,7 +614,9 @@ def _rolling_sortino(df, w=10):
         dd = np.sqrt(np.mean(downside**2, axis=1))
         mask = dd > 1e-10
         ratios = np.where(mask, mean_excess / dd, np.nan)
-        result[w:n] = ratios[:n-w]
+        # window k covers returns k..k+w-1 → ends at bar k+w-1, so the ratio
+        # belongs at result[k+w-1]. result[w-1:] has len n-w+1 == len(ratios).
+        result[w - 1:] = ratios
 
     return pd.Series(result, index=df.index)
 
@@ -605,18 +644,21 @@ def _rolling_omega(df, w=10):
         losses = -np.sum(np.minimum(windows, 0), axis=1)
         mask = losses > 1e-10
         ratios = np.where(mask, gains / losses, np.nan)
-        result[w:n] = ratios[:n-w]
+        # window k ends at bar k+w-1 → ratio belongs at result[k+w-1].
+        result[w - 1:] = ratios
 
     return pd.Series(result, index=df.index)
 
 def _dn_capture_signal(df, threshold, direction):
-    """Signal when downside capture crosses a threshold vs SPY."""
+    """AVERAGE DOWN-DAY RETURN (in %) crossing a level. NOTE: this is NOT a downside-capture ratio
+    (there is no SPY benchmark) — it is the mean of the trailing-10-bar down-day LOG returns, in %.
+    `threshold` is in the same %/100 units: 50 → the -0.5% level, 150 → the -1.5% level, 0 → 0%.
+    min_periods=3 so the mean forms from >=3 down days instead of requiring 10 CONSECUTIVE down days
+    (default min_periods=window left the masked series ~all-NaN → the signal never fired)."""
     ret = np.log(df["Close"] / df["Close"].shift(1))
-    # Need SPY data - use a proxy: compute self-dn-capture vs rolling average
-    # Actually, compute rolling downside capture as: on down days, how much does this drop
     neg_ret = ret.copy()
     neg_ret[neg_ret >= 0] = np.nan
-    dn_avg = neg_ret.rolling(10).mean() * 100  # scale to percentage
+    dn_avg = neg_ret.rolling(10, min_periods=3).mean() * 100  # avg down-day return, in %
 
     if direction == "below":
         return (dn_avg < -abs(threshold/100)) & (dn_avg.shift(1) >= -abs(threshold/100))
@@ -625,12 +667,13 @@ def _dn_capture_signal(df, threshold, direction):
 
 
 def _dn_trending(df, direction):
-    """Signal when downside capture trend changes."""
+    """Trend change in the avg down-day return (its 10-bar mean vs a 5-bar smoothing of that mean).
+    min_periods added so the sparse masked series produces a live series (see _dn_capture_signal)."""
     ret = np.log(df["Close"] / df["Close"].shift(1))
     neg_ret = ret.copy()
     neg_ret[neg_ret >= 0] = np.nan
-    dn_avg = neg_ret.rolling(10).mean()
-    dn_sma = dn_avg.rolling(5).mean()
+    dn_avg = neg_ret.rolling(10, min_periods=3).mean()
+    dn_sma = dn_avg.rolling(5, min_periods=2).mean()
 
     if direction == "down":  # improving = dn going less negative
         return (dn_avg > dn_sma) & (dn_avg.shift(1) <= dn_sma.shift(1))
@@ -639,15 +682,17 @@ def _dn_trending(df, direction):
 
 
 def _updn_spread_signal(df, threshold, direction):
-    """Signal based on Up% - Dn% spread."""
+    """Spread between the avg UP-day and avg DOWN-day return (both in %), i.e. avg_up - avg_dn.
+    min_periods=3 on each masked mean so the series is live; the previous .fillna(0) was dropped
+    because zero-filling a missing half biased the spread toward 0 and pinned the cross tests."""
     ret = np.log(df["Close"] / df["Close"].shift(1))
     pos_ret = ret.copy()
     pos_ret[pos_ret <= 0] = np.nan
     neg_ret = ret.copy()
     neg_ret[neg_ret >= 0] = np.nan
 
-    up_avg = pos_ret.rolling(10).mean().fillna(0) * 100
-    dn_avg = neg_ret.rolling(10).mean().fillna(0) * 100
+    up_avg = pos_ret.rolling(10, min_periods=3).mean() * 100
+    dn_avg = neg_ret.rolling(10, min_periods=3).mean() * 100
     spread = up_avg - dn_avg  # positive = more upside than downside
 
     if direction == "above":
@@ -685,7 +730,8 @@ def _cmf(df, period=20):
     """Chaikin Money Flow."""
     mfm = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / (df["High"] - df["Low"]).replace(0, 1)
     mfv = mfm * df["Volume"]
-    return mfv.rolling(period).sum() / df["Volume"].rolling(period).sum()
+    # Guard a fully-zero-volume (halted/illiquid) window: 0/0 → NaN → no fire.
+    return mfv.rolling(period).sum() / df["Volume"].rolling(period).sum().replace(0, np.nan)
 
 def _cmf_cross_zero(df, period=20):
     """CMF crosses above zero."""
@@ -1035,9 +1081,11 @@ def _rolling_updn_spread(df, spy_close, w=10):
     ret = df["Close"].pct_change()
     spy_ret = spy_close.pct_change().reindex(ret.index)
     spread = pd.Series(np.nan, index=ret.index)
-    for i in range(w, len(ret)):
-        window_r = ret.iloc[i-w:i]
-        window_s = spy_ret.iloc[i-w:i]
+    for i in range(w - 1, len(ret)):
+        # Trailing w-bar window ENDING AT and INCLUDING bar i (iloc[i-w+1:i+1]);
+        # iloc[i-w:i] excluded the current bar and shifted the value one bar early.
+        window_r = ret.iloc[i-w+1:i+1]
+        window_s = spy_ret.iloc[i-w+1:i+1]
         up_mask = window_s > 0
         dn_mask = window_s < 0
         if up_mask.sum() >= 2 and dn_mask.sum() >= 2:
@@ -1664,46 +1712,46 @@ SIGNALS = {
     "seq_rs30_rsi_x_omega_sort_10d": ("Seq: RS Cross <30 -> RSI× + Omega>1 + Sort>0 (10d)", lambda df: _seq_a_then_b(df,
         lambda d: _rsi_of_sortino(d).pipe(lambda r: (r > r.rolling(14).mean()) & (r.shift(1) <= r.rolling(14).mean().shift(1)) & (r.rolling(14).min().shift(1) < 30)),
         lambda d: (ta.momentum.rsi(d["Close"], window=10) > ta.momentum.rsi(d["Close"], window=10).rolling(14).mean()) & (_rolling_omega(d) > 1) & (_rolling_sortino(d) > 0), 10)),
-    # ── Downside Capture (Dn%) signals ──
-    "dn_low": ("Dn% Drops Below 50", lambda df: _dn_capture_signal(df, 50, "below")),
-    "dn_very_low": ("Dn% Drops Below 0 (inverse)", lambda df: _dn_capture_signal(df, 0, "below")),
-    "dn_high": ("Dn% Rises Above 150", lambda df: _dn_capture_signal(df, 150, "above")),
-    "dn_improving": ("Dn% Trending Down (improving)", lambda df: _dn_trending(df, "down")),
-    "dn_worsening": ("Dn% Trending Up (worsening)", lambda df: _dn_trending(df, "up")),
-    "dn_low_rsi_x": ("Dn%<50 + RSI Cross SMA", lambda df: (
+    # ── Avg down-day return signals (mean of trailing-10 down-day returns, in %; NOT a capture ratio) ──
+    "dn_low": ("Avg Dn-Day Ret Crosses < -0.5%", lambda df: _dn_capture_signal(df, 50, "below")),
+    "dn_very_low": ("Avg Dn-Day Ret Turns Negative", lambda df: _dn_capture_signal(df, 0, "below")),
+    "dn_high": ("Avg Dn-Day Ret Recovers > -1.5%", lambda df: _dn_capture_signal(df, 150, "above")),
+    "dn_improving": ("Avg Dn-Day Ret Improving", lambda df: _dn_trending(df, "down")),
+    "dn_worsening": ("Avg Dn-Day Ret Worsening", lambda df: _dn_trending(df, "up")),
+    "dn_low_rsi_x": ("Avg Dn-Day Ret<-0.5% + RSI Cross SMA", lambda df: (
         _dn_capture_signal(df, 50, "below") &
         (ta.momentum.rsi(df["Close"], window=10) > ta.momentum.rsi(df["Close"], window=10).rolling(10).mean()) &
         (ta.momentum.rsi(df["Close"], window=10).shift(1) <= ta.momentum.rsi(df["Close"], window=10).rolling(10).mean().shift(1))
     )),
-    "dn_low_omega": ("Dn%<50 + Omega>1", lambda df: (
+    "dn_low_omega": ("Avg Dn-Day Ret<-0.5% + Omega>1", lambda df: (
         _dn_capture_signal(df, 50, "below") & (_rolling_omega(df) > 1)
     )),
-    "dn_low_sort_pos": ("Dn%<50 + Sortino>0", lambda df: (
+    "dn_low_sort_pos": ("Avg Dn-Day Ret<-0.5% + Sortino>0", lambda df: (
         _dn_capture_signal(df, 50, "below") & (_rolling_sortino(df) > 0)
     )),
-    "dn_neg_rsi_x": ("Dn%<0 + RSI Cross SMA", lambda df: (
+    "dn_neg_rsi_x": ("Avg Dn-Day Ret<0 + RSI Cross SMA", lambda df: (
         _dn_capture_signal(df, 0, "below") &
         (ta.momentum.rsi(df["Close"], window=10) > ta.momentum.rsi(df["Close"], window=10).rolling(10).mean()) &
         (ta.momentum.rsi(df["Close"], window=10).shift(1) <= ta.momentum.rsi(df["Close"], window=10).rolling(10).mean().shift(1))
     )),
-    "dn_neg_omega_sort": ("Dn%<0 + Omega>1 + Sortino>0", lambda df: (
+    "dn_neg_omega_sort": ("Avg Dn-Day Ret<0 + Omega>1 + Sortino>0", lambda df: (
         _dn_capture_signal(df, 0, "below") & (_rolling_omega(df) > 1) & (_rolling_sortino(df) > 0)
     )),
-    "dn_improving_rsi_x": ("Dn% Improving + RSI Cross", lambda df: (
+    "dn_improving_rsi_x": ("Avg Dn-Day Ret Improving + RSI Cross", lambda df: (
         _dn_trending(df, "down") &
         (ta.momentum.rsi(df["Close"], window=10) > ta.momentum.rsi(df["Close"], window=10).rolling(10).mean()) &
         (ta.momentum.rsi(df["Close"], window=10).shift(1) <= ta.momentum.rsi(df["Close"], window=10).rolling(10).mean().shift(1))
     )),
-    "dn_improving_omega_sort": ("Dn% Improving + Omega>1 + Sortino>0", lambda df: (
+    "dn_improving_omega_sort": ("Avg Dn-Day Ret Improving + Omega>1 + Sortino>0", lambda df: (
         _dn_trending(df, "down") & (_rolling_omega(df) > 1) & (_rolling_sortino(df) > 0)
     )),
-    "spread_pos": ("Up%-Dn% Spread > 50", lambda df: _updn_spread_signal(df, 50, "above")),
-    "spread_turns_pos": ("Up%-Dn% Turns Positive", lambda df: _updn_spread_signal(df, 0, "above")),
-    "spread_turns_pos_rsi_x": ("Up%-Dn% Positive + RSI Cross", lambda df: (
+    "spread_pos": ("Up-Dn Ret Spread > 0.5%", lambda df: _updn_spread_signal(df, 50, "above")),
+    "spread_turns_pos": ("Up-Dn Ret Spread Turns Positive", lambda df: _updn_spread_signal(df, 0, "above")),
+    "spread_turns_pos_rsi_x": ("Up-Dn Spread Positive + RSI Cross", lambda df: (
         _updn_spread_signal(df, 0, "above") &
         (ta.momentum.rsi(df["Close"], window=10) > ta.momentum.rsi(df["Close"], window=10).rolling(14).mean())
     )),
-    "spread_pos_rsi_x": ("Spread>50 + RSI Cross SMA", lambda df: (
+    "spread_pos_rsi_x": ("Up-Dn Spread>0.5% + RSI Cross SMA", lambda df: (
         _updn_spread_signal(df, 50, "above") &
         (ta.momentum.rsi(df["Close"], window=10) > ta.momentum.rsi(df["Close"], window=10).rolling(10).mean()) &
         (ta.momentum.rsi(df["Close"], window=10).shift(1) <= ta.momentum.rsi(df["Close"], window=10).rolling(10).mean().shift(1))
@@ -2076,9 +2124,13 @@ SIGNALS = {
 # ── Exit conditions ──
 
 def exit_fixed(df, entry_idx, days):
-    """Exit after fixed number of days."""
-    exit_idx = min(entry_idx + days, len(df) - 1)
-    return exit_idx if exit_idx > entry_idx else None
+    """Exit after a fixed number of days. Returns None when the full horizon runs past the end
+    of the series so an incomplete trade is DROPPED rather than silently clamped to the last bar
+    and counted as a finished `days`-bar trade. Clamping made every ticker's final ~`days` entries
+    book a truncated hold / compressed return, biasing avg_hold down and avg_return toward 0 for
+    long fixed-horizon exits (6m/1y)."""
+    exit_idx = entry_idx + days
+    return exit_idx if exit_idx < len(df) else None
 
 def exit_next_gap_down(df, entry_idx, max_hold=60):
     """Hold until next gap down, max 60 days."""
@@ -2948,6 +3000,7 @@ def run_study(study: dict, all_data: dict) -> dict:
     all_vix_trades = {"LOW_VIX": [], "MED_VIX": [], "HIGH_VIX": []}
     all_spy_trend_trades = {"BULL": [], "BEAR": []}
     all_season_trades = {"NOV_APR": [], "MAY_OCT": []}
+    all_eff_returns = []  # one return per independent episode (overlap-deduped), pooled for t-stat
 
     for ticker, df in all_data.items():
         if ticker == config.BENCHMARK or len(df) < 60:
@@ -2972,6 +3025,8 @@ def run_study(study: dict, all_data: dict) -> dict:
             continue
 
         entry_dates = signals[signals].index.tolist()
+        entry_idxs = [df.index.get_loc(d) for d in entry_dates]
+        episode_starts = _episode_starts(entry_idxs)  # overlap-dedup for the significance stat
         wins = losses = 0
         total_ret = 0
         trades = 0
@@ -2986,8 +3041,7 @@ def run_study(study: dict, all_data: dict) -> dict:
         low_arr = df["Low"].values
         n_bars = len(close_arr)
 
-        for entry_date in entry_dates:
-            idx = df.index.get_loc(entry_date)
+        for entry_date, idx in zip(entry_dates, entry_idxs):
             exit_idx = exit_fn(df, idx)
             if exit_idx is None or exit_idx <= idx:
                 continue
@@ -3004,52 +3058,58 @@ def run_study(study: dict, all_data: dict) -> dict:
             mae_list.append(mae)
             clean_list.append(1 if mae >= CLEAN_MAE_THRESH else 0)
 
-            # Per-trade peak return within 90d + the day it peaked (vectorized — was a per-bar loop).
-            max_look = min(idx + 90, n_bars - 1)
-            if max_look > idx:
-                fwd = (close_arr[idx + 1:max_look + 1] / entry_price - 1.0) * 100
+            # Per-trade peak return + the day it peaked, over the FULL 90d forward window only
+            # (gated identically to ret_90d below) so peak_avg / peak_day / ret_90d are all computed
+            # over the SAME trade sample. Recent trades without a full 90d of forward data are
+            # excluded rather than peaked over a truncated (biased-low) window.
+            if idx + 90 < n_bars:
+                fwd = (close_arr[idx + 1:idx + 91] / entry_price - 1.0) * 100
                 d_best = int(fwd.argmax())
                 if fwd[d_best] > 0:
-                    best_r = float(fwd[d_best]); best_d = d_best + 1
+                    peak_rets.append(float(fwd[d_best]))
+                    peak_days.append(d_best + 1)
                 else:
-                    best_r = 0.0; best_d = 0
-            else:
-                best_r = 0.0; best_d = 0
-            peak_rets.append(best_r)
-            peak_days.append(best_d)
-            if idx + 90 < n_bars:
+                    # Never went green within 90d: peak return floored at 0, but there is no
+                    # meaningful "peak day" — record None so it doesn't pollute the day mode
+                    # (previously stored as 0, which made peak_day report "peak on entry day").
+                    peak_rets.append(0.0)
+                    peak_days.append(None)
                 ret_90ds.append((float(close_arr[idx + 90]) - entry_price) / entry_price * 100)
 
             trades += 1
             total_ret += ret
             returns_list.append(ret)
+            is_ep = idx in episode_starts   # independent-episode start (overlap-dedup)
+            if is_ep:
+                all_eff_returns.append(ret)   # → parent significance pool
             hold_days_list.append(hold)
             if ret > 0:
                 wins += 1
             else:
                 losses += 1
 
-            # Tag with pre-computed regime arrays (fast array lookup)
+            # Tag with pre-computed regime arrays (fast array lookup). Carry the episode flag
+            # so each sub-bucket gets its own eff_trades + t_stat, not just a raw overlapping mean.
             if "_regime" in df.columns:
                 regime = df["_regime"].iloc[idx]
                 if regime in all_regime_trades:
-                    all_regime_trades[regime].append(ret)
+                    all_regime_trades[regime].append((ret, is_ep))
             if "_curve" in df.columns:
                 curve = df["_curve"].iloc[idx]
                 if curve in all_curve_trades:
-                    all_curve_trades[curve].append(ret)
+                    all_curve_trades[curve].append((ret, is_ep))
             if "_vix" in df.columns:
                 vr = df["_vix"].iloc[idx]
                 if vr in all_vix_trades:
-                    all_vix_trades[vr].append(ret)
+                    all_vix_trades[vr].append((ret, is_ep))
             if "_spy_trend" in df.columns:
                 st = df["_spy_trend"].iloc[idx]
                 if st in all_spy_trend_trades:
-                    all_spy_trend_trades[st].append(ret)
+                    all_spy_trend_trades[st].append((ret, is_ep))
             if "_season" in df.columns:
                 ss = df["_season"].iloc[idx]
                 if ss in all_season_trades:
-                    all_season_trades[ss].append(ret)
+                    all_season_trades[ss].append((ret, is_ep))
 
         if trades > 0:
             avg_ret = total_ret / trades
@@ -3082,12 +3142,23 @@ def run_study(study: dict, all_data: dict) -> dict:
     clean_pct = sum(r["clean_pct"] * r["trades"] for r in sector_results.values()) / total_trades
 
     sorted_s = sorted(sector_results.items(), key=lambda x: x[1]["avg_return"], reverse=True)
+    # Floor the best/worst-sector ranking: sector_results keeps any sector with >=1 trade,
+    # so an unfloored top-3/bottom-3 over ~93 correlated ETFs can headline a 1-2 trade noise
+    # max. Require >=5 trades to be eligible; fall back to the full list if none qualify.
+    MIN_HL_SECTOR_TRADES = 5
+    ranked_s = [(s, d) for s, d in sorted_s if d["trades"] >= MIN_HL_SECTOR_TRADES] or sorted_s
 
-    def _regime_stats(rets):
-        if not rets:
+    def _regime_stats(pairs):
+        # pairs: list of (ret, is_episode). eff_trades/t_stat come from the deduped episode
+        # subset so a small overlapping sub-bucket isn't read as significant.
+        if not pairs:
             return None
+        rets = [r for r, _ in pairs]
+        eff = [r for r, is_ep in pairs if is_ep]
         w = sum(1 for r in rets if r > 0)
-        return {"trades": len(rets), "avg_return": round(sum(rets)/len(rets), 3), "win_rate": round(w/len(rets)*100, 1)}
+        return {"trades": len(rets), "avg_return": round(sum(rets)/len(rets), 3),
+                "win_rate": round(w/len(rets)*100, 1),
+                "eff_trades": len(eff), "t_stat": _tstat_from_returns(eff)}
 
     by_regime = {k: _regime_stats(v) for k, v in all_regime_trades.items() if v}
     by_curve = {k: _regime_stats(v) for k, v in all_curve_trades.items() if v}
@@ -3105,9 +3176,11 @@ def run_study(study: dict, all_data: dict) -> dict:
     if all_peak_rets:
         peak_avg = round(sum(all_peak_rets) / len(all_peak_rets), 2)
         best_peak_ret = round(max(all_peak_rets), 2)
-        # Most common peak day (mode)
+        # Most common peak day (mode) over trades that actually peaked positive; never-green
+        # trades carry peak_day=None and are excluded so the mode isn't dragged to 0.
         from collections import Counter
-        peak_day = Counter(all_peak_days).most_common(1)[0][0] if all_peak_days else None
+        valid_peak_days = [d for d in all_peak_days if d is not None]
+        peak_day = Counter(valid_peak_days).most_common(1)[0][0] if valid_peak_days else None
         best_peak_day = all_peak_days[all_peak_rets.index(max(all_peak_rets))] if all_peak_rets else None
     if all_ret_90ds:
         ret_90d = round(sum(all_ret_90ds) / len(all_ret_90ds), 2)
@@ -3116,13 +3189,15 @@ def run_study(study: dict, all_data: dict) -> dict:
     return {
         **study,
         "total_trades": total_trades,
+        "eff_trades": len(all_eff_returns),
+        "t_stat": _tstat_from_returns(all_eff_returns),
         "avg_return": round(weighted_ret, 3),
         "win_rate": round(total_wins / total_trades * 100, 1),
         "avg_hold": round(avg_hold, 1),
         "avg_mae": round(avg_mae, 2),
         "clean_pct": round(clean_pct, 1),
-        "best_sectors": [{"sector": s, **d} for s, d in sorted_s[:3]],
-        "worst_sectors": [{"sector": s, **d} for s, d in sorted_s[-3:]] if len(sorted_s) > 3 else [],
+        "best_sectors": [{"sector": s, **d} for s, d in ranked_s[:3]],
+        "worst_sectors": [{"sector": s, **d} for s, d in ranked_s[-3:]] if len(ranked_s) > 3 else [],
         "sector_count": len(sector_results),
         "peak_day": peak_day,
         "peak_avg": peak_avg,

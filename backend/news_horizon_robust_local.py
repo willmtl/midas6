@@ -1,21 +1,17 @@
 """
-DEPRECATED (2026-08-10): reads the retired Anthropic/Haiku labels (llm_rating/llm_impact/llm_cat).
-The live scanner (news_horizon_scan.py) reads LOCAL qwen labels, so the fade table is now derived by
-news_horizon_robust_local.py. Kept only for historical reference — do NOT use to set ROBUST_FADE.
+LOCAL-LABEL re-validation of the TYPE-conditioned news FADE edges — the cutover gate for the
+earnings_beat / product (and contract / guidance_up) horizon signals.
 
-Robustness gate for the horizon-conditioned news signals — same discipline as news_drift_robust.py
-(the bull-pop fade). For each (signed news TYPE, its own horizon) we split the ORIENTED abnormal
-drift by TIME-half and by MARKET-CAP to rule out a single-regime / size artifact.
+Identical methodology to news_horizon_robust.py (the retired Anthropic/Haiku-label version) but reads
+the LOCAL qwen labels (local_rating / local_impact / cat_llm + local_dir) instead of
+llm_rating / llm_impact / llm_cat. The live scanner (news_horizon_scan.py) already reads local labels,
+so its ROBUST_FADE table must be re-derived on the SAME labels — a drift measured on the retired
+Anthropic taxonomy is not guaranteed to hold on the local one. Only edges that reproduce here (STRONG
+negative, BOTH time halves same sign, size-consistent) stay robust; the rest drop to WATCH.
 
-Focus signals:
-  contract   @month  (+1.7% candidate UNDER-reaction — buy/hold)
-  product    @month  (-3.7% candidate OVER-reaction — fade)
-  guidance_up@3mo    (-7.0% candidate OVER-reaction — fade)
-  earnings_beat@3mo  (-1.7% fade, high-n reference)
+oriented drift = dir * abn (beta-adj). + = drifts WITH the news, - = reverses (fade).
 
-oriented drift = dir * abn (β-adj). + = drifts WITH the news, − = reverses.
-
-Run:  docker compose exec -T backend python -u news_horizon_robust.py
+Run:  docker compose exec -T backend python -u news_horizon_robust_local.py
 """
 import django, os
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings"); django.setup()
@@ -26,7 +22,23 @@ from core.models import NewsItem, Fundamental
 
 HZ = {"day": 1, "week": 5, "month": 21, "3mo": 63}
 BETA_WIN = 60; MIN_PRICE = 3.0
-SIGNALS = [("contract", "month"), ("product", "month"), ("guidance_up", "3mo"), ("earnings_beat", "3mo")]
+# The signals whose fade the live scanner treats as robust (+ the two references validated alongside).
+SIGNALS = [("earnings_beat", "3mo"), ("product", "month"), ("contract", "month"),
+           ("guidance_up", "3mo"), ("earnings_miss", "3mo")]
+
+
+def _signed_cat(cat, direction):
+    """Fold the unsigned local cat_llm + local_dir into the signed taxonomy the horizon tables key
+    on. Copy of news_horizon_scan._signed_cat (kept local so this validator is standalone)."""
+    c = (cat or "other").lower(); d = direction or 0
+    if c == "earnings":    return "earnings_beat" if d >= 0 else "earnings_miss"
+    if c == "guidance":    return "guidance_up" if d >= 0 else "guidance_down"
+    if c == "analyst":     return "upgrade" if d >= 0 else "downgrade"
+    if c in ("offering", "buyback"): return "capital"
+    if c == "partnership": return "contract"
+    if c == "insider":     return "other"
+    return c
+
 
 def main():
     tks = build_universe()
@@ -34,11 +46,11 @@ def main():
     cds = load_candles(tks + ["SPY"]); spy = cds.get("SPY"); spy_ret = spy["Close"].pct_change()
     mcap = {f["ticker"]: (f["market_cap"] or 0) for f in Fundamental.objects.values("ticker", "market_cap")}
     news_by_tk = defaultdict(list)
-    for r in NewsItem.objects.filter(llm_rating__isnull=False, llm_impact__gte=2).values(
-            "ticker", "dt", "llm_rating", "llm_impact", "llm_cat"):
+    for r in NewsItem.objects.filter(local_rating__isnull=False, local_impact__gte=2).values(
+            "ticker", "dt", "local_rating", "local_impact", "cat_llm", "local_dir"):
         news_by_tk[r["ticker"]].append(r)
 
-    ev = defaultdict(list)     # cat -> list of events
+    ev = defaultdict(list)     # signed cat -> list of events
     maxd = max(HZ.values())
     for tk, df in cds.items():
         if tk == "SPY" or df is None or len(df) < BETA_WIN + maxd + 5:
@@ -51,14 +63,16 @@ def main():
         r = df["Close"].pct_change()
         both = pd.concat([r.rename("s"), spy_ret.rename("m")], axis=1).reindex(idx)
         beta = (both["s"].rolling(BETA_WIN).cov(both["m"]) / both["m"].rolling(BETA_WIN).var()).values
-        # per (day,cat): dominant item
+        # per (day, signed cat): dominant item (net rating + max impact)
         day = defaultdict(lambda: defaultdict(lambda: {"net": 0, "imp": 0}))
         for it in items:
+            scat = _signed_cat(it["cat_llm"], it["local_dir"])
             d = pd.Timestamp(it["dt"]).tz_localize(None).normalize()
             pos = int(idx.searchsorted(d))
             if pos <= 0 or pos >= n:
                 continue
-            a = day[pos][it["llm_cat"]]; a["net"] += (it["llm_rating"] or 0); a["imp"] = max(a["imp"], it["llm_impact"] or 0)
+            a = day[pos][scat]
+            a["net"] += (it["local_rating"] or 0); a["imp"] = max(a["imp"], it["local_impact"] or 0)
         for d0, cats in day.items():
             rfrom, rto = d0 - 1, d0 + 1
             if rfrom < BETA_WIN or rto + maxd >= n or close[rto] < MIN_PRICE or mkt[rfrom] <= 0 or mkt[rto] <= 0:
@@ -76,28 +90,34 @@ def main():
                     ev[cat].append(dict(fwd=fwd, date=idx[rto], mcap=mcap.get(tk, 0)))
 
     all_dates = sorted(e["date"] for lst in ev.values() for e in lst)
+    if not all_dates:
+        print("no local-labeled events — let the classification drain fill more first"); return
     mid = all_dates[len(all_dates) // 2]
 
     def stat(g, label, hz):
         if len(g) < 15:
             print("    %-20s n=%-4d (thin)" % (label, len(g))); return
         v = np.array([e["fwd"][hz] for e in g])
-        print("    %-20s n=%-4d  med=%+5.1f%%  win=%2d%%" % (label, len(g), np.median(v), round((v > 0).mean()*100)))
+        print("    %-20s n=%-4d  med=%+5.1f%%  win=%2d%%  mean=%+5.1f%%"
+              % (label, len(g), np.median(v), round((v > 0).mean() * 100), v.mean()))
 
+    print("\n=== LOCAL-LABEL type-conditioned drift (oriented; NEGATIVE = fade) ===", flush=True)
     for cat, hz in SIGNALS:
         g = ev.get(cat, [])
         if len(g) < 15:
             print(f"\n{cat} @{hz}: n={len(g)} (thin, skip)"); continue
-        v = np.array([e["fwd"][hz] for e in g]); direction = "UNDER-react (drift with)" if np.median(v) > 0 else "OVER-react (fade)"
-        print(f"\n=== {cat} @{hz}  n={len(g)}  ALL med={np.median(v):+.1f}%/{round((v>0).mean()*100)}%win  [{direction}] ===")
+        v = np.array([e["fwd"][hz] for e in g])
+        direction = "UNDER-react (drift with)" if np.median(v) > 0 else "OVER-react (fade)"
+        print(f"\n=== {cat} @{hz}  n={len(g)}  ALL med={np.median(v):+.1f}%/{round((v>0).mean()*100)}%win/mean={v.mean():+.1f}%  [{direction}] ===")
         print("  by TIME half:")
         stat([e for e in g if e["date"] <= mid], "1st half", hz)
         stat([e for e in g if e["date"] >  mid], "2nd half", hz)
-        print("  by MCAP:")
-        stat([e for e in g if 0 < e["mcap"] < 2e9],     "micro/small <2B", hz)
+        print("  by MCAP (bucket keys used by ROBUST_FADE):")
+        stat([e for e in g if 0 < e["mcap"] < 2e9],     "small <2B", hz)
         stat([e for e in g if 2e9 <= e["mcap"] < 10e9], "mid 2-10B", hz)
         stat([e for e in g if e["mcap"] >= 10e9],       "large >=10B", hz)
     print(f"\ntime split at {mid.date()}  (window {all_dates[0].date()} .. {all_dates[-1].date()})")
+
 
 if __name__ == "__main__":
     main()

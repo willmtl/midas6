@@ -17,6 +17,7 @@ Yield curve:
 import warnings
 warnings.filterwarnings("ignore")
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from pathlib import Path
@@ -65,7 +66,12 @@ def get_rates(period="5y"):
 
     # Rate trend (is the short rate rising or falling over last 20 days?)
     df["rate_sma20"] = df["rate_3m"].rolling(20).mean()
-    df["rate_trend"] = (df["rate_3m"] > df["rate_sma20"]).map({True: "RISING", False: "FALLING"})
+    # Emit NaN during the 20-bar SMA warmup instead of forcing "FALLING"
+    # (rate_3m > NaN → False → bogus FALLING on the first 19 rows). Build the string labels
+    # first, then NaN the warmup on an object array — np.nan (float) and str can't share one np.where.
+    _rt_lab = np.where(df["rate_3m"] > df["rate_sma20"], "RISING", "FALLING").astype(object)
+    _rt_lab[df["rate_sma20"].isna().to_numpy()] = np.nan
+    df["rate_trend"] = _rt_lab
 
     # Save cache
     try:

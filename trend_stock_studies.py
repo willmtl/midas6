@@ -138,10 +138,21 @@ def run_mixed(etf_monthly, stock_monthly, panels, sector_map, lookback, hold, to
         peak = max(peak, pt["equity"])
         max_dd = min(max_dd, (pt["equity"] - peak) / peak * 100)
     wins = sum(1 for t in trades if t["return_pct"] > 0)
+    # Significance of the average rebalance-period return vs 0. Periods are NON-overlapping
+    # (each starts where the last ended), so this is a legit one-sample t — no overlap correction
+    # needed. It's what separates a real edge from a lucky single-name run (esp. top_n=1, where a
+    # "+525%" can be ~8 sequential single-stock bets).
+    period_rets = [t["return_pct"] for t in trades]
+    t_stat = None
+    if len(period_rets) >= 3:
+        ser = pd.Series(period_rets, dtype=float)
+        sd = ser.std(ddof=1)
+        if sd and sd > 0:
+            t_stat = round(float(ser.mean() / (sd / len(ser) ** 0.5)), 2)
     return {"lookback_months": lookback, "hold_months": hold, "top_n": top_n, "hold_mode": rule,
             "total_return": round(total, 2), "annual_return": round(annual, 2),
             "spy_total": round(spy_total, 2), "alpha": round(total - spy_total, 2),
-            "max_drawdown": round(max_dd, 2), "trades": len(trades),
+            "max_drawdown": round(max_dd, 2), "trades": len(trades), "t_stat": t_stat,
             "win_rate": round(wins / len(trades) * 100, 1) if trades else 0,
             "equity_curve": ec, "spy_curve": sc, "trade_log": trades}
 
@@ -154,6 +165,32 @@ def _ret(series, date, end):
     return None
 
 
+def _available_at(series, date):
+    """Is this name tradeable AT `date` — the only information available at selection time."""
+    if date not in series.index:
+        return False
+    s = series.loc[date]
+    return bool(pd.notna(s) and s > 0)
+
+
+def _ret_delist(series, date, end):
+    """Hold-period return date->end. If the name has no valid price at `end` (delisted/halted mid-
+    hold), realize at the LAST traded price on or before `end` — a delisting is a real exit, not a
+    reason to drop the trade. Requiring a price AT `end` (old `_ret`) was survivorship LOOKAHEAD: it
+    filtered selection on which names survived the holding period."""
+    if not _available_at(series, date):
+        return None
+    s = series.loc[date]
+    e = series.loc[end] if end in series.index else None
+    if pd.notna(e) and e and e > 0:
+        return e / s - 1
+    win = series.loc[date:end].dropna()
+    win = win[win > 0]
+    if len(win) <= 1:            # only the entry price survived (or nothing) -> total loss realized
+        return -1.0
+    return win.iloc[-1] / s - 1
+
+
 def _pick_return(etf, holds, date, end, rule, etf_monthly, stock_monthly, stock_trail, panels):
     """Return (instrument, hold-period return). Falls back to the ETF if no stock qualifies.
     All stock-pick rules select POINT-IN-TIME using only data available at `date`:
@@ -162,7 +199,8 @@ def _pick_return(etf, holds, date, end, rule, etf_monthly, stock_monthly, stock_
     etf_r = _ret(etf_monthly[etf], date, end) if etf in etf_monthly.columns else None
     if rule == "etf" or not holds:
         return etf, (etf_r or 0.0)
-    cands = [h for h in holds if h in stock_monthly.columns and _ret(stock_monthly[h], date, end) is not None]
+    # Qualify candidates on availability AT `date` only (no peeking at the future `end` price).
+    cands = [h for h in holds if h in stock_monthly.columns and _available_at(stock_monthly[h], date)]
     if not cands:
         return etf, (etf_r or 0.0)
 
@@ -180,7 +218,8 @@ def _pick_return(etf, holds, date, end, rule, etf_monthly, stock_monthly, stock_
             row = row[row > 0] if rule == "insider" else row  # insider: require actual buying
         if len(row):
             pick = row.idxmax() if direction == "max" else row.idxmin()
-            return pick, _ret(stock_monthly[pick], date, end)
+            r = _ret_delist(stock_monthly[pick], date, end)
+            return pick, (r if r is not None else (etf_r or 0.0))
     return etf, (etf_r or 0.0)
 
 
@@ -226,12 +265,19 @@ def run(save_db=False):
                     r = run_mixed(etf_monthly, stock_monthly, panels, sector_map, lb, h, n, rule)
                     if r:
                         results.append(r)
-    results.sort(key=lambda x: x["total_return"], reverse=True)
+    # Adequately-sampled AND statistically-supported combos are "robust". Below MIN_PERIODS
+    # non-overlapping rebalances a headline "+525%" is usually one lucky (often single-name) run.
+    MIN_PERIODS = 12
+    for r in results:
+        r["robust"] = bool(r["trades"] >= MIN_PERIODS and r["t_stat"] is not None and abs(r["t_stat"]) >= 2)
+    # Rank robust first, then by total_return — a thin single-name fluke can no longer sit at the top.
+    results.sort(key=lambda x: (x["robust"], x["total_return"]), reverse=True)
 
-    print(f"\n{'MODE':9} {'LB':>3} {'H':>2} {'TopN':>4} {'Total':>8} {'Annual':>7} {'Alpha':>7} {'MaxDD':>7} {'WR':>5}")
+    print(f"\n{'MODE':9} {'LB':>3} {'H':>2} {'TopN':>4} {'Total':>8} {'Annual':>7} {'Alpha':>7} {'MaxDD':>7} {'WR':>5} {'t':>5} {'rob':>4}")
     for r in results[:20]:
         print(f"{r['hold_mode']:9} {r['lookback_months']:>3} {r['hold_months']:>2} {r['top_n']:>4} "
-              f"{r['total_return']:>7.1f}% {r['annual_return']:>6.1f}% {r['alpha']:>6.1f}% {r['max_drawdown']:>6.1f}% {r['win_rate']:>4.0f}%")
+              f"{r['total_return']:>7.1f}% {r['annual_return']:>6.1f}% {r['alpha']:>6.1f}% {r['max_drawdown']:>6.1f}% "
+              f"{r['win_rate']:>4.0f}% {(r['t_stat'] if r['t_stat'] is not None else 0):>5.1f} {('Y' if r['robust'] else '-'):>4}")
 
     # Best per mode for a clean head-to-head.
     print("\nBest per mode:")
@@ -251,7 +297,7 @@ def run(save_db=False):
                 lookback_months=r["lookback_months"], hold_months=r["hold_months"],
                 top_n=r["top_n"], hold_mode=r["hold_mode"],
                 defaults={k: r[k] for k in ("total_return", "annual_return", "spy_total", "alpha",
-                          "max_drawdown", "win_rate")} | {"num_trades": r["trades"],
+                          "max_drawdown", "win_rate")} | {"num_trades": r["trades"], "t_stat": r["t_stat"],
                           "equity_curve": r["equity_curve"], "spy_curve": r["spy_curve"],
                           "trade_log": r["trade_log"], "computed_at": now})
         print(f"\nSaved {len(results)} rows to TrendStudy (with hold_mode).")

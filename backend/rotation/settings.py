@@ -41,7 +41,13 @@ DATABASES = {
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {
-    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    # orjson-backed renderer/parser — 2-5x faster JSON, serializes numpy/datetime/Decimal natively.
+    "DEFAULT_RENDERER_CLASSES": ["drf_orjson_renderer.renderers.ORJSONRenderer"],
+    "DEFAULT_PARSER_CLASSES": [
+        "drf_orjson_renderer.parsers.ORJSONParser",
+        "rest_framework.parsers.FormParser",
+        "rest_framework.parsers.MultiPartParser",
+    ],
     "DEFAULT_PAGINATION_CLASS": None,
     "UNAUTHENTICATED_USER": None,
 }

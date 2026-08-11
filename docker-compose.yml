@@ -50,6 +50,8 @@ x-backend-volumes: &backend-volumes
   - ./trend_stock_studies.py:/app/trend_stock_studies.py
   - ./dim_intersection_study.py:/app/dim_intersection_study.py
   - ./test_pit_fundamentals.py:/app/test_pit_fundamentals.py
+  - ./backtest_concept.py:/app/backtest_concept.py
+  - ./backtest_lowpb.py:/app/backtest_lowpb.py
   - ./.data:/app/.data
 
 services:

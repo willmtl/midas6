@@ -96,6 +96,9 @@ class Fundamental(models.Model):
     avg_volume = models.BigIntegerField(null=True, blank=True)
     sector = models.CharField(max_length=100, null=True, blank=True)
     industry = models.CharField(max_length=200, null=True, blank=True)
+    # EODHD TICKER.EXCHANGE symbol used to fetch this row (e.g. 7203.TSE, WIPRO.NSE, AAPL.US).
+    # Distinct from `ticker` (plain/yahoo form) — recorded so global fundamentals fills are traceable.
+    eodhd_symbol = models.CharField(max_length=32, null=True, blank=True)
 
     class Meta:
         ordering = ["-date"]
@@ -209,8 +212,12 @@ class TrendStudy(models.Model):
     spy_total = models.FloatField(default=0)
     alpha = models.FloatField(default=0)
     max_drawdown = models.FloatField(default=0)
-    num_trades = models.IntegerField(default=0)
+    num_trades = models.IntegerField(default=0)   # = number of non-overlapping rebalance periods
     win_rate = models.FloatField(default=0)
+    # One-sample t of the per-period returns vs 0 (periods are non-overlapping → no overlap
+    # correction). |t|>=2 with num_trades>=12 = "robust"; below that a big total_return is usually a
+    # lucky single-name run (esp. top_n=1). Null when <3 periods or zero dispersion.
+    t_stat = models.FloatField(null=True, blank=True)
 
     equity_curve = models.JSONField(null=True, blank=True)
     spy_curve = models.JSONField(null=True, blank=True)
@@ -271,6 +278,15 @@ class Study(models.Model):
     # "do we usually nail the entry, or usually sit underwater first".
     avg_mae = models.FloatField(default=0)
     clean_pct = models.FloatField(default=0)
+
+    # Significance / independence. eff_trades = trade count after collapsing fires within
+    # EFFECTIVE_GAP (=5) bars into one independent observation (level-condition signals fire on
+    # consecutive bars → heavily overlapping forward windows, so total_trades overstates the
+    # independent sample). t_stat = one-sample t of those deduped per-trade returns vs 0; |t|>=2
+    # ≈ a real edge, small |t| = noise despite a big total_trades. Coarse (an overlap proxy, not
+    # Newey-West) but flags signals whose apparent robustness is just near-duplicate bars.
+    eff_trades = models.IntegerField(null=True, blank=True)
+    t_stat = models.FloatField(null=True, blank=True)
 
     # Peak / curve data (averages)
     peak_day = models.IntegerField(null=True, blank=True)
@@ -410,6 +426,13 @@ class StockStudy(models.Model):
     # Entry-quality (max adverse excursion) — see Study.avg_mae / Study.clean_pct.
     avg_mae = models.FloatField(default=0)
     clean_pct = models.FloatField(default=0)
+
+    # Significance / independence — see Study.eff_trades / Study.t_stat. eff_trades collapses
+    # fires within EFFECTIVE_GAP (=5) bars per ticker into one independent observation; t_stat is
+    # the one-sample t of those deduped returns vs 0 (|t|>=2 ≈ real, small |t| = noise). This is
+    # what separates the genuinely-robust winners from combos inflated by overlapping trades.
+    eff_trades = models.IntegerField(null=True, blank=True)
+    t_stat = models.FloatField(null=True, blank=True)
 
     # Fundamental-bucket breakdown:
     # {"PE (trailing)": [{"bucket":"cheap (<15)","trades":N,"avg_return":X,"win_rate":Y}, ...], ...}
@@ -632,6 +655,61 @@ class DarkPoolDay(models.Model):
 
     def __str__(self):
         return f"{self.ticker} {self.date} off%={self.off_pct}"
+
+
+class DarkPoolWeek(models.Model):
+    """Weekly ATS (dark-pool) volume per stock from FINRA OTC Transparency — the OFFICIAL source that
+    mandates every ATS venue to report. Unlike DarkPoolDay (a daily BLENDED off-exchange proxy the raw
+    tape can't split), this is the canonical per-ticker dark-pool number, cleanly separated from
+    wholesaler/internalizer flow. Carries `published_date` — the date FINRA made it public (~3-4wk
+    lag) — so studies can gate on known-as-of for lookahead-safe point-in-time analysis. `off_pct` =
+    ats_shares / that week's consolidated volume (summed from Candle, Monday-anchored week)."""
+    ticker = models.CharField(max_length=20, db_index=True)
+    week_start = models.DateField(db_index=True)             # Monday of the reporting week
+    ats_shares = models.BigIntegerField(default=0)           # FINRA totalWeeklyShareQuantity
+    ats_trades = models.BigIntegerField(default=0)           # FINRA totalWeeklyTradeCount
+    ats_notional = models.FloatField(null=True, blank=True)  # FINRA totalNotionalSum ($)
+    off_pct = models.FloatField(null=True, blank=True)       # ats_shares / weekly consolidated volume
+    tier = models.CharField(max_length=16, blank=True)       # "NMS Tier 1" / "NMS Tier 2" / "OTC"
+    published_date = models.DateField(null=True, blank=True)  # FINRA initialPublishedDate (PIT)
+    source = models.CharField(max_length=16, default="finra_ats")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ["ticker", "week_start", "source"]
+        indexes = [models.Index(fields=["ticker", "week_start"])]
+
+    def __str__(self):
+        return f"{self.ticker} wk{self.week_start} ats={self.ats_shares}"
+
+
+class NewsEventStudy(models.Model):
+    """Latest market-adjusted news event-study result (api.news_market_study.run_news_market_study),
+    stored as one JSON blob for the dashboard. AR = R_stock − beta·R_spy, keyed on OUR model's read
+    (local_dir/local_impact), with IV/surprise + next-morning gap + short/long beta. Single row
+    (label='latest'), refreshed nightly after the local news classifier runs."""
+    label = models.CharField(max_length=32, unique=True, default="latest")
+    n_events = models.IntegerField(default=0)
+    n_tickers = models.IntegerField(default=0)
+    data = models.JSONField(default=dict)     # {by_model_dir_beta:[...], by_iv_dir:[...], ...}
+    computed_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"NewsEventStudy({self.label}, {self.n_events} events)"
+
+
+class IvCalibration(models.Model):
+    """Latest IV-calibration study (api.iv_calibration): is ATM implied vol a good predictor of the
+    next-day move? Aggregate (variance-risk-premium stats) + per-ticker ranking of over/under-priced
+    options. Single JSON-blob row (label='latest'), refreshed weekly."""
+    label = models.CharField(max_length=32, unique=True, default="latest")
+    n_days = models.IntegerField(default=0)
+    n_tickers = models.IntegerField(default=0)
+    data = models.JSONField(default=dict)     # {aggregate:{...}, per_ticker:[...]}
+    computed_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"IvCalibration({self.label}, {self.n_days} days)"
 
 
 class NewsItem(models.Model):

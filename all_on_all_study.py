@@ -30,14 +30,14 @@ from pathlib import Path
 from studies import (
     SIGNALS, EXITS, MARKET_SIGNAL_KEYS, _categorize,
     _rolling_sortino, _rolling_omega, _rsi_of_sortino,
-    CLEAN_MAE_THRESH, trade_mae,
+    CLEAN_MAE_THRESH, trade_mae, _episode_starts,
 )
 import ta
 # Reuse universe / loaders / fundamental bucketing from the single-signal study.
 from seq_fundamental_study import (
     build_universe, load_candles, load_fundamentals, load_financial_reports,
-    load_dividends, load_insider, load_filings, label_trade, DIMENSIONS, DEFAULT_JOBS,
-    _chunk, MIN_BARS,
+    load_dividends, load_insider, load_filings, load_darkpool, load_news, label_trade,
+    DIMENSIONS, DEFAULT_JOBS, _chunk, MIN_BARS,
 )
 from pit_fundamentals import prepare_pit_metrics
 
@@ -69,35 +69,47 @@ def _prepare_indicators(df):
 
 def _prepare_alt(df, insider_s, filings_df):
     """Attach alt-data event columns the Phase-D signals read: per-bar insider open-market
-    buy $, and 1.0 on bars a 13D/13G was filed. Absent data -> all-zero columns."""
+    buy $, and 1.0 on bars a 13D/13G was filed. Absent data -> all-zero columns.
+
+    Each event column is SHIFTED one trading bar forward (.shift(1)) so the signal fires — and
+    enters at that bar's close — the session AFTER the filing date. SEC Form 4 / 13D / 13G are
+    routinely filed after the 16:00 ET close, so close[filed_date] pre-dated the disclosure;
+    entering on filed_date's close was a one-session lookahead on these directional events."""
     import pandas as pd
     idx = df.index
     if insider_s is not None and len(insider_s):
         s = insider_s.copy(); s.index = pd.to_datetime(s.index)
-        df["_insider_buy"] = s.groupby(s.index).sum().reindex(idx).fillna(0.0)
+        df["_insider_buy"] = s.groupby(s.index).sum().reindex(idx).shift(1).fillna(0.0)
     else:
         df["_insider_buy"] = 0.0
     for grp, col in (("13D", "_filed_13d"), ("13G", "_filed_13g")):
         if filings_df is not None and len(filings_df):
             sub = filings_df[filings_df["form_group"] == grp]
             ev = pd.Series(1.0, index=pd.to_datetime(sub["filed_date"]))
-            df[col] = ev.groupby(ev.index).sum().reindex(idx).fillna(0.0) if len(ev) else 0.0
+            df[col] = ev.groupby(ev.index).sum().reindex(idx).shift(1).fillna(0.0) if len(ev) else 0.0
         else:
             df[col] = 0.0
     return df
 
 
 def _new_stat():
-    return [0, 0.0, 0, 0.0, 0.0, 0]  # [n, sum_ret, wins, sum_hold, sum_mae, cleans]
+    # [n, sum_ret, wins, sum_hold, sum_mae, cleans, eff_n, eff_sum, eff_sumsq]
+    # The last three carry the overlap-deduped "independent episode" returns (running sum + sum of
+    # squares) so a one-sample t-stat can be finalized without keeping the full return list.
+    return [0, 0.0, 0, 0.0, 0.0, 0, 0, 0.0, 0.0]
 
 
-def _accum(stat, ret, hold, mae, clean):
+def _accum(stat, ret, hold, mae, clean, is_episode=False):
     stat[0] += 1
     stat[1] += ret
     stat[2] += 1 if ret > 0 else 0
     stat[3] += hold
     stat[4] += mae
     stat[5] += clean
+    if is_episode:
+        stat[6] += 1
+        stat[7] += ret
+        stat[8] += ret * ret
 
 
 def _worker(payload):
@@ -116,6 +128,8 @@ def _worker(payload):
     divs = load_dividends(tickers)
     insider = load_insider(tickers)
     filings = load_filings(tickers)
+    darkpool = load_darkpool(tickers)
+    news = load_news(tickers)
     spy_close = load_candles(["SPY"]).get("SPY")
     spy_close = spy_close["Close"] if spy_close is not None else None
 
@@ -137,7 +151,8 @@ def _worker(payload):
         snap = funds.get(tk, {})
         # Point-in-time metrics frame for this ticker (indexed by the price dates).
         pit_metrics = prepare_pit_metrics(sdf, reports.get(tk), divs.get(tk), spy_close,
-                                          insider.get(tk), filings.get(tk))
+                                          insider.get(tk), filings.get(tk),
+                                          darkpool.get(tk), news.get(tk))
         # Bucket labels depend only on the entry bar's date, so memoize per entry_idx
         # (signals fire on overlapping bars → reused across signals/exits, like exit_cache).
         label_cache = {}
@@ -155,6 +170,9 @@ def _worker(payload):
             entry_idxs = [sdf.index.get_loc(d) for d in sig[sig].index]
             if not entry_idxs:
                 continue
+            # Overlap-dedup: fires within EFFECTIVE_GAP bars collapse to one independent episode
+            # (computed once per signal — the entry bars are the same across all exits).
+            episode = _episode_starts(entry_idxs)
             for ek, exit_fn in exit_fns.items():
                 for idx in entry_idxs:
                     ck = (ek, idx)
@@ -174,10 +192,11 @@ def _worker(payload):
                     hold = exit_idx - idx
                     mae = trade_mae(ep, low[idx + 1:exit_idx + 1])
                     clean = 1 if mae >= CLEAN_MAE_THRESH else 0
+                    is_ep = idx in episode
                     o = overall.get((sk, ek))
                     if o is None:
                         o = overall[(sk, ek)] = _new_stat()
-                    _accum(o, ret, hold, mae, clean)
+                    _accum(o, ret, hold, mae, clean, is_ep)
                     labels = label_cache.get(idx)
                     if labels is None:
                         labels = label_cache[idx] = label_trade(pit_metrics, sdf.index[idx], snap)
@@ -186,7 +205,7 @@ def _worker(payload):
                         b = buckets.get(key)
                         if b is None:
                             b = buckets[key] = _new_stat()
-                        _accum(b, ret, hold, mae, clean)
+                        _accum(b, ret, hold, mae, clean, is_ep)
     return overall, buckets
 
 
@@ -197,15 +216,27 @@ def _merge(dst, src):
             dst[k] = list(s)
         else:
             d[0] += s[0]; d[1] += s[1]; d[2] += s[2]; d[3] += s[3]; d[4] += s[4]; d[5] += s[5]
+            d[6] += s[6]; d[7] += s[7]; d[8] += s[8]
 
 
 def _finalize_stat(s):
     n = s[0]
     if n == 0:
         return None
-    return {"trades": n, "avg_return": round(s[1] / n, 2),
-            "win_rate": round(s[2] / n * 100, 1), "avg_hold": round(s[3] / n, 1),
-            "avg_mae": round(s[4] / n, 2), "clean_pct": round(s[5] / n * 100, 1)}
+    out = {"trades": n, "avg_return": round(s[1] / n, 2),
+           "win_rate": round(s[2] / n * 100, 1), "avg_hold": round(s[3] / n, 1),
+           "avg_mae": round(s[4] / n, 2), "clean_pct": round(s[5] / n * 100, 1)}
+    # Significance over the overlap-deduped independent episodes: one-sample t vs 0.
+    en, esum, esumsq = s[6], s[7], s[8]
+    out["eff_trades"] = int(en)
+    t = None
+    if en >= 3:
+        mean = esum / en
+        var = (esumsq - esum * esum / en) / (en - 1)
+        if var > 0:
+            t = round(mean / (var / en) ** 0.5, 2)
+    out["t_stat"] = t
+    return out
 
 
 def _save_to_db(results, universe_size):
@@ -223,6 +254,7 @@ def _save_to_db(results, universe_size):
                 defaults={
                     "signal_name": r["signal_name"], "exit_name": r["exit_name"],
                     "category": r["category"], "total_trades": r["trades"],
+                    "eff_trades": r.get("eff_trades"), "t_stat": r.get("t_stat"),
                     "avg_return": r["avg_return"], "win_rate": r["win_rate"],
                     "avg_hold": r["avg_hold"], "avg_mae": r["avg_mae"],
                     "clean_pct": r["clean_pct"], "universe_size": universe_size,

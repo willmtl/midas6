@@ -3,11 +3,12 @@ News-horizon scanner — the live surface for the horizon-conditioned news work.
 
 For every RECENT, material (impact>=2), LLM-classified news event whose type-specific horizon window
 is still OPEN, join it to what our data says happens over THAT horizon for THAT news type, and take a
-stance. Only the FADES survived robustness (news_horizon_robust.py + news_drift_robust.py):
-  - earnings_beat  @3mo   -> FADE  (size-conditioned: mid/small ~-5%, large ~-1.4%)
-  - product        @month -> FADE  (~-3.7%, all sizes)
+stance. Only the FADES survived robustness, RE-VALIDATED ON LOCAL qwen labels (news_horizon_robust_local.py +
+news_drift_robust_local.py; the Anthropic/Haiku validators are DEPRECATED):
+  - earnings_beat  @3mo   -> FADE  (size-conditioned: small ~-7.5%, mid ~-5.2%, large ~-0.5%)
   - strong bullish POP (dir>0, impact>=2, day-1 β-adj >= +6%) in mid/small cap -> FADE (bull-pop)
 Everything else is WATCH — informational (its measured drift shown) but NOT robustness-validated.
+NOTE: product @month did NOT reproduce as a fade on local labels (was Anthropic-only) → demoted to WATCH.
 
 Writes NewsHorizonSignal (cleared each run). Run:
   docker compose exec -T backend python -u news_horizon_scan.py
@@ -28,15 +29,21 @@ CAT_HORIZON = {
     "earnings_beat": "3mo", "earnings_miss": "3mo", "guidance_up": "3mo", "guidance_down": "3mo",
     "clinical": "3mo", "mgmt": "3mo",
 }
-# robust FADE table: cat -> {cap_bucket: expected oriented drift %}. Validated by news_horizon_robust.py.
+# robust FADE table: cat -> {cap_bucket: expected oriented drift %}. RE-VALIDATED ON LOCAL qwen labels
+# by news_horizon_robust_local.py (the Anthropic/Haiku validator news_horizon_robust.py is DEPRECATED —
+# the scanner reads local labels, so the fade table must be derived on the same labels). Only
+# earnings_beat reproduced as a robust size-conditioned fade (n=2002, both time halves negative);
+# product did NOT (local n=183, med ~+0.2%, time halves sign-flip) → demoted to WATCH.
 ROBUST_FADE = {
-    "earnings_beat": {"small": -5.7, "mid": -5.3, "large": -1.4},
-    "product":       {"small": -3.9, "mid": -3.8, "large": -3.5},
+    "earnings_beat": {"small": -7.5, "mid": -5.2, "large": -0.5},
 }
-# informational (NOT robust) measured drift at own horizon, for the WATCH rows.
-OBSERVED = {"earnings_miss": -0.9, "ma": -0.1, "upgrade": -0.5, "contract": +1.4, "legal": -0.7,
-            "downgrade": -1.3, "clinical": -1.4, "guidance_up": -5.7, "guidance_down": +1.7,
-            "mgmt": +0.3, "capital": +0.9, "dividend": 0.0, "macro": 0.0, "other": -0.8}
+# Informational (NOT robust) measured oriented drift at own horizon, for WATCH rows. earnings_beat/
+# product/contract/guidance_up/earnings_miss re-measured on LOCAL labels (news_horizon_robust_local.py);
+# the rest are legacy Anthropic values pending a full local re-measure. (earnings_miss is a robust
+# under-reaction/continuation +3.5%, not a fade — shown as WATCH since the scanner has no short stance.)
+OBSERVED = {"earnings_miss": +3.5, "ma": -0.1, "upgrade": -0.5, "contract": -0.4, "legal": -0.7,
+            "downgrade": -1.3, "clinical": -1.4, "guidance_up": -1.1, "guidance_down": +1.7,
+            "mgmt": +0.3, "capital": +0.9, "dividend": 0.0, "macro": 0.0, "other": -0.8, "product": +0.2}
 BETA_WIN = 60; MIN_PRICE = 3.0; POP = 6.0
 SCAN_DAYS = 40   # look back far enough that month/3mo windows can still be open
 

@@ -49,7 +49,13 @@ def rolling_sortino(
         dd = np.sqrt(np.mean(downside ** 2))
 
         if dd < 1e-10:
-            return np.nan
+            # No downside in the window. The ratio is ±inf, NOT "undefined" — returning NaN made
+            # the caller (_last) reach back to a STALE earlier bar and mislabel a ripping ETF.
+            # Flat window (no up moves either) is genuinely undefined → NaN; otherwise a large
+            # JSON-safe finite sentinel so the sortino>0 gate reads correctly.
+            if abs(mean_excess) < 1e-10:
+                return np.nan
+            return 9.99 if mean_excess > 0 else -9.99
 
         return mean_excess / dd
 
@@ -95,7 +101,11 @@ def rolling_omega(
         gains = excess[excess > 0].sum()
         losses = -excess[excess < 0].sum()
         if losses < 1e-10:
-            return np.nan
+            # No losses in the window → Omega is +inf (all upside), NOT undefined. Returning NaN
+            # made _last reach back to a stale bar and downgrade a strong ETF from BULLISH to
+            # "RSI ONLY". Flat window (no gains either) is genuinely undefined → NaN; otherwise a
+            # large JSON-safe finite sentinel so the omega>1 gate reads bullish.
+            return np.nan if gains < 1e-10 else 99.0
         return gains / losses
 
     return returns.rolling(window=window).apply(_omega, raw=False)
@@ -107,8 +117,11 @@ def rolling_cvar(
     alpha: float = 0.05,
 ) -> pd.Series:
     """
-    Rolling CVaR (Expected Shortfall) at alpha level.
-    Average of the worst alpha% of returns. More negative = worse tail risk.
+    Rolling CVaR (Expected Shortfall) at alpha level: mean of the worst alpha% of returns.
+    NOTE: at the default 10-day window, int(10*0.05)=0 → n=1, so this DEGENERATES to the single
+    worst day (a 1-sample VaR, not an averaged tail). Fine as a relative ETF-vs-SPY tail gauge
+    (both use the same method); do NOT read the absolute number as a true multi-sample ES unless
+    the window is large enough that len*alpha >= ~2.
     """
     def _cvar(r):
         sorted_r = np.sort(r)
@@ -250,8 +263,12 @@ def compute_all_risk_metrics(
     etf_beta = rolling_beta(etf_r, spy_r, window)
 
     def _last(s):
-        v = s.dropna()
-        return round(float(v.iloc[-1]), 3) if len(v) > 0 else None
+        # Return the LATEST bar's value (or None) — never reach back past a trailing NaN, which
+        # silently returned a stale earlier-date metric as if it were current.
+        if len(s) == 0:
+            return None
+        v = s.iloc[-1]
+        return round(float(v), 3) if pd.notna(v) else None
 
     def _trend(s):
         """
@@ -294,7 +311,7 @@ def compute_all_risk_metrics(
 
 def compute_rsi_crossover(df: pd.DataFrame, omega_series: pd.Series = None) -> dict:
     """
-    Compute 14-day RSI and its 14-period SMA.
+    Compute RSI(RSI_PERIOD=10) and its RSI_SMA_PERIOD(=10)-period SMA.
     Returns latest RSI, RSI SMA, and whether RSI just crossed above its SMA.
     """
     rsi = ta.momentum.rsi(df["Close"], window=RSI_PERIOD)

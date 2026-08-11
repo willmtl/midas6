@@ -64,10 +64,13 @@ def _quarterly_frame(reports_df):
     return r.set_index("avail_date")
 
 
-def prepare_pit_metrics(price_df, reports_df, dividends, spy_close, insider=None, filings=None):
+def prepare_pit_metrics(price_df, reports_df, dividends, spy_close, insider=None, filings=None,
+                        darkpool=None, news=None):
     """Return a DataFrame indexed by price_df.index with all point-in-time metric columns.
     Missing inputs yield NaN (never raises). `insider` = Series of open-market buy $ indexed
-    by filed_date. `filings` = DataFrame[filed_date, form_group] of 13D/13G filings."""
+    by filed_date. `filings` = DataFrame[filed_date, form_group] of 13D/13G filings.
+    `darkpool` = DataFrame[off_pct, published_date] of FINRA weekly ATS volume. `news` =
+    Series of sentiment polarity indexed by news datetime."""
     idx = price_df.index
     close = price_df["Close"].astype(float)
     out = pd.DataFrame(index=idx)
@@ -141,6 +144,57 @@ def prepare_pit_metrics(price_df, reports_df, dividends, spy_close, insider=None
     out["insider_buy_intensity"] = _insider_intensity(close, insider, out["market_cap"])
     out["stake_13d_1y"] = _filings_trailing(close.index, filings, "13D")
     out["stake_13g_1y"] = _filings_trailing(close.index, filings, "13G")
+    dp_level, dp_trend = _darkpool_features(idx, darkpool)
+    out["dp_off_pct"] = dp_level
+    out["dp_trend_z"] = dp_trend
+    out["news_sent"] = _news_sentiment(idx, news)
+    return out
+
+
+def _darkpool_features(idx, darkpool, window=8):
+    """PIT dark-pool level + trend as of each trading day, keyed by FINRA PUBLISH date so the
+    ~3-4wk reporting lag is respected (no lookahead). `darkpool` = DataFrame[off_pct,
+    published_date]. Returns (level, trend_z): level = most-recently-published weekly ATS
+    off_pct; trend_z = that week's off_pct z-scored vs the trailing `window` published weeks.
+    NaN where the ticker has no dark-pool data (so 'no data' stays distinct from 'low')."""
+    if darkpool is None or len(darkpool) == 0:
+        return _nan(idx), _nan(idx)
+    d = darkpool.dropna(subset=["published_date", "off_pct"])
+    if d.empty:
+        return _nan(idx), _nan(idx)
+    off = pd.Series(d["off_pct"].astype(float).values, index=pd.to_datetime(d["published_date"]))
+    off = off.groupby(off.index).last().sort_index()      # one value per publish date
+    # Z-score this week's off_pct against the TRAILING window (prior weeks only). Including the
+    # current week in its own mean/std shrinks |z| toward 0 (each point is 1/window of its own
+    # baseline), so a genuine surge under-reads — use shift(1) so the baseline excludes the point
+    # being scored.
+    prior = off.shift(1)
+    rmean = prior.rolling(window, min_periods=3).mean()
+    rstd = prior.rolling(window, min_periods=3).std()
+    z = _safe_div(off - rmean, rstd)
+    level = off.reindex(off.index.union(idx)).sort_index().ffill().reindex(idx)
+    trend = z.reindex(z.index.union(idx)).sort_index().ffill().reindex(idx)
+    return level, trend
+
+
+def _news_sentiment(idx, news, window="7D"):
+    """PIT trailing-`window` mean news sentiment as of each trading day (only news dt <= bar).
+    `news` = Series of polarity (−1..1) indexed by news datetime. Built on a full daily calendar
+    so a bar with no news in the window is NaN, not a stale carry-forward. NaN where no news."""
+    if news is None or len(news) == 0:
+        return _nan(idx)
+    ni = pd.to_datetime(news.index)
+    if getattr(ni, "tz", None) is not None:
+        ni = ni.tz_localize(None)
+    s = pd.Series(np.asarray(news.values, dtype=float), index=ni).sort_index()
+    daily = s.groupby(s.index.normalize()).mean()
+    if daily.empty:
+        return _nan(idx)
+    idxn = idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
+    full = pd.date_range(daily.index.min(), max(daily.index.max(), idxn.max()), freq="D")
+    roll = daily.reindex(full).rolling(window, min_periods=1).mean()   # trailing mean, skips NaN
+    out = roll.reindex(roll.index.union(idxn)).sort_index().ffill().reindex(idxn)
+    out.index = idx   # restore caller's original index labels
     return out
 
 
@@ -223,19 +277,46 @@ def _ad_state(price_df, window=20, sma=10):
     return code
 
 
-def _rolling_beta(close, spy_close):
+def _rolling_beta(close, spy_close, window=BETA_WINDOW):
     if spy_close is None or len(spy_close) == 0:
         return pd.Series(np.nan, index=close.index)
     r = close.pct_change()
     m = spy_close.reindex(close.index).ffill().pct_change()
-    cov = r.rolling(BETA_WINDOW).cov(m)
-    var = m.rolling(BETA_WINDOW).var()
+    cov = r.rolling(window).cov(m)
+    var = m.rolling(window).var()
     return _safe_div(cov, var)
 
 
 # ── Bucket functions (all dimensions; snapshot dims reuse the same fns) ─────────
 def _na(v):
     return v is None or (isinstance(v, float) and np.isnan(v))
+
+
+def bucket_darkpool_level(v):
+    """FINRA ATS dark-pool share of that week's consolidated volume."""
+    if _na(v): return "NA"
+    if v < 0.05: return "low (<5%)"
+    if v < 0.12: return "mid (5-12%)"
+    if v < 0.20: return "high (12-20%)"
+    return "very high (>=20%)"
+
+
+def bucket_darkpool_trend(v):
+    """Z-score of the latest published dark-pool week vs its trailing 8-week baseline."""
+    if _na(v): return "NA"
+    if v <= -1.0: return "distributing (z<=-1)"
+    if v < 1.0: return "steady (-1..1)"
+    if v < 2.0: return "accumulating (1-2)"
+    return "surging (>=2)"
+
+
+def bucket_news_sent(v):
+    """Trailing-7d mean news sentiment polarity (−1..1) as of entry."""
+    if _na(v): return "NA"
+    if v <= -0.15: return "negative (<=-.15)"
+    if v < 0.15: return "neutral (-.15..15)"
+    if v < 0.50: return "positive (.15-.5)"
+    return "very positive (>=.5)"
 
 def bucket_ps(v):
     if _na(v): return "NA"
