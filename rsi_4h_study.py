@@ -30,15 +30,16 @@ RSI_P = 14
 SMA_P = 14
 GAP = 3                       # episode-dedup gap (bars) between independent entries
 MIN_BARS = 120
-CACHE = Path(__file__).resolve().parent / ".data" / "intraday" / "4h"
-CACHE.mkdir(parents=True, exist_ok=True)
-OUT = Path(__file__).resolve().parent / ".data" / "studies" / "rsi_4h_backtest.json"
+DATA = Path(__file__).resolve().parent / ".data" / "intraday"
+DATA.mkdir(parents=True, exist_ok=True)
+STUD = Path(__file__).resolve().parent / ".data" / "studies"
 EOD = os.environ.get("EODHD_API_KEY", "")
 
-# Exit ladder in BARS (4h). ~2 bars/trading-day, so the day approximations below.
-FIXED = [("1b", 1, "~½ day"), ("2b", 2, "~1 day"), ("3b", 3, "~1.5 days"),
-         ("5b", 5, "~2.5 days"), ("10b", 10, "~1 week"), ("20b", 20, "~2 weeks"),
-         ("40b", 40, "~4 weeks")]
+TF_HOURS = {"4h": 4, "8h": 8, "12h": 12}   # 8h/12h derive from the cached 4h (aligned bin boundaries)
+RTH_HOURS = 6.5
+
+# Exit ladder in BARS. Day approximations are filled per-timeframe (bars_per_day ≈ RTH/tf_hours).
+FIXED_BARS = [1, 2, 3, 5, 10, 20, 40]
 
 
 def fetch_1h(sym, years):
@@ -77,33 +78,54 @@ def fetch_1h(sym, years):
     return df
 
 
-def resample_4h(df1h):
-    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    df4 = df1h.resample("4h").agg(agg).dropna()
-    df4.columns = ["Open", "High", "Low", "Close", "Volume"]
-    return df4
+def resample_ohlc(df, hours, from_1h=False):
+    """Resample to `hours`-bar OHLCV. Works from 1h bars (raw EODHD, lower-cased cols) or from an
+    already-4h frame (Title-cased cols) — 8h/12h bin boundaries align with 4h, so it's exact."""
+    cols = ["open", "high", "low", "close", "volume"] if from_1h else ["Open", "High", "Low", "Close", "Volume"]
+    agg = {c: f for c, f in zip(cols, ["first", "max", "min", "last", "sum"])}
+    out = df[cols].resample(f"{hours}h").agg(agg).dropna()
+    out.columns = ["Open", "High", "Low", "Close", "Volume"]
+    return out
 
 
-def get_4h(ticker, years, allow_fetch):
-    p = CACHE / f"{ticker}.parquet"
+def get_tf(ticker, tf, years, allow_fetch):
+    """4h is fetched (1h→4h) and cached; 8h/12h are resampled UP from the cached 4h (no re-fetch)."""
+    hours = TF_HOURS[tf]
+    p = DATA / tf / f"{ticker}.parquet"
+    p.parent.mkdir(parents=True, exist_ok=True)
     if p.exists():
         try:
             return pd.read_parquet(p)
         except Exception:
             pass
-    if not allow_fetch or not EOD:
-        return None
-    raw = fetch_1h(f"{ticker}.US", years)
-    if raw is None or raw.empty:
-        return None
-    df4 = resample_4h(raw)
-    if len(df4) < MIN_BARS:
+    if tf == "4h":
+        if not allow_fetch or not EOD:
+            return None
+        raw = fetch_1h(f"{ticker}.US", years)
+        if raw is None or raw.empty:
+            return None
+        df = resample_ohlc(raw, 4, from_1h=True)
+    else:
+        four = get_tf(ticker, "4h", years, allow_fetch)   # reuse the cached 4h
+        if four is None:
+            return None
+        df = resample_ohlc(four, hours, from_1h=False)
+    if len(df) < MIN_BARS:
         return None
     try:
-        df4.to_parquet(p)
+        df.to_parquet(p)
     except Exception:
         pass
-    return df4
+    return df
+
+
+def day_label(bars, tf):
+    days = bars * TF_HOURS[tf] / RTH_HOURS
+    return f"~{days:.1f}d" if days >= 1 else "~½ day"
+
+
+def fixed_for(tf):
+    return [(f"{b}b", b, day_label(b, tf)) for b in FIXED_BARS]
 
 
 def _entries_exits(close):
@@ -114,7 +136,7 @@ def _entries_exits(close):
     return up.fillna(False).values, dn.fillna(False).values
 
 
-def backtest_df(df):
+def backtest_df(df, fixed):
     """Return {exit_key: [returns]} for one instrument (episode-deduped entries)."""
     close = df["Close"].reset_index(drop=True)
     n = len(close)
@@ -122,13 +144,13 @@ def backtest_df(df):
     idxs = [i for i in range(n) if up[i]]
     idxs = sorted(_episode_starts(idxs, gap=GAP))
     cvals = close.values
-    res = {k: [] for k, _, _ in FIXED}
+    res = {k: [] for k, _, _ in fixed}
     res["rsi_x_dn"] = []      # hold until RSI crosses back below its SMA
     for i in idxs:
         ep = float(cvals[i])
         if ep <= 0:
             continue
-        for k, bars, _ in FIXED:
+        for k, bars, _ in fixed:
             j = i + bars
             if j < n:
                 res[k].append((cvals[j] - ep) / ep * 100)
@@ -138,10 +160,10 @@ def backtest_df(df):
     return res
 
 
-def agg_rows(pool):
+def agg_rows(pool, fixed):
     rows = []
-    order = [k for k, _, _ in FIXED] + ["rsi_x_dn"]
-    label = {k: f"Hold {k} ({d})" for k, _, d in FIXED}
+    order = [k for k, _, _ in fixed] + ["rsi_x_dn"]
+    label = {k: f"Hold {k} ({d})" for k, _, d in fixed}
     label["rsi_x_dn"] = "Till RSI crosses back below SMA"
     for k in order:
         r = pool.get(k, [])
@@ -156,7 +178,7 @@ def agg_rows(pool):
     return rows
 
 
-def daily_backtest(tickers):
+def daily_backtest(tickers, fixed):
     """Same RSI(14) crossover on DAILY DB candles, same exit bars, as a benchmark."""
     from seq_fundamental_study import load_candles
     pool = {}
@@ -166,14 +188,61 @@ def daily_backtest(tickers):
         if len(df) < MIN_BARS:
             continue
         n_used += 1
-        r = backtest_df(df)
+        r = backtest_df(df, fixed)
         for k, v in r.items():
             pool.setdefault(k, []).extend(v)
-    return agg_rows(pool), n_used
+    return agg_rows(pool, fixed), n_used
+
+
+def run_tf(tf, etfs, years, allow_fetch):
+    fixed = fixed_for(tf)
+    pool = {}
+    got, spans = 0, []
+    for i, tk in enumerate(etfs):
+        df = get_tf(tk, tf, years, allow_fetch)
+        if df is None or len(df) < MIN_BARS:
+            continue
+        got += 1
+        spans.append((tk, str(df.index[0].date()), str(df.index[-1].date())))
+        r = backtest_df(df, fixed)
+        for k, v in r.items():
+            pool.setdefault(k, []).extend(v)
+        if (i + 1) % 20 == 0:
+            print(f"  [{tf}] ...{i + 1}/{len(etfs)} ({got} with data)", flush=True)
+    rows = agg_rows(pool, fixed)
+    rows_d, n_daily = daily_backtest([s[0] for s in spans] or etfs, fixed)
+    earliest = min((s[1] for s in spans), default=None)
+    latest = max((s[2] for s in spans), default=None)
+    payload = {
+        "computed_at": pd.Timestamp.utcnow().isoformat(),
+        "params": {"rsi_period": RSI_P, "sma_period": SMA_P, "timeframe": tf,
+                   "universe": "93 sector ETFs", "n_with_data": got, "n_daily": n_daily,
+                   "episode_gap_bars": GAP, "history": {"from": earliest, "to": latest}},
+        "backtest_tf": rows, "backtest_daily": rows_d,
+        "note": (f"EODHD 1h resampled to {tf} (8h/12h derived from cached 4h). Entry at the crossover "
+                 "bar's close; episode-deduped; NO fees. Exit holds are in BARS. Daily column runs the "
+                 "identical RSI(14) crossover on DB daily candles."),
+    }
+    (STUD / f"rsi_{tf}_backtest.json").write_text(json.dumps(payload, indent=2, default=str))
+    try:
+        from core.models import BacktestResult
+        from django.utils import timezone
+        BacktestResult.objects.update_or_create(
+            kind=f"rsi_{tf}_backtest",
+            defaults={"payload": json.loads(json.dumps(payload, default=str)),
+                      "computed_at": timezone.now()})
+    except Exception as e:
+        print(f"DB save failed [{tf}]:", e, flush=True)
+    print(f"\n=== RSI(14) crossover — {tf.upper()} ({got} ETFs, {earliest}→{latest}) ===", flush=True)
+    for r in rows:
+        print(f"  {r['exit']:8} {r['name']:22} n={r['trades']:>6} avg {r['avg_pct']:>+6.2f}% "
+              f"win {r['win_pct']:>5}% t={r['t']}", flush=True)
+    return payload
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--tf", default="4h,8h,12h", help="comma list of 4h/8h/12h")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--no-fetch", action="store_true")
     ap.add_argument("--years", type=float, default=5)
@@ -183,61 +252,11 @@ def main():
     etfs = sorted(set(Sector.objects.values_list("etf", flat=True)))
     if args.limit:
         etfs = etfs[:args.limit]
-    print(f"{len(etfs)} sector ETFs | RSI({RSI_P}) x SMA({SMA_P}) crossover on 4h | "
+    tfs = [t.strip() for t in args.tf.split(",") if t.strip() in TF_HOURS]
+    print(f"{len(etfs)} sector ETFs | RSI({RSI_P})×SMA({SMA_P}) crossover | timeframes {tfs} | "
           f"fetch={'off' if args.no_fetch else 'on'}", flush=True)
-
-    pool4 = {}
-    got, spans = 0, []
-    for i, tk in enumerate(etfs):
-        df4 = get_4h(tk, args.years, allow_fetch=not args.no_fetch)
-        if df4 is None or len(df4) < MIN_BARS:
-            continue
-        got += 1
-        spans.append((tk, str(df4.index[0].date()), str(df4.index[-1].date()), len(df4)))
-        r = backtest_df(df4)
-        for k, v in r.items():
-            pool4.setdefault(k, []).extend(v)
-        if (i + 1) % 20 == 0:
-            print(f"  ...{i + 1}/{len(etfs)} processed ({got} with 4h data)", flush=True)
-
-    rows4 = agg_rows(pool4)
-    rows_d, n_daily = daily_backtest([s[0] for s in spans] or etfs)
-
-    earliest = min((s[1] for s in spans), default=None)
-    latest = max((s[2] for s in spans), default=None)
-    payload = {
-        "computed_at": pd.Timestamp.utcnow().isoformat(),
-        "params": {"rsi_period": RSI_P, "sma_period": SMA_P, "timeframe": "4h",
-                   "universe": "93 sector ETFs", "n_with_4h": got, "n_daily": n_daily,
-                   "episode_gap_bars": GAP, "history": {"from": earliest, "to": latest}},
-        "backtest_4h": rows4,
-        "backtest_daily": rows_d,
-        "note": ("EODHD 1h resampled to 4h (~2 RTH bars/day); intraday history is shorter than the "
-                 "5y daily. Entry at the crossover bar's close; episode-deduped; NO fees. Exit holds "
-                 "are in BARS. Daily column runs the identical RSI(14) crossover on DB daily candles."),
-    }
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(payload, indent=2, default=str))
-    try:
-        from core.models import BacktestResult
-        from django.utils import timezone
-        BacktestResult.objects.update_or_create(
-            kind="rsi_4h_backtest",
-            defaults={"payload": json.loads(json.dumps(payload, default=str)),
-                      "computed_at": timezone.now()})
-        print("Saved BacktestResult[rsi_4h_backtest]", flush=True)
-    except Exception as e:
-        print("DB save failed:", e, flush=True)
-
-    print(f"\n4h data: {got}/{len(etfs)} ETFs | history {earliest} → {latest}", flush=True)
-    print("\n=== RSI(14) crossover — 4h ===", flush=True)
-    for r in rows4:
-        print(f"  {r['exit']:8} {r['name']:34} n={r['trades']:>6} avg {r['avg_pct']:>+6.2f}% "
-              f"win {r['win_pct']:>5}% t={r['t']}", flush=True)
-    print("\n=== RSI(14) crossover — DAILY (same ETFs, benchmark) ===", flush=True)
-    for r in rows_d:
-        print(f"  {r['exit']:8} {r['name']:34} n={r['trades']:>6} avg {r['avg_pct']:>+6.2f}% "
-              f"win {r['win_pct']:>5}% t={r['t']}", flush=True)
+    for tf in tfs:
+        run_tf(tf, etfs, args.years, allow_fetch=not args.no_fetch)
 
 
 if __name__ == "__main__":
