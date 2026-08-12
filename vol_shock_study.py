@@ -93,6 +93,7 @@ def build(limit=None):
 
     base = {H: Acc() for H in HZ}
     cond = {(thr, H, d): Acc() for thr in THRS for H in HZ for d in ("up", "dn")}
+    cond_hv = {(thr, H, d): Acc() for thr in THRS for H in HZ for d in ("up", "dn")}  # volume-confirmed
     slc = {}
     def sadd(kind, d, H, bucket, v):
         slc.setdefault((kind, d, H, bucket), Acc()).add1(v, (v > 0) if d == "up" else (v < 0))
@@ -108,6 +109,7 @@ def build(limit=None):
         vstd = ret.rolling(WIN).std().shift(1)
         z = (ret / vstd).values; vv = vstd.values
         avgvol = pd.Series(volu).rolling(WIN).mean().shift(1).values
+        hv_arr = (avgvol > 0) & (volu > 1.5 * avgvol)   # volume-confirmed (>1.5x trailing avg)
         mc, sec = fmap.get(tk, (None, "?")); capb = cap_bucket(mc)
         for H in HZ:
             fwd = np.full(len(close), np.nan); fwd[:-H] = close[H:] / close[:-H] - 1.0
@@ -120,6 +122,12 @@ def build(limit=None):
                     ep = sorted(_episode_starts(idxs.tolist(), gap=H))
                     f = fwd[ep]
                     cond[(thr, H, d)].add(f, f > 0 if d == "up" else f < 0)
+                    # volume-confirmed continuation: episodes among hi-vol shocks only
+                    idxs_hv = np.where(mask & ok & hv_arr)[0]
+                    if idxs_hv.size:
+                        ep_hv = sorted(_episode_starts(idxs_hv.tolist(), gap=H))
+                        fhv = fwd[ep_hv]
+                        cond_hv[(thr, H, d)].add(fhv, fhv > 0 if d == "up" else fhv < 0)
                     if thr == SLICE_THR and H in SLICE_HZ:
                         for j in ep:
                             fv = fwd[j]
@@ -131,19 +139,23 @@ def build(limit=None):
 
     baseline = {H: base[H].stats()["mean"] for H in HZ}
 
-    # continuation rows
-    continuation = {"up": [], "dn": []}
-    for d in ("up", "dn"):
-        for thr in THRS:
-            for H in HZ:
-                st = cond[(thr, H, d)].stats()
-                if not st["n"]: continue
-                b = baseline[H]
-                edge = round((st["mean"] - b) if d == "up" else (b - st["mean"]), 3)
-                cont = st["wr"] if d == "up" else round(100 - st["wr"], 1)
-                continuation[d].append({"thr": thr, "H": H, "episodes": st["n"],
-                                        "mean_pct": st["mean"], "cont_pct": cont,
-                                        "edge_pct": edge, "t": st["t"]})
+    # continuation rows (shared builder for the all-shocks and volume-confirmed matrices)
+    def _cont_rows(condmap):
+        out = {"up": [], "dn": []}
+        for d in ("up", "dn"):
+            for thr in THRS:
+                for H in HZ:
+                    st = condmap[(thr, H, d)].stats()
+                    if not st["n"]: continue
+                    b = baseline[H]
+                    edge = round((st["mean"] - b) if d == "up" else (b - st["mean"]), 3)
+                    cont = st["wr"] if d == "up" else round(100 - st["wr"], 1)
+                    out[d].append({"thr": thr, "H": H, "episodes": st["n"],
+                                   "mean_pct": st["mean"], "cont_pct": cont,
+                                   "edge_pct": edge, "t": st["t"]})
+        return out
+    continuation = _cont_rows(cond)
+    continuation_hivol = _cont_rows(cond_hv)
 
     # slices
     slices = {}
@@ -187,6 +199,7 @@ def build(limit=None):
                    "universe": {"names": n_names}},
         "baseline": baseline,
         "continuation": continuation,
+        "continuation_hivol": continuation_hivol,
         "slices": slices,
         "backtest": backtest,
         "note": ("Entry at the shock close (no lookahead). Episode-deduped (independent episodes, "
