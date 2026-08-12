@@ -4653,6 +4653,256 @@ function ResearchPage() {
   );
 }
 
+// ---- Live hub: Short-term Burst ----------------------------------------------
+// Names bursting right now (trigger fired in the last ~2 bars), tagged momentum vs reversal.
+function ShortTermPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [burstFilter, setBurstFilter] = useState('all');   // all | momentum | reversal (client-side)
+
+  const filteredRows = React.useMemo(
+    () => ((data && data.results) || []).filter(r => burstFilter === 'all' || r.burst_type === burstFilter),
+    [data, burstFilter]);
+  const sort = useSortedRows(filteredRows, 'days_ago', 'asc');
+
+  const load = () => apiFetch('/short-term').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+
+  const runScan = () => {
+    setRunning(true);
+    fetch(`${API}/short-term`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/short-term`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading short-term burst signals...</div>;
+  if (data.computed === false) {
+    return (
+      <div className="studies-page">
+        <h1>Short-term Burst</h1>
+        <p className="subtitle">Names bursting right now, tagged momentum or reversal.</p>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not scanned yet.'}</p>
+          <button className="refresh-btn" onClick={runScan} disabled={running}>{running ? 'Scanning...' : 'Run scan'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const capFmt = v => v == null ? '–' : v >= 1e9 ? `$${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `$${(v / 1e6).toFixed(0)}M` : `$${(v / 1e3).toFixed(0)}K`;
+  const signCls = v => v == null ? 'dim' : v > 0 ? 'good' : v < 0 ? 'bad' : 'dim';
+  const burstChip = t => t === 'reversal'
+    ? <span className="sm-badge sm-13g" title="Reversal — snapping back off a low">reversal</span>
+    : <span className="sm-badge sm-insider" title="Momentum — thrusting up">momentum</span>;
+  const smChips = r => {
+    const fmt = v => v >= 1e9 ? `$${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : `$${(v / 1e3).toFixed(0)}K`;
+    const p = [];
+    if (r.insider_buy_90d > 0) p.push(<span key="i" className="sm-badge sm-insider" title="Insider open-market buys, ~trailing 6mo (SEC bulk data lags ~1 quarter)">▲ {fmt(r.insider_buy_90d)} insider</span>);
+    if (r.recent_13d > 0) p.push(<span key="d" className="sm-badge sm-13d" title="Activist 13D filings, last 180d">13D×{r.recent_13d}</span>);
+    if (r.recent_13g > 0) p.push(<span key="g" className="sm-badge sm-13g" title="Passive institutional 13G filings, last 180d">13G×{r.recent_13g}</span>);
+    return p.length ? p : <span className="dim">–</span>;
+  };
+
+  return (
+    <div className="studies-page">
+      <h1>Short-term Burst <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle">
+        Names bursting right now (trigger fired in the last ~2 bars), tagged momentum (thrusting up) or reversal (snapping back).
+        Edge is the trigger's short-horizon historical result.
+        <span className="dim"> · <b className="good">{data.n_momentum}</b> momentum · <b>{data.n_reversal}</b> reversal</span>
+      </p>
+
+      <div className="studies-controls">
+        <div className="filters">
+          <span className="dim" style={{ fontSize: 11 }}>Burst:</span>
+          {['all', 'momentum', 'reversal'].map(b => (
+            <button key={b} className={burstFilter === b ? 'active' : ''} onClick={() => setBurstFilter(b)}>
+              {b === 'all' ? 'All' : b === 'momentum' ? 'Momentum' : 'Reversal'}
+            </button>
+          ))}
+          <button className="refresh-btn" onClick={runScan} disabled={running}>{running ? 'Scanning...' : 'Re-scan'}</button>
+        </div>
+      </div>
+
+      <table className="studies-table">
+        <thead><tr>
+          <SortTh colKey="ticker" sort={sort}><Term k="ticker">Ticker</Term></SortTh>
+          <SortTh colKey="burst_type" sort={sort}>Burst</SortTh>
+          <SortTh colKey="signal_name" sort={sort}><Term k="signal">Signal</Term></SortTh>
+          <SortTh colKey="days_ago" sort={sort} align="right"><Term k="fired">Days ago</Term></SortTh>
+          <SortTh colKey="day1_move" sort={sort} align="right">Day-1 move</SortTh>
+          <SortTh colKey="z_shock" sort={sort} align="right">z (σ)</SortTh>
+          <SortTh colKey="hist_avg_return" sort={sort} align="right"><Term k="histedge">Short edge</Term></SortTh>
+          <SortTh colKey="hist_win_rate" sort={sort} align="right"><Term k="winrate">Win%</Term></SortTh>
+          <SortTh colKey="hist_trades" sort={sort} align="right">Trades</SortTh>
+          <SortTh colKey="market_cap" sort={sort} align="right"><Term k="marketcap">Mkt cap</Term></SortTh>
+          <SortTh colKey="forward_pe" sort={sort} align="right"><Term k="pe">Fwd P/E</Term></SortTh>
+          <th><Term k="sector">Sector</Term></th>
+          <th><Term k="smartmoney">Smart money</Term></th>
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(r => (
+            <tr key={`${r.ticker}|${r.signal_key}`} className="study-row">
+              <td><b>{r.ticker}</b></td>
+              <td>{burstChip(r.burst_type)}</td>
+              <td title={r.signal_key} className="dim">{r.signal_name}</td>
+              <td style={{ textAlign: 'right' }}>{r.days_ago === 0 ? <span className="good">today</span> : `${r.days_ago}d`}</td>
+              <td style={{ textAlign: 'right' }} className={signCls(r.day1_move)}>{r.day1_move == null ? '–' : `${r.day1_move > 0 ? '+' : ''}${r.day1_move}%`}</td>
+              <td style={{ textAlign: 'right' }} className={signCls(r.z_shock)}>{r.z_shock == null ? '–' : r.z_shock.toFixed(1)}</td>
+              <td style={{ textAlign: 'right' }} className={r.hist_avg_return == null ? 'dim' : signCls(r.hist_avg_return)}>{r.hist_avg_return == null ? '–' : `${r.hist_avg_return > 0 ? '+' : ''}${r.hist_avg_return}%`}</td>
+              <td style={{ textAlign: 'right' }}>{r.hist_win_rate == null ? <span className="dim">–</span> : `${r.hist_win_rate}%`}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.hist_trades == null ? '–' : r.hist_trades}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{capFmt(r.market_cap)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.forward_pe != null ? r.forward_pe.toFixed(1) : '–'}</td>
+              <td className="dim">{(r.sectors || []).slice(0, 2).join(', ')}</td>
+              <td style={{ fontSize: 11 }}>{smChips(r)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ---- Live hub: Global Confluence ---------------------------------------------
+// A live short-term burst (required) confirmed by our other validated layers, scored 0-100.
+function GlobalPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const rowsAll = (data && data.results) || [];
+  const sort = useSortedRows(rowsAll, 'global_score', 'desc');
+
+  const load = () => apiFetch('/global').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+
+  const runScan = () => {
+    setRunning(true);
+    fetch(`${API}/global`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/global`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading global confluence...</div>;
+  if (data.computed === false) {
+    return (
+      <div className="studies-page">
+        <h1>Global Confluence</h1>
+        <p className="subtitle">High-conviction confluence across our validated layers.</p>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not scanned yet.'}</p>
+          <button className="refresh-btn" onClick={runScan} disabled={running}>{running ? 'Scanning...' : 'Run scan'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const weights = data.weights || {};
+  const capFmt = v => v == null ? '–' : v >= 1e9 ? `$${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `$${(v / 1e6).toFixed(0)}M` : `$${(v / 1e3).toFixed(0)}K`;
+  const signCls = v => v == null ? 'dim' : v > 0 ? 'good' : v < 0 ? 'bad' : 'dim';
+  const scoreCls = s => s == null ? 'dim' : s >= 70 ? 'good' : s >= 40 ? '' : 'bad';
+  const adCls = s => !s ? 'dim' : /accum/.test(s) ? 'good' : /distribution/.test(s) ? 'bad' : 'dim';
+  const burstChip = t => t === 'reversal'
+    ? <span className="sm-badge sm-13g" title="Reversal">reversal</span>
+    : <span className="sm-badge sm-insider" title="Momentum">momentum</span>;
+  // 7 component pills: B(urst) E(dge) A/D D(arkpool) S(mart money) F(undamentals) R(egime), shaded by 0..1.
+  const COMP = [['burst', 'B'], ['edge', 'E'], ['ad', 'A'], ['darkpool', 'D'], ['smart_money', 'S'], ['fundamentals', 'F'], ['regime', 'R']];
+  const compPills = c => (
+    <span style={{ whiteSpace: 'nowrap' }}>
+      {COMP.map(([k, lbl]) => {
+        const v = c && typeof c[k] === 'number' ? c[k] : 0;
+        return (
+          <span key={k} title={`${k} ${v.toFixed(2)}`}
+            style={{ display: 'inline-block', width: 15, textAlign: 'center', fontSize: 10, fontWeight: 600, marginRight: 2, borderRadius: 3, color: v >= 0.45 ? '#fff' : '#8b949e', background: `rgba(63,185,80,${(0.12 + 0.78 * v).toFixed(3)})` }}>
+            {lbl}
+          </span>
+        );
+      })}
+    </span>
+  );
+  const smChips = r => {
+    const fmt = v => v >= 1e9 ? `$${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : `$${(v / 1e3).toFixed(0)}K`;
+    const p = [];
+    if (r.insider_buy_90d > 0) p.push(<span key="i" className="sm-badge sm-insider" title="Insider open-market buys, ~trailing 6mo">▲ {fmt(r.insider_buy_90d)} insider</span>);
+    if (r.recent_13d > 0) p.push(<span key="d" className="sm-badge sm-13d" title="Activist 13D filings, last 180d">13D×{r.recent_13d}</span>);
+    if (r.recent_13g > 0) p.push(<span key="g" className="sm-badge sm-13g" title="Passive institutional 13G filings, last 180d">13G×{r.recent_13g}</span>);
+    return p.length ? p : <span className="dim">–</span>;
+  };
+
+  return (
+    <div className="studies-page">
+      <h1>Global Confluence <span className="dim">({(data.n_global ?? rowsAll.length).toLocaleString()})</span>
+        <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle">
+        High-conviction confluence — a live short-term burst (required) confirmed by our other validated layers, scored 0-100.{' '}
+        {data.regime_bull
+          ? <span className="sm-badge sm-insider" title="SPY regime">SPY BULL</span>
+          : <span className="sm-badge sm-13d" title="SPY regime" style={{ color: '#f85149', background: '#3d1416' }}>SPY BEAR</span>}
+      </p>
+      <p className="subtitle" style={{ marginTop: 0, fontSize: 11 }}>
+        <span className="dim">Weights: </span>
+        {COMP.map(([k], i) => (
+          <span key={k} className="dim">{i ? ' · ' : ''}{k} {weights[k] != null ? weights[k] : '–'}</span>
+        ))}
+      </p>
+
+      <div className="studies-controls">
+        <div className="filters">
+          <button className="refresh-btn" onClick={runScan} disabled={running}>{running ? 'Scanning...' : 'Re-scan'}</button>
+        </div>
+      </div>
+
+      <table className="studies-table">
+        <thead><tr>
+          <SortTh colKey="global_score" sort={sort} align="right">Score</SortTh>
+          <th>Components</th>
+          <SortTh colKey="burst_signal_name" sort={sort}>Burst</SortTh>
+          <SortTh colKey="hist_avg_return" sort={sort} align="right"><Term k="histedge">Edge</Term></SortTh>
+          <SortTh colKey="ad_state" sort={sort}>A/D</SortTh>
+          <SortTh colKey="darkpool_off_pct" sort={sort} align="right">Dark pool</SortTh>
+          <th><Term k="smartmoney">Smart money</Term></th>
+          <th>Fundamentals</th>
+          <SortTh colKey="market_cap" sort={sort} align="right"><Term k="marketcap">Mkt cap</Term></SortTh>
+          <th><Term k="sector">Sector</Term></th>
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(r => (
+            <tr key={r.ticker} className="study-row">
+              <td style={{ textAlign: 'right', minWidth: 66 }}>
+                <b className={scoreCls(r.global_score)} style={{ fontSize: 14 }}>{r.global_score}</b>
+                <div style={{ height: 4, marginTop: 3, borderRadius: 2, background: '#1f6feb', width: `${Math.max(0, Math.min(100, r.global_score || 0))}%`, maxWidth: '100%' }} />
+              </td>
+              <td>{compPills(r.components)}</td>
+              <td>
+                <b>{r.ticker}</b> {burstChip(r.burst_type)}
+                <div className="dim" style={{ fontSize: 10 }} title={r.burst_signal_key}>{r.burst_signal_name} · {r.burst_days_ago === 0 ? 'today' : `${r.burst_days_ago}d`}</div>
+              </td>
+              <td style={{ textAlign: 'right' }} className={r.hist_avg_return == null ? 'dim' : signCls(r.hist_avg_return)}>{r.hist_avg_return == null ? '–' : `${r.hist_avg_return > 0 ? '+' : ''}${r.hist_avg_return}%`}</td>
+              <td className={adCls(r.ad_state)} style={{ fontSize: 11 }}>{r.ad_state || <span className="dim">–</span>}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.darkpool_off_pct == null ? '–' : `${r.darkpool_off_pct}%`}{r.darkpool_rising ? <span className="good"> ▲</span> : ''}</td>
+              <td style={{ fontSize: 11 }}>{smChips(r)}</td>
+              <td className="dim" style={{ fontSize: 11 }}>{(() => {
+                const vals = Object.values(r.fund_buckets || {}).filter(Boolean).slice(0, 2);
+                return vals.length ? vals.join(' · ') : '–';
+              })()}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{capFmt(r.market_cap)}</td>
+              <td className="dim">{(r.sectors || []).slice(0, 2).join(', ')}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // Small helper: a tab bar backed by URL hash. `tabs` = [{key,label,hash,el}].
 function HubTabs({ tabs, initKey }) {
   const pick = () => {
@@ -4687,6 +4937,8 @@ function LiveSignalsHub() {
       <HubTabs initKey="playbook" tabs={[
         { key: 'playbook', label: '▶ Playbook', hash: '/live/playbook', match: ['playbook'], el: <PlaybookPage /> },
         { key: 'firing', label: '⚡ Firing Now', hash: '/live/firing', match: ['firing'], el: <FiringNowPage /> },
+        { key: 'shortterm', label: 'Short-term', hash: '/live/shortterm', match: ['shortterm'], el: <ShortTermPage /> },
+        { key: 'global', label: 'Global', hash: '/live/global', match: ['global'], el: <GlobalPage /> },
         { key: 'addiv', label: 'A/D Divergence', hash: '/live/addiv', match: ['addiv'], el: <AdDivergencePage /> },
       ]} />
     </div>
