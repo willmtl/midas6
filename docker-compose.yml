@@ -64,6 +64,7 @@ x-backend-volumes: &backend-volumes
   - ./vol_shock_study.py:/app/vol_shock_study.py
   - ./burst_scan.py:/app/burst_scan.py
   - ./rsi_4h_study.py:/app/rsi_4h_study.py
+  - ./news_overreaction.py:/app/news_overreaction.py
   - ./.data:/app/.data
 
 services:
