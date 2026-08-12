@@ -62,6 +62,7 @@ x-backend-volumes: &backend-volumes
   - ./darkpool_backtest.py:/app/darkpool_backtest.py
   - ./congress_backtest.py:/app/congress_backtest.py
   - ./vol_shock_study.py:/app/vol_shock_study.py
+  - ./burst_scan.py:/app/burst_scan.py
   - ./.data:/app/.data
 
 services:

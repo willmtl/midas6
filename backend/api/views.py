@@ -1779,3 +1779,85 @@ class VolShockStudyView(_StudyResultView):
     kind = "vol_shock_study"
     script = "vol_shock_study.py"
     json_path = "/app/.data/studies/vol_shock_study.json"
+
+
+def _burst_scan_bg():
+    import subprocess
+    try:
+        subprocess.run(["python", "-u", "/app/burst_scan.py", "--db", "--jobs", "4"],
+                       cwd="/app", timeout=3600)
+    except Exception:
+        pass
+
+
+def _clean_rows(rows):
+    """Null out non-finite floats so DRF/orjson can serialize (some ratios are inf)."""
+    import math
+    for r in rows:
+        for k, v in r.items():
+            if isinstance(v, float) and not math.isfinite(v):
+                r[k] = None
+    return rows
+
+
+class ShortTermView(APIView):
+    """Short-term BURST scanner (ShortTermSignal): what is bursting today, momentum or reversal,
+    with the trigger's short-horizon edge. GET reads the DB (optional ?burst_type=); POST re-runs
+    the burst scan in the background."""
+    FIELDS = ["ticker", "signal_key", "signal_name", "burst_type", "days_ago", "last_close",
+              "day1_move", "z_shock", "best_exit_key", "hist_avg_return", "hist_win_rate",
+              "hist_trades", "market_cap", "pe_ratio", "forward_pe", "fund_buckets", "sectors",
+              "insider_buy_90d", "recent_13d", "recent_13g"]
+
+    def get(self, request):
+        from core.models import ShortTermSignal
+        from django.db.models import Max
+        if not ShortTermSignal.objects.exists():
+            return Response({"computed": False, "results": [],
+                             "message": "No burst scan yet. POST to run it (needs stock studies first)."})
+        qs = ShortTermSignal.objects.all()
+        bt = request.query_params.get("burst_type")
+        if bt in ("momentum", "reversal"):
+            qs = qs.filter(burst_type=bt)
+        rows = _clean_rows(list(qs.values(*self.FIELDS)))
+        last = ShortTermSignal.objects.aggregate(m=Max("computed_at"))["m"]
+        return Response({
+            "computed": True, "n_burst": len(rows), "results": rows,
+            "n_momentum": ShortTermSignal.objects.filter(burst_type="momentum").count(),
+            "n_reversal": ShortTermSignal.objects.filter(burst_type="reversal").count(),
+            "last_updated": last.isoformat() if last else None,
+        })
+
+    def post(self, request):
+        threading.Thread(target=_burst_scan_bg, daemon=True).start()
+        return Response({"status": "burst scan started"})
+
+
+class GlobalView(APIView):
+    """GLOBAL confluence scanner (GlobalSignal): live burst confirmed by our other validated layers,
+    scored 0-100 with a per-component breakdown, ranked by score. GET reads the DB; POST re-runs."""
+    FIELDS = ["ticker", "global_score", "components", "burst_signal_key", "burst_signal_name",
+              "burst_type", "burst_days_ago", "last_close", "best_signal_key", "hist_avg_return",
+              "hist_win_rate", "hist_trades", "ad_state", "darkpool_off_pct", "darkpool_rising",
+              "market_cap", "pe_ratio", "forward_pe", "fund_buckets", "sectors", "insider_buy_90d",
+              "recent_13d", "recent_13g", "regime_bull", "sector_state"]
+
+    def get(self, request):
+        from core.models import GlobalSignal
+        from django.db.models import Max
+        if not GlobalSignal.objects.exists():
+            return Response({"computed": False, "results": [],
+                             "message": "No burst scan yet. POST to run it (needs stock studies first)."})
+        rows = _clean_rows(list(GlobalSignal.objects.all().values(*self.FIELDS)))
+        last = GlobalSignal.objects.aggregate(m=Max("computed_at"))["m"]
+        return Response({
+            "computed": True, "n_global": len(rows), "results": rows,
+            "weights": {"burst": 15, "edge": 15, "ad": 15, "darkpool": 15,
+                        "smart_money": 15, "fundamentals": 15, "regime": 10},
+            "regime_bull": bool(rows and rows[0].get("regime_bull")),
+            "last_updated": last.isoformat() if last else None,
+        })
+
+    def post(self, request):
+        threading.Thread(target=_burst_scan_bg, daemon=True).start()
+        return Response({"status": "burst scan started"})

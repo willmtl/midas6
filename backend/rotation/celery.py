@@ -220,4 +220,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_vol_shock_study",
         "schedule": crontab(hour=23, minute=45),
     },
+    "burst-scan-nightly": {             # short-term burst + global confluence (after stock sweep/AD)
+        "task": "api.celery_tasks.run_burst_scan",
+        "schedule": crontab(hour=22, minute=55),
+    },
 }

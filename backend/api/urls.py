@@ -61,6 +61,9 @@ urlpatterns = [
     path("congress-backtest", views.CongressBacktestView.as_view(), name="congress-backtest"),
     # Vol-normalized shock continuation study (continuation matrix + slices + exit-ladder backtest)
     path("vol-shock-study", views.VolShockStudyView.as_view(), name="vol-shock-study"),
+    # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
+    path("short-term", views.ShortTermView.as_view(), name="short-term"),
+    path("global", views.GlobalView.as_view(), name="global"),
     # Forward paper-trade track record of Playbook picks
     path("paper-trades", views.PaperTradesView.as_view(), name="paper-trades"),
     # Research/Lab: trigger×exit / timeframe / regime / cap-band / MPT comparisons

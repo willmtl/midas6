@@ -476,6 +476,20 @@ def run_vol_shock_study():
 
 
 @shared_task
+def run_burst_scan():
+    """Nightly: short-term burst scan + global confluence → ShortTermSignal + GlobalSignal.
+    Runs after the stock sweep (needs StockStudy short-horizon edges) + dark-pool/A-D jobs."""
+    import subprocess, os
+    if not os.path.exists("/app/burst_scan.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/burst_scan.py", "--db", "--jobs", "4"], cwd="/app",
+                          capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("burst_scan failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_backtest_decomp():
     """Nightly: rotation-edge decomposition (pick vs rotation vs both, 200MA both-numbers,
     value×technical) → BacktestResult[decomposition]. Runs AFTER candles/fundamentals refresh."""

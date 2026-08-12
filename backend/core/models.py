@@ -510,6 +510,93 @@ class LiveSignal(models.Model):
         return f"{self.ticker} firing {self.signal_key} ({self.days_ago}d ago)"
 
 
+class ShortTermSignal(models.Model):
+    """A stock showing a SHORT-TERM BURST right now (a burst trigger fired within the last ~2 bars),
+    tagged momentum (thrusting up) or reversal (snapping back off a vol-shock-down / oversold).
+    Refreshed by the burst scan. Answers 'what is bursting today, and does it have a historical edge'."""
+    ticker = models.CharField(max_length=20)
+    signal_key = models.CharField(max_length=60)
+    signal_name = models.CharField(max_length=120)
+    burst_type = models.CharField(max_length=12, default="momentum")  # "momentum" | "reversal"
+    days_ago = models.IntegerField(default=0)           # bars since the trigger (0 = latest bar)
+    last_close = models.FloatField(default=0)
+    day1_move = models.FloatField(null=True, blank=True)  # trigger-day close-to-close return (%)
+    z_shock = models.FloatField(null=True, blank=True)    # trigger-day move in trailing-vol sigmas
+
+    # Historical edge of this trigger (its best SHORT-horizon exit) from the all-on-all sweep.
+    best_exit_key = models.CharField(max_length=60, blank=True)
+    hist_avg_return = models.FloatField(null=True, blank=True)
+    hist_win_rate = models.FloatField(null=True, blank=True)
+    hist_trades = models.IntegerField(null=True, blank=True)
+
+    market_cap = models.FloatField(null=True, blank=True)
+    pe_ratio = models.FloatField(null=True, blank=True)
+    forward_pe = models.FloatField(null=True, blank=True)
+    fund_buckets = models.JSONField(null=True, blank=True)
+    sectors = models.JSONField(null=True, blank=True)
+    insider_buy_90d = models.BigIntegerField(null=True, blank=True)
+    recent_13d = models.IntegerField(default=0)
+    recent_13g = models.IntegerField(default=0)
+
+    computed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["days_ago", "-hist_avg_return"]
+        unique_together = ["ticker", "signal_key"]
+        indexes = [models.Index(fields=["burst_type"]), models.Index(fields=["days_ago"])]
+
+    def __str__(self):
+        return f"{self.ticker} burst {self.signal_key} ({self.burst_type}, {self.days_ago}d)"
+
+
+class GlobalSignal(models.Model):
+    """A high-conviction CONFLUENCE candidate: a live short-term burst (REQUIRED) confirmed by our
+    other validated layers — a strong StockStudy signal edge, A/D accumulation, dark-pool
+    accumulation, insider/13D-13G, a fundamental amplifier bucket, and a favorable regime. Scored
+    0-100 with a per-component breakdown, ranked by score. Refreshed by the burst scan (global pass).
+    Answers 'where does everything line up at once'."""
+    ticker = models.CharField(max_length=20, unique=True)
+    global_score = models.FloatField(default=0)          # 0-100 weighted confluence
+    components = models.JSONField(null=True, blank=True)  # {burst:.., edge:.., ad:.., darkpool:.., smart_money:.., fundamentals:.., regime:..}
+
+    # The required burst.
+    burst_signal_key = models.CharField(max_length=60, blank=True)
+    burst_signal_name = models.CharField(max_length=120, blank=True)
+    burst_type = models.CharField(max_length=12, default="")
+    burst_days_ago = models.IntegerField(default=0)
+    last_close = models.FloatField(default=0)
+
+    # Best StockStudy edge among the ticker's firing signals.
+    best_signal_key = models.CharField(max_length=60, blank=True)
+    hist_avg_return = models.FloatField(null=True, blank=True)
+    hist_win_rate = models.FloatField(null=True, blank=True)
+    hist_trades = models.IntegerField(null=True, blank=True)
+
+    ad_state = models.CharField(max_length=24, blank=True)          # "accum divergence" | ...
+    darkpool_off_pct = models.FloatField(null=True, blank=True)     # latest PIT ATS off-exchange share
+    darkpool_rising = models.BooleanField(default=False)           # off_pct rising vs lookback
+
+    market_cap = models.FloatField(null=True, blank=True)
+    pe_ratio = models.FloatField(null=True, blank=True)
+    forward_pe = models.FloatField(null=True, blank=True)
+    fund_buckets = models.JSONField(null=True, blank=True)
+    sectors = models.JSONField(null=True, blank=True)
+    insider_buy_90d = models.BigIntegerField(null=True, blank=True)
+    recent_13d = models.IntegerField(default=0)
+    recent_13g = models.IntegerField(default=0)
+    regime_bull = models.BooleanField(default=False)               # SPY > 200dMA at scan
+    sector_state = models.CharField(max_length=12, blank=True)     # IN/STRONG/LEADER/TURNING/OUT
+
+    computed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-global_score"]
+        indexes = [models.Index(fields=["-global_score"])]
+
+    def __str__(self):
+        return f"{self.ticker} global {self.global_score:.0f}"
+
+
 class NewsHorizonSignal(models.Model):
     """A recent, material, LLM-classified news event joined with the horizon-conditioned drift we
     measured for its TYPE (news_drift_horizon.py / news_horizon_robust.py). Answers: 'this stock
