@@ -61,6 +61,7 @@ x-backend-volumes: &backend-volumes
   - ./delisted_survivorship.py:/app/delisted_survivorship.py
   - ./darkpool_backtest.py:/app/darkpool_backtest.py
   - ./congress_backtest.py:/app/congress_backtest.py
+  - ./vol_shock_study.py:/app/vol_shock_study.py
   - ./.data:/app/.data
 
 services:

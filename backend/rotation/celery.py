@@ -216,4 +216,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_congress_backtest",
         "schedule": crontab(hour=23, minute=35),
     },
+    "vol-shock-study-nightly": {        # vol-normalized shock continuation + slices + exit-ladder
+        "task": "api.celery_tasks.run_vol_shock_study",
+        "schedule": crontab(hour=23, minute=45),
+    },
 }

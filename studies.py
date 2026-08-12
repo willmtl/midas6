@@ -574,6 +574,16 @@ def sig_vol_shock_up(df):   return _vol_shock_z(df) >= 2.0
 def sig_vol_shock_dn(df):   return _vol_shock_z(df) <= -2.0
 def sig_vol_shock_dn3(df):  return _vol_shock_z(df) <= -3.0
 
+# Volume-CONFIRMED shock: the move also came on above-average volume (>1.5x trailing-20d avg,
+# shifted). In the study, volume confirmation made the shock more RELIABLE (higher t) even though
+# the point estimate shrank — genuine participation behind the move, not a thin-tape print.
+def _hi_vol(df, win=20):
+    return df["Volume"] > 1.5 * df["Volume"].rolling(win).mean().shift(1)
+
+def sig_vol_shock_up_hivol(df):   return sig_vol_shock_up(df) & _hi_vol(df)
+def sig_vol_shock_dn_hivol(df):   return sig_vol_shock_dn(df) & _hi_vol(df)
+def sig_vol_shock_dn3_hivol(df):  return sig_vol_shock_dn3(df) & _hi_vol(df)
+
 def sig_weekly_up_3pct(df):
     ret5 = df["Close"].pct_change(5) * 100
     return ret5 > 3
@@ -1264,6 +1274,9 @@ SIGNALS = {
     "vol_shock_up": ("Vol-Shock Up (+2σ day)", sig_vol_shock_up),
     "vol_shock_dn": ("Vol-Shock Down (-2σ day)", sig_vol_shock_dn),
     "vol_shock_dn3": ("Vol-Shock Down (-3σ day)", sig_vol_shock_dn3),
+    "vol_shock_up_hivol": ("Vol-Shock Up +2σ (hi-vol)", sig_vol_shock_up_hivol),
+    "vol_shock_dn_hivol": ("Vol-Shock Down -2σ (hi-vol)", sig_vol_shock_dn_hivol),
+    "vol_shock_dn3_hivol": ("Vol-Shock Down -3σ (hi-vol)", sig_vol_shock_dn3_hivol),
     "weekly_up3": ("Weekly Up >3%", sig_weekly_up_3pct),
     "weekly_down3": ("Weekly Down >3%", sig_weekly_down_3pct),
     "high_vol": ("Above Avg Volume (1.5x)", sig_above_avg_volume),

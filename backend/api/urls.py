@@ -59,6 +59,8 @@ urlpatterns = [
     # Dark-pool + alt-data equity-curve backtests (DB-first via BacktestResult)
     path("darkpool-backtest", views.DarkPoolBacktestView.as_view(), name="darkpool-backtest"),
     path("congress-backtest", views.CongressBacktestView.as_view(), name="congress-backtest"),
+    # Vol-normalized shock continuation study (continuation matrix + slices + exit-ladder backtest)
+    path("vol-shock-study", views.VolShockStudyView.as_view(), name="vol-shock-study"),
     # Forward paper-trade track record of Playbook picks
     path("paper-trades", views.PaperTradesView.as_view(), name="paper-trades"),
     # Research/Lab: trigger×exit / timeframe / regime / cap-band / MPT comparisons

@@ -463,6 +463,19 @@ def run_congress_backtest():
 
 
 @shared_task
+def run_vol_shock_study():
+    """Nightly: vol-normalized shock continuation study → BacktestResult[vol_shock_study]."""
+    import subprocess, os
+    if not os.path.exists("/app/vol_shock_study.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/vol_shock_study.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("vol_shock_study failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_backtest_decomp():
     """Nightly: rotation-edge decomposition (pick vs rotation vs both, 200MA both-numbers,
     value×technical) → BacktestResult[decomposition]. Runs AFTER candles/fundamentals refresh."""

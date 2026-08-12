@@ -1771,3 +1771,11 @@ class CongressBacktestView(_StudyResultView):
     kind = "congress_backtest"
     script = "congress_backtest.py"
     json_path = "/app/.data/studies/congress_backtest.json"
+
+
+class VolShockStudyView(_StudyResultView):
+    """Vol-normalized shock continuation study: after a big vol-relative day, continue or reverse?
+    Continuation matrix + slices (cap/volume/regime/sector) + exit-ladder backtest of vol_shock_*."""
+    kind = "vol_shock_study"
+    script = "vol_shock_study.py"
+    json_path = "/app/.data/studies/vol_shock_study.json"
