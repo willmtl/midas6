@@ -81,21 +81,64 @@ class StudyListView(APIView):
     def get(self, request):
         """Serve studies from database. Cursor-paginated when ?paginate=1 (or ?cursor=...) is sent —
         the infinite-scroll frontend opts in; legacy callers get the full list unchanged."""
-        from django.db.models import Max
+        from django.db.models import Max, Q
         qs = Study.objects.filter(is_computed=True)
         last = qs.aggregate(m=Max("computed_at"))["m"]
         last_iso = last.isoformat() if last else None
-        if request.query_params.get("cursor") is not None or request.query_params.get("paginate") == "1":
-            from api.pagination import DashboardCursorPagination, resolve_ordering
-            STUDY_ORDER = {"avg_return": "avg_return", "win_rate": "win_rate",
-                           "trades": "total_trades", "total_trades": "total_trades",
-                           "avg_hold": "avg_hold", "avg_mae": "avg_mae", "clean_pct": "clean_pct",
-                           "peak_avg": "peak_avg", "ret_90d": "ret_90d"}
-            ordering = resolve_ordering(request, STUDY_ORDER, "avg_return")
-            paginator = DashboardCursorPagination()
-            page = paginator.paginate(qs, request, ordering=ordering, last_updated=last_iso,
-                                      extra={"total_studies": qs.count()})
-            return paginator.get_paginated_response(StudySerializer(page, many=True).data)
+        if request.query_params.get("paginate") == "1" or request.query_params.get("offset") is not None:
+            from django.db.models import F, FloatField
+            from api.pagination import resolve_ordering, paginate_offset, paged_response
+            qp = request.query_params
+            # Server-side filters so the paginated query mirrors the old client-side filter UX
+            # (search / category / signal / exit / regime). Applied BEFORE the slice so paging walks
+            # the filtered set.
+            search = (qp.get("search") or "").strip()
+            if search:
+                qs = qs.filter(Q(signal_name__icontains=search) | Q(name__icontains=search)
+                               | Q(exit_name__icontains=search))
+            if qp.get("category") and qp.get("category") != "all":
+                qs = qs.filter(category=qp.get("category"))
+            if qp.get("signal"):
+                qs = qs.filter(signal_key=qp.get("signal"))
+            if qp.get("exit"):
+                qs = qs.filter(exit_key=qp.get("exit"))
+            # Every sortable column in the table maps to a DB field; offset paging orders by any of
+            # them (NULLS LAST), so nullable metrics like t_stat/avg_mae/clean_pct are fine.
+            STUDY_ORDER = {"id": "id", "name": "name", "category": "category", "exit_name": "exit_name",
+                           "total_trades": "total_trades", "trades": "total_trades", "t_stat": "t_stat",
+                           "avg_return": "avg_return", "win_rate": "win_rate", "avg_hold": "avg_hold",
+                           "avg_mae": "avg_mae", "clean_pct": "clean_pct", "peak_day": "peak_day",
+                           "peak_avg": "peak_avg", "ret_90d": "ret_90d",
+                           "best_peak_ret": "best_peak_ret", "best_ret_90d": "best_ret_90d"}
+            REGIME_FIELDS = {"by_regime", "by_curve", "by_vix", "by_spy_trend", "by_season"}
+            regime = qp.get("regime")
+            ordering = None
+            if regime and ":" in regime:
+                rtype, rkey = regime.split(":", 1)
+                if rtype in REGIME_FIELDS and rkey:
+                    # Keep only studies carrying that bucket, then sort by its nested numeric stat.
+                    qs = qs.filter(**{f"{rtype}__{rkey}__isnull": False})
+                    order_key = qp.get("ordering", "avg_return")
+                    leaf = {"avg_return": "avg_return", "win_rate": "win_rate",
+                            "trades": "trades", "total_trades": "trades"}.get(order_key)
+                    if leaf:
+                        from django.db.models.functions import Cast
+                        from django.db.models.fields.json import KeyTransform, KeyTextTransform
+                        val = Cast(KeyTextTransform(leaf, KeyTransform(rkey, rtype)), FloatField())
+                        qs = qs.annotate(_regime_sort=val)
+                        asc = qp.get("dir", "desc") == "asc"
+                        ordering = [F("_regime_sort").asc(nulls_last=True) if asc
+                                    else F("_regime_sort").desc(nulls_last=True),
+                                    F("id").asc() if asc else F("id").desc()]
+            if ordering is None:
+                ordering = resolve_ordering(request, STUDY_ORDER, "avg_return")
+            # Unfiltered category list so the filter buttons stay complete without all rows loaded.
+            categories = sorted(c for c in Study.objects.filter(is_computed=True).order_by()
+                                .values_list("category", flat=True).distinct() if c)
+            page, next_offset, total = paginate_offset(request, qs, ordering)
+            return paged_response(StudySerializer(page, many=True).data, next_offset, total,
+                                  last_updated=last_iso,
+                                  extra={"total_studies": total, "categories": categories})
         data = StudySerializer(qs, many=True).data
         return Response({"total_studies": len(data), "studies": data, "last_updated": last_iso})
 
@@ -485,9 +528,14 @@ class TrendStudyListView(APIView):
         mode = request.GET.get("mode")
         if mode:
             studies = studies.filter(hold_mode=mode)
-        data = []
-        for s in studies:
-            data.append({
+        # .order_by() clears the model's default ordering, else it pollutes DISTINCT.
+        modes = sorted(TrendStudy.objects.order_by().values_list("hold_mode", flat=True).distinct())
+        from django.db.models import Max
+        last = TrendStudy.objects.aggregate(m=Max('computed_at'))['m']
+        last_iso = last.isoformat() if last else None
+
+        def _row(s):
+            return {
                 "id": s.id,
                 "lookback_months": s.lookback_months,
                 "hold_months": s.hold_months,
@@ -502,13 +550,23 @@ class TrendStudyListView(APIView):
                 "win_rate": s.win_rate,
                 "t_stat": s.t_stat,
                 "robust": bool(s.num_trades >= 12 and s.t_stat is not None and abs(s.t_stat) >= 2),
-            })
-        # .order_by() clears the model's default ordering, else it pollutes DISTINCT.
-        modes = sorted(TrendStudy.objects.order_by().values_list("hold_mode", flat=True).distinct())
-        from django.db.models import Max
-        last = TrendStudy.objects.aggregate(m=Max('computed_at'))['m']
+            }
+
+        if request.query_params.get("paginate") == "1" or request.query_params.get("offset") is not None:
+            from api.pagination import resolve_ordering, paginate_offset, paged_response
+            TREND_ORDER = {"total_return": "total_return", "annual_return": "annual_return",
+                           "vs_spy": "alpha", "alpha": "alpha", "max_drawdown": "max_drawdown",
+                           "num_trades": "num_trades", "periods": "num_trades",
+                           "win_rate": "win_rate", "t_stat": "t_stat", "sharpe": "t_stat",
+                           "hold_months": "hold_months", "lookback_months": "lookback_months"}
+            ordering = resolve_ordering(request, TREND_ORDER, "total_return")
+            page, next_offset, total = paginate_offset(request, studies, ordering)
+            return paged_response([_row(s) for s in page], next_offset, total,
+                                  last_updated=last_iso, extra={"total": total, "modes": modes})
+
+        data = [_row(s) for s in studies]
         return Response({"total": len(data), "strategies": data, "modes": modes,
-                         "last_updated": last.isoformat() if last else None})
+                         "last_updated": last_iso})
 
 
 class TrendStudyDetailView(APIView):
@@ -608,6 +666,7 @@ class StockStudiesView(APIView):
         category = p.get("category")
         signal = p.get("signal")
         exit_key = p.get("exit")
+        search = (p.get("search") or "").strip()
         try:
             min_trades = int(p.get("min_trades")) if p.get("min_trades") else None
         except ValueError:
@@ -643,26 +702,14 @@ class StockStudiesView(APIView):
                 fq = fq.filter(exit_key=exit_key)
             if min_trades:
                 fq = fq.filter(total_trades__gte=min_trades)
+            if search:
+                from django.db.models import Q as _Q
+                fq = fq.filter(_Q(signal_name__icontains=search) | _Q(exit_name__icontains=search))
             computed_at = meta["computed_at"] if meta else None
             _last_iso = computed_at.isoformat() if computed_at else None
-            # Opt-in cursor pagination (infinite-scroll frontend); legacy full list otherwise.
-            if request.query_params.get("cursor") is not None or request.query_params.get("paginate") == "1":
-                from api.pagination import DashboardCursorPagination, resolve_ordering
-                STOCK_ORDER = {"avg_return": "avg_return", "win_rate": "win_rate",
-                               "trades": "total_trades", "avg_hold": "avg_hold",
-                               "avg_mae": "avg_mae", "clean_pct": "clean_pct"}
-                ordering = resolve_ordering(request, STOCK_ORDER, "avg_return")
-                vq = fq.values(
-                    "id", "signal_key", "signal_name", "exit_key", "exit_name", "category",
-                    "total_trades", "eff_trades", "t_stat",
-                    "avg_return", "win_rate", "avg_hold", "avg_mae", "clean_pct", "by_dimension")
-                paginator = DashboardCursorPagination()
-                page = paginator.paginate(vq, request, ordering=ordering, last_updated=_last_iso, extra={
-                    "computed": True, "source": "db",
-                    "universe_size": meta["universe_size"] if meta else None,
-                    "n_results": n_results, "categories": categories,
-                    "computed_at": _last_iso, "dimension_meta": dimension_meta})
-                page_rows = [{
+
+            def _shape(r):
+                return {
                     "signal_key": r["signal_key"], "signal_name": r["signal_name"],
                     "exit_key": r["exit_key"], "exit_name": r["exit_name"],
                     "category": r["category"], "trades": r["total_trades"],
@@ -670,8 +717,26 @@ class StockStudiesView(APIView):
                     "avg_return": r["avg_return"], "win_rate": r["win_rate"],
                     "avg_hold": r["avg_hold"], "avg_mae": r["avg_mae"], "clean_pct": r["clean_pct"],
                     "by_dimension": r["by_dimension"] or {},
-                } for r in page]
-                return paginator.get_paginated_response(page_rows)
+                }
+            _STOCK_VALS = ("id", "signal_key", "signal_name", "exit_key", "exit_name", "category",
+                           "total_trades", "eff_trades", "t_stat", "avg_return", "win_rate",
+                           "avg_hold", "avg_mae", "clean_pct", "by_dimension")
+            # Opt-in offset pagination (infinite-scroll frontend); legacy full list otherwise.
+            if request.query_params.get("paginate") == "1" or request.query_params.get("offset") is not None:
+                from api.pagination import resolve_ordering, paginate_offset, paged_response
+                STOCK_ORDER = {"signal_name": "signal_name", "exit_name": "exit_name",
+                               "category": "category", "avg_return": "avg_return",
+                               "win_rate": "win_rate", "trades": "total_trades",
+                               "t_stat": "t_stat", "avg_hold": "avg_hold",
+                               "avg_mae": "avg_mae", "clean_pct": "clean_pct"}
+                ordering = resolve_ordering(request, STOCK_ORDER, "avg_return")
+                page, next_offset, total = paginate_offset(request, fq.values(*_STOCK_VALS), ordering)
+                return paged_response([_shape(r) for r in page], next_offset, total,
+                                      last_updated=_last_iso, extra={
+                    "computed": True, "source": "db",
+                    "universe_size": meta["universe_size"] if meta else None,
+                    "n_results": n_results, "categories": categories,
+                    "computed_at": _last_iso, "dimension_meta": dimension_meta})
             # .values() → dicts, skips model instantiation for the (up to `limit`) rows.
             rows = fq.order_by("-avg_return").values(
                 "signal_key", "signal_name", "exit_key", "exit_name", "category",
@@ -784,19 +849,21 @@ class LiveSignalsView(APIView):
                  "hist_avg_mae", "hist_clean_pct",
                  "market_cap", "pe_ratio", "forward_pe", "profit_margin", "fund_buckets", "sectors",
                  "insider_buy_90d", "recent_13d", "recent_13g")
-        # Opt-in cursor pagination (infinite-scroll frontend); legacy full list otherwise.
-        if request.query_params.get("cursor") is not None or request.query_params.get("paginate") == "1":
-            from api.pagination import DashboardCursorPagination, resolve_ordering
-            LIVE_ORDER = {"days_ago": "days_ago", "hist_avg_return": "hist_avg_return",
-                          "hist_win_rate": "hist_win_rate", "hist_trades": "hist_trades"}
+        # Opt-in offset pagination (infinite-scroll frontend); legacy full list otherwise.
+        if request.query_params.get("paginate") == "1" or request.query_params.get("offset") is not None:
+            from api.pagination import resolve_ordering, paginate_offset, paged_response
+            LIVE_ORDER = {"ticker": "ticker", "signal_name": "signal_name", "days_ago": "days_ago",
+                          "last_close": "last_close", "hist_avg_return": "hist_avg_return",
+                          "hist_win_rate": "hist_win_rate", "hist_trades": "hist_trades",
+                          "hist_avg_mae": "hist_avg_mae", "hist_clean_pct": "hist_clean_pct",
+                          "market_cap": "market_cap", "pe_ratio": "pe_ratio",
+                          "forward_pe": "forward_pe", "profit_margin": "profit_margin"}
             ordering = resolve_ordering(request, LIVE_ORDER, "days_ago", default_dir="asc")
-            vq = qs.values("id", *_VALS)
-            paginator = DashboardCursorPagination()
-            page = paginator.paginate(vq, request, ordering=ordering, last_updated=_last_iso,
-                                      extra={"computed": True, "n_firing": n_total, "signals": signals,
-                                             "computed_at": _last_iso})
+            page, next_offset, total = paginate_offset(request, qs.values("id", *_VALS), ordering)
             clean = [{k: _finite(v) for k, v in r.items() if k != "id"} for r in page]
-            return paginator.get_paginated_response(clean)
+            return paged_response(clean, next_offset, total, last_updated=_last_iso,
+                                  extra={"computed": True, "n_firing": n_total, "signals": signals,
+                                         "computed_at": _last_iso})
         rows = qs.order_by("days_ago", "-hist_avg_return").values(*_VALS)[:limit]
         clean = [{k: _finite(v) for k, v in r.items()} for r in rows]
         return Response({

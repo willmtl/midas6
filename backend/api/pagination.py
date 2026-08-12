@@ -1,57 +1,62 @@
-"""Cursor (keyset) pagination for the dashboard list endpoints — powers infinite scroll.
+"""Limit/offset pagination for the dashboard list endpoints — powers infinite scroll.
 
-Why cursor, not offset: the study tables are large (StockStudy ~23k rows) and append/recompute
-while being read; offset pagination skips/duplicates rows when the underlying set shifts. Cursor
-pagination keys off the ordering value itself, so scrolling stays stable during a recompute.
+Why offset, not cursor: these tables are sorted by a user-chosen column, and many of those columns are
+nullable (t_stat, avg_mae, clean_pct, peak_avg, ret_90d, …). Cursor/keyset pagination needs a non-null,
+near-unique ordering key, so it cannot back arbitrary-column sort — the very thing the sortable-column
+UX requires. Offset pagination orders by any column (NULLS LAST) at any depth; the tables are small
+enough (<=~26k rows) that even a deep offset stays fast. Each view passes an ORDERING whitelist so a
+client can't order by an un-indexed / arbitrary field.
 
-Trade-off with the client-side sortable tables: a cursor page only holds ~50 rows, so sorting can
-no longer happen fully client-side. Instead the frontend sends ?ordering=<col> and we re-issue the
-query server-side from a fresh cursor. Each view exposes a small whitelist of sortable columns
-(ORDERING maps a public column name -> a concrete DB field) so a client can't order by an arbitrary
-or nullable field (CursorPagination requires a non-null, total-ish ordering key).
+Response envelope (what the frontend `usePagedList` hook consumes):
+    {results: [...], next_offset: <int|null>, total: <int>, last_updated: <iso|null>, ...extra}
+`next_offset` is the offset to request for the following page, or null at the end.
 """
-from rest_framework.pagination import CursorPagination
+from django.db.models import F
 from rest_framework.response import Response
 
-
-class DashboardCursorPagination(CursorPagination):
-    page_size = 50
-    page_size_query_param = "page_size"
-    max_page_size = 200
-    # default ordering; each view passes its own via paginate(...)
-    ordering = "-id"
-
-    def paginate(self, queryset, request, *, ordering, last_updated=None, extra=None):
-        """Paginate `queryset` ordered by `ordering` (str or tuple of DB fields, '-' = desc).
-        Stashes `last_updated` (ISO str or None) and any `extra` top-level keys to merge into the
-        response envelope. Returns the page (list of rows) — call get_paginated_response(page)."""
-        self.ordering = ordering
-        self._last_updated = last_updated
-        self._extra = extra or {}
-        return self.paginate_queryset(queryset, request, view=None)
-
-    def get_paginated_response(self, data):
-        payload = {
-            "results": data,
-            "next": self.get_next_link(),      # opaque cursor URL, or None at the end
-            "previous": self.get_previous_link(),
-            "last_updated": self._last_updated,
-        }
-        payload.update(self._extra)
-        return Response(payload)
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
 
 
 def resolve_ordering(request, whitelist, default, default_dir="desc"):
-    """Map ?ordering=<key>[&dir=asc|desc] to a concrete DB ordering tuple.
-    `whitelist` maps public column key -> DB field name (no leading '-'). Falls back to `default`
-    (a DB field name) with `default_dir` when the key isn't whitelisted / absent. Always appends
-    'id' as a unique tiebreaker so the cursor is a total order even when the metric has ties."""
+    """Map ?ordering=<key>[&dir=asc|desc] to a list of order_by args (NULLS LAST) with an `id`
+    tiebreaker so the slice is a total order even when the sort column has ties.
+    `whitelist` maps a public column key -> a concrete DB field name (no leading '-')."""
     key = request.query_params.get("ordering")
     field = whitelist.get(key)
     if field is None:
         field, direction = default, default_dir
     else:
         direction = request.query_params.get("dir", "desc")
-    prefix = "-" if direction != "asc" else ""
-    tie = "id" if direction == "asc" else "-id"
-    return (f"{prefix}{field}", tie)
+    asc = direction == "asc"
+    primary = F(field).asc(nulls_last=True) if asc else F(field).desc(nulls_last=True)
+    tie = F("id").asc() if asc else F("id").desc()
+    return [primary, tie]
+
+
+def _read_int(request, name, default):
+    try:
+        return int(request.query_params.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def paginate_offset(request, queryset, ordering):
+    """Order `queryset` by `ordering` (a list of order_by args) and slice by ?offset=&page_size=.
+    Returns (page, next_offset, total): `page` is a list (of model instances or .values() dicts,
+    matching the queryset), `next_offset` is the offset for the next page or None at the end."""
+    limit = max(1, min(_read_int(request, "page_size", DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE))
+    offset = max(0, _read_int(request, "offset", 0))
+    total = queryset.count()
+    page = list(queryset.order_by(*ordering)[offset:offset + limit])
+    next_offset = offset + limit if (offset + limit) < total else None
+    return page, next_offset, total
+
+
+def paged_response(rows, next_offset, total, *, last_updated=None, extra=None):
+    """Build the standard infinite-scroll envelope."""
+    payload = {"results": rows, "next_offset": next_offset, "total": total,
+               "last_updated": last_updated}
+    if extra:
+        payload.update(extra)
+    return Response(payload)
