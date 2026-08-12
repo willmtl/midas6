@@ -121,6 +121,14 @@ function SortTh({ label, colKey, sort, className, title, align, style, children 
   );
 }
 
+// Small shared "Updated: <timestamp>" chip. Renders nothing for a missing/invalid value.
+function LastUpdatedChip({ value }) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return null;
+  return <span className="last-updated-chip">Updated: {d.toLocaleString()}</span>;
+}
+
 // Site-wide plain-English glossary. Wrap any jargon in <Term k="cagr">CAGR</Term> to get a hover ?.
 const GLOSSARY = {
   cagr: ['CAGR', 'Compound Annual Growth Rate — the smoothed yearly % an investment would need to grow at to go from start value to end value over the period. Strips out the lumpiness of individual years.'],
@@ -1336,7 +1344,7 @@ function StudiesPage() {
   return (
     <div className="studies-page">
       <h1>Indicator Studies <span className="dim">({filtered.length}{filtered.length !== data.studies.length ? ` / ${data.studies.length}` : ''})</span>
-        {(data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+        <LastUpdatedChip value={data.last_updated || data.computed_at} />
       </h1>
       <p className="subtitle">{profitable} profitable / {data.studies.length} total across all sector ETFs (5y daily backtest).</p>
 
@@ -1654,7 +1662,8 @@ function StockDrilldownPage() {
 
   return (
     <div className="studies-page">
-      <h1>Stock Drilldown <span className="dim">({data.total})</span></h1>
+      <h1>Stock Drilldown <span className="dim">({data.total})</span>
+        <LastUpdatedChip value={data.last_updated} /></h1>
       <p className="subtitle">Top 10% indicator studies: buy highest-beta stock in sector instead of ETF. {beating}/{data.total} beat the ETF.</p>
 
       <BacktestPanel
@@ -1849,7 +1858,7 @@ function TrendStudiesPage() {
   return (
     <div className="studies-page">
       <h1>Trend Studies <span className="dim">({sorted.length})</span>
-        {(data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+        <LastUpdatedChip value={data.last_updated || data.computed_at} />
       </h1>
       <p className="subtitle">Sector momentum rotation backtests. Buy top N sectors by trailing return, hold, rebalance. 5Y backtest excluding crypto. <b>Hold mode</b> = what you buy in each winning sector: the ETF, its top-momentum stock, or its highest-beta stock (both stock picks point-in-time).</p>
 
@@ -1941,7 +1950,7 @@ function TradeJournalPage() {
 
   return (
     <div className="studies-page">
-      <h1>Trade Journal</h1>
+      <h1>Trade Journal <LastUpdatedChip value={entries[0]?.date} /></h1>
       <p className="subtitle">Log your trades and track performance.</p>
 
       <BacktestPanel
@@ -2446,7 +2455,7 @@ function StockStudiesPage() {
   return (
     <div className="studies-page">
       <h1>Stock Indicator Studies <span className="dim">({rows.length} / {data.n_results})</span>
-        {(data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+        <LastUpdatedChip value={data.last_updated || data.computed_at} />
       </h1>
       <p className="subtitle">
         {data.n_signals} signals × {data.n_exits} exits over {data.universe_size} stocks (5y daily).
@@ -2681,7 +2690,7 @@ function FiringNowPage() {
   return (
     <div className="studies-page">
       <h1>Firing Now <span className="dim">({rows.length} shown / {data.n_firing})</span>
-        {(data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+        <LastUpdatedChip value={data.last_updated || data.computed_at} />
       </h1>
       <p className="subtitle">
         Stocks triggering a top signal within the last {maxDays} bars, with the signal's historical edge + fundamentals.
@@ -2804,7 +2813,8 @@ function NewsHorizonPage() {
 
   return (
     <div className="studies-page">
-      <h1>News Horizon <span className="dim">({rows.length} shown / {data.n_total}, {data.n_fade} fade)</span></h1>
+      <h1>News Horizon <span className="dim">({rows.length} shown / {data.n_total}, {data.n_fade} fade)</span>
+        <LastUpdatedChip value={data.computed_at} /></h1>
       <p className="subtitle">
         Each recent material headline read at the horizon that matters for its <b>type</b> (M&amp;A→day, analyst→week,
         product→1mo, earnings/guidance→3mo). The one durable edge in our data: <b>good news fades, hardest in mid/small caps.</b>{' '}
@@ -2944,7 +2954,7 @@ function NewsEffectPage() {
   return (
     <div className="studies-page">
       <h1>News Effect {data && <span className="dim">({rows.length} shown / {data.n_total} match, {data.n_effect} moved)</span>}
-        {data && (data.last_updated || data.computed_at) && <span className="last-updated-chip">Updated: {new Date(data.last_updated || data.computed_at).toLocaleString()}</span>}
+        <LastUpdatedChip value={data && (data.last_updated || data.computed_at)} />
       </h1>
       <p className="subtitle">
         Real news events — <b>headlines that actually moved the stock</b>. <b>Day move</b> = β-adjusted abnormal return over the
@@ -3210,7 +3220,8 @@ function NewsClusterPage() {
 
   return (
     <div className="studies-page">
-      <h1><Term k="cluster">News clusters</Term>{data && <span className="dim"> ({rows.length} shown / {data.n_total}, {data.n_faded} faded)</span>}</h1>
+      <h1><Term k="cluster">News clusters</Term>{data && <span className="dim"> ({rows.length} shown / {data.n_total}, {data.n_faded} faded)</span>}
+        <LastUpdatedChip value={data?.last_updated} /></h1>
       <p className="subtitle">
         Bursts of headlines on one ticker inside a short window — the footprint of a promotion / <b>“propping”</b> campaign.
         A high <Term k="propscore">prop score</Term> (lots of items, one-sided bullish, heavy PR/opinion “junk”, with an up push)
@@ -3558,7 +3569,8 @@ function AdDivergencePage() {
 
   const intro = (
     <>
-      <h1>A/D Divergence <span className="dim">{data.computed ? `(${data.n_primed} primed · ${data.n_watch} watch)` : ''}</span></h1>
+      <h1>A/D Divergence <span className="dim">{data.computed ? `(${data.n_primed} primed · ${data.n_watch} watch)` : ''}</span>
+        <LastUpdatedChip value={data.computed_at} /></h1>
       <p className="subtitle">
         Stocks whose Accumulation/Distribution line is in <b>accum divergence</b> right now — price flat/down while the ADL keeps rising (read as slope + divergence vs price, never sign). The study found this slice roughly <b>triples the edge</b> on price-capitulation signals, so a stock is <b>primed</b> when it's <i>also</i> firing a capitulation signal (new 52-wk low / RSI&lt;20).
         {data.computed_at && <span className="dim"> · scanned {new Date(data.computed_at).toLocaleString()}</span>}
@@ -3715,7 +3727,8 @@ function IntersectionPage() {
   if (!meta) return <div className="loading">Loading…</div>;
   return (
     <div className="studies-page">
-      <h1>Dimension Intersection <span className="dim">— do amplifiers stack?</span></h1>
+      <h1>Dimension Intersection <span className="dim">— do amplifiers stack?</span>
+        <LastUpdatedChip value={result?.computed_at || result?.last_updated} /></h1>
       <p className="subtitle">Pick a signal + up to 3 point-in-time dimensions; see which <b>combinations</b> beat the signal's baseline (vs. the one-at-a-time slices in Stock Indicator Studies). Runs on demand (~1 min).</p>
       <div className="studies-controls">
         <div className="filters">
@@ -3804,7 +3817,8 @@ function PlaybookPage() {
 
   return (
     <div className="studies-page">
-      <h1>▶ The Playbook <span className="dim" style={{ fontSize: 13 }}>— buy deep capitulations that smart money is accumulating, in sectors rotating in, ride winners with a trailing stop</span></h1>
+      <h1>▶ The Playbook <span className="dim" style={{ fontSize: 13 }}>— buy deep capitulations that smart money is accumulating, in sectors rotating in, ride winners with a trailing stop</span>
+        <LastUpdatedChip value={d.computed_at} /></h1>
       <p className="subtitle">
         {d.computed ? <>
           <b className={d.spy_riskoff ? 'bad' : 'good'}>Market: {d.market_regime}</b>{d.vix_regime && <span> · <b className={d.vix_regime === 'spiking' ? 'good' : d.vix_regime === 'calm' ? 'dim' : ''}>VIX {d.vix_level} ({d.vix_regime})</b>{d.vix_regime === 'calm' && <span className="dim"> — distress signals here are idiosyncratic knives, downgrade Mode A</span>}{d.vix_regime === 'spiking' && <span className="good"> — golden window to buy distress</span>}</span>} · {d.n_in} IN · {d.n_leader || 0} leader · {d.n_turning} turning · {d.n_commodity || 0} commodity themes · {d.n_a} Mode-A + {d.n_b} Mode-B candidates
@@ -4298,7 +4312,7 @@ function BacktestLabPage() {
   return (
     <div className="studies-page">
       <h1>Backtest Lab <span className="dim" style={{ fontSize: 13 }}>— rules, robustness &amp; portfolio vs SPY</span>
-        {updated && <span className="last-updated-chip">Updated: {new Date(updated).toLocaleString()}</span>}
+        <LastUpdatedChip value={updated} />
       </h1>
       <p className="subtitle">
         Three phases: (1) rank the rotation <b>rules</b>, (2) check each <b>signal</b> in- vs out-of-sample, (3) a combined <b>portfolio</b> — all against SPY buy-hold.
@@ -4511,7 +4525,8 @@ function ResearchPage() {
 
   return (
     <div className="studies-page">
-      <h1>Research / Lab <span className="dim" style={{ fontSize: 13 }}>— every strategy comparison we ran, cached & re-runnable</span></h1>
+      <h1>Research / Lab <span className="dim" style={{ fontSize: 13 }}>— every strategy comparison we ran, cached & re-runnable</span>
+        <LastUpdatedChip value={d.computed_at} /></h1>
       <p className="subtitle">
         {d.computed ? `${d.n_daily} daily · ${d.n_weekly} weekly · ${d.n_mix} mix entries · computed ${new Date(d.computed_at).toLocaleString()}` : (d.message || 'Not computed yet.')}
         <button className="refresh-btn" style={{ marginLeft: 10 }} onClick={run} disabled={running}>{running ? 'Running (few min)…' : 'Re-run all'}</button>
@@ -4691,7 +4706,8 @@ function NewsEventStudyPage() {
 
   return (
     <div className="studies-page">
-      <h1>News Event Study <span className="dim">({data.n_events} events / {data.n_tickers} tickers)</span></h1>
+      <h1>News Event Study <span className="dim">({data.n_events} events / {data.n_tickers} tickers)</span>
+        <LastUpdatedChip value={data.computed_at} /></h1>
       <p className="subtitle">
         Market-adjusted news reaction, keyed on <b>our model's read</b> (direction/impact), not EODHD sentiment.
         <b> AR = stock return − β·SPY</b> (news effect, market stripped). <b>AR d0</b> = event-day reaction;
@@ -4792,7 +4808,8 @@ function IvCalibrationPage() {
 
   return (
     <div className="studies-page">
-      <h1>IV Calibration <span className="dim">({a.n_days ? a.n_days.toLocaleString() : 0} stock-days / {data.n_tickers} tickers)</span></h1>
+      <h1>IV Calibration <span className="dim">({a.n_days ? a.n_days.toLocaleString() : 0} stock-days / {data.n_tickers} tickers)</span>
+        <LastUpdatedChip value={data.computed_at} /></h1>
       <p className="subtitle">
         Is ATM implied vol a good predictor of the next-day move? Ratio = <b>actual move ÷ IV-implied 1σ daily move</b> (atm_iv/√252).
         A calibrated normal has median ~0.67 and clears 1σ ~32% of days.
@@ -4994,7 +5011,7 @@ function AltDataPage() {
       <div className="altdata-card">
         <div className="altdata-card-head">
           <h2>Congressional Trades</h2>
-          {updated(congress) && <span className="last-updated-chip">Updated: {new Date(updated(congress)).toLocaleString()}</span>}
+          <LastUpdatedChip value={updated(congress)} />
         </div>
         {cErr && <ErrorBanner message={cErr} onRetry={() => { setCErr(null); loadCongress(); }} onDismiss={() => setCErr(null)} />}
         {!congress && !cErr && <div className="loading">Loading congressional-trade study...</div>}
@@ -5092,7 +5109,7 @@ function AltDataPage() {
       <div className="altdata-card">
         <div className="altdata-card-head">
           <h2>Delisted Survivorship Audit</h2>
-          {updated(delisted) && <span className="last-updated-chip">Updated: {new Date(updated(delisted)).toLocaleString()}</span>}
+          <LastUpdatedChip value={updated(delisted)} />
         </div>
         {dErr && <ErrorBanner message={dErr} onRetry={() => { setDErr(null); loadDelisted(); }} onDismiss={() => setDErr(null)} />}
         {!delisted && !dErr && <div className="loading">Loading survivorship audit...</div>}
@@ -5391,7 +5408,7 @@ function DarkPoolPage() {
       <div className="darkpool-card">
         <div className="darkpool-card-head">
           <h2>Historical dark-pool backtest — equity curve vs SPY</h2>
-          {bt && (bt.last_updated || bt.computed_at) && <span className="last-updated-chip">Updated: {new Date(bt.last_updated || bt.computed_at).toLocaleString()}</span>}
+          <LastUpdatedChip value={bt && (bt.last_updated || bt.computed_at)} />
         </div>
         {bt && bt.computed === false && (
           <p className="subtitle darkpool-muted">{bt.note || 'Dark-pool backtest not computed yet — check back after the nightly sweep.'}</p>
@@ -5497,7 +5514,8 @@ function FundamentalsPage() {
 
   return (
     <div className="studies-page">
-      <h1>Fundamentals <span className="dim">({data.total ?? rows.length})</span></h1>
+      <h1>Fundamentals <span className="dim">({data.total ?? rows.length})</span>
+        <LastUpdatedChip value={data.last_updated} /></h1>
       <p className="subtitle">Per-ticker fundamentals with EODHD analyst consensus. The "Analyst" column shows Strong-Buy·Buy·Hold·Sell·Strong-Sell counts and the mean rating (1–5, higher = more bullish); sortable by mean.</p>
       <input className="fund-search" placeholder="Filter by ticker or sector…" value={search} onChange={e => setSearch(e.target.value)} style={{ margin: '4px 0 10px', padding: '6px 10px', width: 260 }} />
       <table className="studies-table">
