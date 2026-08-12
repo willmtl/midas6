@@ -5521,10 +5521,49 @@ function DarkPoolPage() {
 // Vol-normalized shock study: is a day whose move is large relative to the stock's own
 // trailing volatility (z = return ÷ trailing-20d vol) followed by continuation or reversal?
 // Reads GET /vol-shock-study; POST kicks a background recompute (poll until computed).
+// One sortable backtest table for a single vol_shock signal (sig = { name, rows }).
+// Extracted so useSortedRows (a hook) isn't called inside VolShockPage's .map loop.
+function VolShockBacktestTable({ sig }) {
+  const sort = useSortedRows((sig && sig.rows) || [], 'avg_pct', 'desc');
+  const fmtN = (v) => (v == null ? '–' : Number(v).toLocaleString());
+  const sPct = (v) => (v == null ? '–' : `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%`);
+  const pctR = (v) => (v == null ? '–' : `${Number(v).toFixed(1)}%`);
+  const num2 = (v) => (v == null ? '–' : Number(v).toFixed(2));
+  const signCls = (v) => (v == null ? 'dim' : v > 0 ? 'good' : 'bad');
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <h4 style={{ margin: '6px 0' }}>{(sig && sig.name) || ''}</h4>
+      <table className="studies-table">
+        <thead><tr>
+          <SortTh label="exit" colKey="exit" sort={sort} align="left" />
+          <SortTh label="name" colKey="name" sort={sort} align="left" />
+          <SortTh label="trades" colKey="trades" sort={sort} align="right" />
+          <SortTh label="avg %" colKey="avg_pct" sort={sort} align="right" />
+          <SortTh label="win %" colKey="win_pct" sort={sort} align="right" />
+          <SortTh label="t" colKey="t" sort={sort} align="right" />
+        </tr></thead>
+        <tbody>
+          {sort.rows.map((r, i) => (
+            <tr key={i} className={i === 0 ? 'darkpool-base-row' : ''}>
+              <td style={{ fontWeight: i === 0 ? 700 : 600 }}>{r.exit}</td>
+              <td className="dim">{r.name}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{fmtN(r.trades)}</td>
+              <td style={{ textAlign: 'right' }} className={signCls(r.avg_pct)}>{sPct(r.avg_pct)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pctR(r.win_pct)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{num2(r.t)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function VolShockPage() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
   const [running, setRunning] = useState(false);
+  const [contMode, setContMode] = useState('all'); // 'all' | 'hivol' — Continuation card source toggle
 
   const load = () => { setErr(null); apiFetch('/vol-shock-study').then(setData).catch(e => setErr(e.message)); };
   useEffect(() => { load(); }, []);
@@ -5566,7 +5605,7 @@ function VolShockPage() {
 
   const params = data.params || {};
   const baseline = data.baseline || {};
-  const cont = data.continuation || {};
+  const cont = (contMode === 'hivol' ? data.continuation_hivol : data.continuation) || {};
   const slices = data.slices || {};
   const backtest = data.backtest || {};
 
@@ -5668,8 +5707,13 @@ function VolShockPage() {
       <div className="darkpool-card">
         <div className="darkpool-card-head">
           <h2>Continuation vs reversal</h2>
+          <div className="filters">
+            <button className={contMode === 'all' ? 'active' : ''} onClick={() => setContMode('all')}>All shocks</button>
+            <button className={contMode === 'hivol' ? 'active' : ''} onClick={() => setContMode('hivol')}>Volume-confirmed</button>
+          </div>
         </div>
         {baseLine && <p className="subtitle">Baseline drift: {baseLine}</p>}
+        {contMode === 'hivol' && <p className="subtitle darkpool-muted">Only shocks on &gt;1.5× average volume — fewer episodes, but the edge is far more reliable (higher t).</p>}
         <div className="darkpool-statgrid" style={{ display: 'block' }}>
           <div style={{ marginBottom: 12 }}>
             <h4 style={{ margin: '6px 0' }}>Good day (+σ) → keeps rising?</h4>
@@ -5703,37 +5747,9 @@ function VolShockPage() {
         <div className="darkpool-card-head">
           <h2>vol_shock signals × exit ladder (episode-deduped, no fees — directional)</h2>
         </div>
-        {btKeys.map(k => {
-          const b = backtest[k] || {};
-          const rows = b.rows || [];
-          return (
-            <div key={k} style={{ marginBottom: 12 }}>
-              <h4 style={{ margin: '6px 0' }}>{b.name || k}</h4>
-              <table className="studies-table">
-                <thead><tr>
-                  <th style={{ textAlign: 'left' }}>exit</th>
-                  <th style={{ textAlign: 'left' }}>name</th>
-                  <th style={{ textAlign: 'right' }}>trades</th>
-                  <th style={{ textAlign: 'right' }}>avg %</th>
-                  <th style={{ textAlign: 'right' }}>win %</th>
-                  <th style={{ textAlign: 'right' }}>t</th>
-                </tr></thead>
-                <tbody>
-                  {rows.map((r, i) => (
-                    <tr key={i} className={i === 0 ? 'darkpool-base-row' : ''}>
-                      <td style={{ fontWeight: i === 0 ? 700 : 600 }}>{r.exit}</td>
-                      <td className="dim">{r.name}</td>
-                      <td style={{ textAlign: 'right' }} className="dim">{fmtN(r.trades)}</td>
-                      <td style={{ textAlign: 'right' }} className={signCls(r.avg_pct)}>{sPct(r.avg_pct)}</td>
-                      <td style={{ textAlign: 'right' }} className="dim">{pctR(r.win_pct)}</td>
-                      <td style={{ textAlign: 'right' }} className="dim">{num2(r.t)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          );
-        })}
+        {btKeys.map(k => (
+          <VolShockBacktestTable key={k} sig={backtest[k]} />
+        ))}
       </div>
 
       {data.note && <p className="subtitle" style={{ marginTop: 8, fontStyle: 'italic' }}>{data.note}</p>}
