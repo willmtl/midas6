@@ -61,6 +61,9 @@ urlpatterns = [
     path("congress-backtest", views.CongressBacktestView.as_view(), name="congress-backtest"),
     # Vol-normalized shock continuation study (continuation matrix + slices + exit-ladder backtest)
     path("vol-shock-study", views.VolShockStudyView.as_view(), name="vol-shock-study"),
+    # News overreaction detector + reversion backtest (size-bucketed); intraday RSI crossover study
+    path("news-overreaction", views.NewsOverreactionView.as_view(), name="news-overreaction"),
+    path("rsi-intraday", views.RsiIntradayView.as_view(), name="rsi-intraday"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),

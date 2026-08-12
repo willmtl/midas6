@@ -1781,6 +1781,49 @@ class VolShockStudyView(_StudyResultView):
     json_path = "/app/.data/studies/vol_shock_study.json"
 
 
+class NewsOverreactionView(_StudyResultView):
+    """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
+    forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""
+    kind = "news_overreaction"
+    script = "news_overreaction.py"
+    json_path = "/app/.data/studies/news_overreaction.json"
+
+
+class RsiIntradayView(APIView):
+    """Intraday RSI(14) crossover backtest, bucketed by RSI level at the cross (edge only from
+    oversold). GET ?tf=4h|8h|12h reads BacktestResult[rsi_<tf>_backtest]; POST recomputes 4h (fetch)."""
+    def get(self, request):
+        from core.models import BacktestResult
+        tf = request.query_params.get("tf", "12h")
+        if tf not in ("4h", "8h", "12h"):
+            tf = "12h"
+        row = BacktestResult.objects.filter(kind=f"rsi_{tf}_backtest").first()
+        if not row:
+            return Response({"computed": False, "tf": tf,
+                             "message": "Not computed yet. POST to run the intraday fetch + backtest."})
+        data = dict(row.payload or {})
+        data["computed"] = True
+        data["tf"] = tf
+        data["last_updated"] = row.computed_at.isoformat()
+        data["available_tf"] = sorted(
+            k.replace("rsi_", "").replace("_backtest", "")
+            for k in BacktestResult.objects.filter(kind__startswith="rsi_")
+            .values_list("kind", flat=True))
+        return Response(data)
+
+    def post(self, request):
+        import threading, subprocess
+
+        def _run():
+            try:
+                subprocess.run(["python", "-u", "/app/rsi_4h_study.py", "--tf", "4h,8h,12h"],
+                               cwd="/app", timeout=3600)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+        return Response({"status": "rsi intraday recompute started"})
+
+
 def _burst_scan_bg():
     import subprocess
     try:
