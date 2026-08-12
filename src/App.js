@@ -129,6 +129,48 @@ function LastUpdatedChip({ value }) {
   return <span className="last-updated-chip">Updated: {d.toLocaleString()}</span>;
 }
 
+// Reusable inline "the edge lives in the tail" mini-bar strip. Renders one small equal-width
+// segment per bucket, left→right: a tiny label on top, a vertical bar whose HEIGHT ∝ |value|
+// (normalized to the strip's max |value|, min ~3px / max ~26px), colored green (value>0) /
+// red (value<0) / dim (~0 or null), and the value printed below. Skips null/absent buckets
+// gracefully (renders a dim placeholder so alignment holds). In-file use only.
+//   buckets: [{ label, value, n }]   unit: string appended in the tooltip (default '%')
+function TailStrip({ buckets, unit = '%' }) {
+  const list = Array.isArray(buckets) ? buckets : [];
+  const isNum = (v) => v != null && !isNaN(Number(v));
+  const vals = list.filter(b => b && isNum(b.value)).map(b => Math.abs(Number(b.value)));
+  if (!vals.length) return null;
+  const maxAbs = Math.max(...vals, 1e-9);
+  const MIN_H = 3, MAX_H = 26;
+  const fmt = (v) => `${v > 0 ? '+' : ''}${Number(v).toFixed(1)}`;
+  const colorOf = (v) => (!isNum(v) || Math.abs(Number(v)) < 1e-9) ? '#8a8f98' : (Number(v) > 0 ? '#2ec46b' : '#e0555f');
+  const segStyle = { flex: '1 1 0', minWidth: 34, textAlign: 'center' };
+  const labStyle = { fontSize: 9, color: '#9aa0a8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
+  const barBox = { height: MAX_H, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' };
+  return (
+    <div style={{ display: 'flex', gap: 4, alignItems: 'flex-end', margin: '4px 0' }}>
+      {list.map((b, i) => {
+        const has = b && isNum(b.value);
+        const v = has ? Number(b.value) : null;
+        const col = colorOf(v);
+        const h = has ? Math.max(MIN_H, Math.round((Math.abs(v) / maxAbs) * MAX_H)) : MIN_H;
+        return (
+          <div key={i} style={segStyle}
+               title={b ? `${b.label}: ${has ? v : '–'}${unit} (n=${b && b.n != null ? b.n : '–'})` : ''}>
+            <div style={labStyle}>{b ? b.label : ''}</div>
+            <div style={barBox}>
+              <div style={{ width: 10, height: h, borderRadius: 1, background: has ? col : '#555', opacity: has ? 1 : 0.4 }} />
+            </div>
+            <div style={{ fontSize: 10, fontFamily: 'ui-monospace, Menlo, monospace', fontWeight: 600, color: col }}>
+              {has ? fmt(v) : '–'}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ---- Server-side pagination + infinite scroll --------------------------------
 // usePagedList(path, params): fetches page 1 of `path?paginate=1&<params>` and appends further pages
 // (by offset) via loadMore(). Any change to `params` (ordering / dir / search / category / regime / …)
@@ -5199,6 +5241,7 @@ function NewsHub() {
         { key: 'newscl', label: 'Clusters', hash: '/news/clusters', match: ['clusters', 'newscl'], el: <NewsClusterPage /> },
         { key: 'newshz', label: 'News Horizon', hash: '/news/horizon', match: ['horizon', 'newshz'], el: <NewsHorizonPage /> },
         { key: 'newsev', label: 'Event Study', hash: '/news/eventstudy', match: ['eventstudy', 'newsev'], el: <NewsEventStudyPage /> },
+        { key: 'overreaction', label: 'Overreaction', hash: '/news/overreaction', match: ['overreaction'], el: <NewsOverreactionPage /> },
         { key: 'ivcal', label: 'IV Calibration', hash: '/news/ivcal', match: ['ivcal'], el: <IvCalibrationPage /> },
       ]} />
     </div>
@@ -5224,6 +5267,7 @@ function ResearchHub() {
         { key: 'backtest', label: 'Backtest', hash: '/research/backtest', match: ['backtest'], el: <BacktestPage /> },
         { key: 'lab', label: 'Research/Lab', hash: '/research/lab', match: ['lab'], el: <ResearchPage /> },
         { key: 'intersect', label: 'Intersections', hash: '/research/intersect', match: ['intersect'], el: <IntersectionPage /> },
+        { key: 'rsiintraday', label: 'RSI Intraday', hash: '/research/rsiintraday', match: ['rsiintraday'], el: <RsiIntradayPage /> },
       ]} />
     </div>
   );
@@ -5775,6 +5819,393 @@ function DarkPoolPage() {
 // Reads GET /vol-shock-study; POST kicks a background recompute (poll until computed).
 // One sortable backtest table for a single vol_shock signal (sig = { name, rows }).
 // Extracted so useSortedRows (a hook) isn't called inside VolShockPage's .map loop.
+// ── News Overreaction ────────────────────────────────────────────────────────
+// "A material news event whose β-adjusted move CONTRADICTS its sentiment tends to revert —
+// but only in a tail band." Leads with the crash-size TailStrip so the tail edge is the headline.
+function NewsOverreactionPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  // by-category rows built up-front so the sortable-hook is unconditional (data may be null early).
+  const rowAtH = (arr, H) => (Array.isArray(arr) ? arr.find(r => Number(r.H) === H) : null);
+  const catRows = React.useMemo(() => {
+    const bc = (data && data.deep_dive && data.deep_dive.by_category) || {};
+    return Object.keys(bc).map(k => {
+      const r5 = rowAtH(bc[k], 5), r20 = rowAtH(bc[k], 20);
+      return { category: k, mean5: r5 ? r5.mean : null, mean20: r20 ? r20.mean : null, n: (r5 && r5.n != null) ? r5.n : (r20 ? r20.n : null) };
+    });
+  }, [data]);
+  const catSort = useSortedRows(catRows, 'mean5', 'asc');
+
+  const load = () => { setErr(null); apiFetch('/news-overreaction').then(setData).catch(e => setErr(e.message)); };
+  useEffect(() => { load(); }, []);
+
+  const run = () => {
+    setRunning(true);
+    apiFetch('/news-overreaction', { method: 'POST' }).then(() => {
+      const t = setInterval(() => apiFetch('/news-overreaction').then(d => {
+        if (d && d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(e => { setErr(e.message); setRunning(false); });
+  };
+
+  const sPct = (v) => (v == null ? '–' : `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%`);
+  const pctR = (v) => (v == null ? '–' : `${Number(v).toFixed(1)}%`);
+  const fmtN = (v) => (v == null ? '–' : Number(v).toLocaleString());
+  const signCls = (v) => (v == null ? 'dim' : v > 0 ? 'good' : 'bad');
+
+  if (err) return (
+    <div className="darkpool-page">
+      <h1>News Overreaction</h1>
+      <ErrorBanner message={err} onRetry={load} onDismiss={() => setErr(null)} />
+    </div>
+  );
+  if (!data) return <div className="loading">Loading news-overreaction study...</div>;
+
+  if (!data.computed) {
+    return (
+      <div className="darkpool-page">
+        <h1>News Overreaction</h1>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.note || data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={run} disabled={running}>{running ? 'Running…' : 'Run detector'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const params = data.params || {};
+  const dsize = data.downside_by_size || {};
+  const deep = data.deep_dive || {};
+  const gp = deep.gap_profile || {};
+  const classes = data.classes || {};
+  const HZ = params.horizons || [1, 3, 5, 10, 20];
+
+  const DSIZE_ORDER = ['5-10%', '10-15%', '15-20%', '20-25%', '25%+'];
+  const dsizeStrip = (H) => DSIZE_ORDER.map(k => {
+    const r = rowAtH(dsize[k], H);
+    return { label: k, value: r ? r.mean : null, n: r ? r.n : null };
+  });
+
+  // Classes × horizons compact reversion table (mean colored by sign).
+  const classOrder = [
+    ['over_dn', 'Overreaction ↓ (good news, crashed)'],
+    ['conf_dn', 'Confirmation ↓ (bad news, fell)'],
+    ['over_up', 'Overreaction ↑ (bad news, popped)'],
+    ['baseline', 'Baseline (all events)'],
+  ].filter(([k]) => Array.isArray(classes[k]) && classes[k].length);
+
+  return (
+    <div className="darkpool-page">
+      <h1>News Overreaction <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle">{data.note || 'β-adjusted news-reaction reversion detector.'}</p>
+      <p className="subtitle darkpool-muted">
+        A material news event whose β-adjusted move <b>CONTRADICTS</b> its sentiment (good news that crashes / bad news
+        that pops) tends to revert — but only in a tail band.
+        {params.n_events != null ? ` ${fmtN(params.n_events)} events, threshold ${params.thr_pct != null ? params.thr_pct + '%' : '—'}.` : ''}
+      </p>
+
+      {/* ── LEAD: the tail ─────────────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Bounce by crash size (good news, 5d &amp; 10d)</h2>
+        </div>
+        <div style={{ display: 'flex', gap: 28, flexWrap: 'wrap' }}>
+          <div style={{ minWidth: 240 }}>
+            <div className="subtitle darkpool-muted" style={{ margin: '2px 0' }}>Forward mean at H=5</div>
+            <TailStrip buckets={dsizeStrip(5)} />
+          </div>
+          <div style={{ minWidth: 240 }}>
+            <div className="subtitle darkpool-muted" style={{ margin: '2px 0' }}>Forward mean at H=10</div>
+            <TailStrip buckets={dsizeStrip(10)} />
+          </div>
+        </div>
+        <p className="subtitle" style={{ marginTop: 10 }}>
+          The edge concentrates at <b>10-15%</b>; <b>20-25% inverts</b> (keeps falling). Bigger is <b>not</b> better here —
+          the bounce lives in a middle tail band, not at the extremes.
+        </p>
+      </div>
+
+      {/* ── Gap profile ────────────────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Gap profile — {deep.band || '10-25% down on good news'}</h2>
+        </div>
+        <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', margin: '4px 0 8px' }}>
+          {[
+            ['Opened gap-down >2%', gp.pct_gap_down != null ? pctR(gp.pct_gap_down) : '–'],
+            ['Avg overnight gap', sPct(gp.avg_overnight_gap)],
+            ['Avg intraday open→close', sPct(gp.avg_intraday_open_to_close)],
+            ['% recovered intraday', gp.pct_intraday_recovered != null ? pctR(gp.pct_intraday_recovered) : '–'],
+            ['n', fmtN(gp.n)],
+          ].map(([label, val]) => (
+            <div key={label} style={{ border: '1px solid #333', borderRadius: 8, padding: '10px 14px', minWidth: 120 }}>
+              <div className="dim" style={{ fontSize: 11 }}>{label}</div>
+              <div style={{ fontSize: 20, fontWeight: 600 }}>{val}</div>
+            </div>
+          ))}
+        </div>
+        <p className="subtitle darkpool-muted">These are overnight / premarket earnings gaps — the crash is mostly gapped in before the open.</p>
+      </div>
+
+      {/* ── By category ────────────────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>By category — {deep.band || 'deep-dive band'}</h2>
+        </div>
+        <table className="studies-table">
+          <thead><tr>
+            <SortTh label="category" colKey="category" sort={catSort} align="left" />
+            <SortTh label="5d mean" colKey="mean5" sort={catSort} align="right" />
+            <SortTh label="20d mean" colKey="mean20" sort={catSort} align="right" />
+            <SortTh label="n" colKey="n" sort={catSort} align="right" />
+          </tr></thead>
+          <tbody>
+            {catSort.rows.map((r, i) => (
+              <tr key={i}>
+                <td>{CAT_LABELS[r.category] || r.category}</td>
+                <td style={{ textAlign: 'right' }} className={signCls(r.mean5)}>{sPct(r.mean5)}</td>
+                <td style={{ textAlign: 'right' }} className={signCls(r.mean20)}>{sPct(r.mean20)}</td>
+                <td style={{ textAlign: 'right' }} className="dim">{fmtN(r.n)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* ── Classes × horizons ─────────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Forward reversion by class × horizon</h2>
+        </div>
+        <p className="subtitle darkpool-muted">Mean forward return (%) at each horizon. Overreaction classes are the reversion candidates.</p>
+        <div style={{ overflowX: 'auto' }}>
+          <table className="studies-table">
+            <thead><tr>
+              <th style={{ textAlign: 'left' }}>class</th>
+              {HZ.map(h => <th key={h} style={{ textAlign: 'right' }}>{h}d</th>)}
+              <th style={{ textAlign: 'right' }}>n</th>
+            </tr></thead>
+            <tbody>
+              {classOrder.map(([k, label]) => {
+                const arr = classes[k] || [];
+                const nRow = rowAtH(arr, HZ[0]) || arr[0] || {};
+                return (
+                  <tr key={k}>
+                    <td style={{ fontWeight: 600 }}>{label}</td>
+                    {HZ.map(h => {
+                      const r = rowAtH(arr, h);
+                      return <td key={h} style={{ textAlign: 'right' }} className={signCls(r ? r.mean : null)}>{r ? sPct(r.mean) : '–'}</td>;
+                    })}
+                    <td style={{ textAlign: 'right' }} className="dim">{fmtN(nRow.n)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {data.note && <p className="subtitle" style={{ marginTop: 8, fontStyle: 'italic' }}>{data.note}</p>}
+    </div>
+  );
+}
+
+// ── RSI Intraday crossover ────────────────────────────────────────────────────
+// RSI(14) crossing above its SMA(14) on an intraday timeframe. Averaged it's noise;
+// bucketed by how oversold the cross was, the edge appears — led by the RSI-level TailStrip.
+// Per-bucket sortable exit-ladder rendered by a child component (one useSortedRows per instance).
+function RsiBucketTable({ bucket, rows }) {
+  const sort = useSortedRows(rows || [], 'avg_pct', 'desc');
+  const [open, setOpen] = useState(false);
+  const fmtN = (v) => (v == null ? '–' : Number(v).toLocaleString());
+  const sPct = (v) => (v == null ? '–' : `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%`);
+  const pctR = (v) => (v == null ? '–' : `${Number(v).toFixed(1)}%`);
+  const num2 = (v) => (v == null ? '–' : Number(v).toFixed(2));
+  const signCls = (v) => (v == null ? 'dim' : v > 0 ? 'good' : 'bad');
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <button className="refresh-btn" style={{ marginBottom: 4 }} onClick={() => setOpen(o => !o)}>
+        {open ? '▾' : '▸'} RSI {bucket} <span className="dim">({(rows || []).length} exits)</span>
+      </button>
+      {open && (
+        <table className="studies-table">
+          <thead><tr>
+            <SortTh label="exit" colKey="exit" sort={sort} align="left" />
+            <SortTh label="name" colKey="name" sort={sort} align="left" />
+            <SortTh label="trades" colKey="trades" sort={sort} align="right" />
+            <SortTh label="avg %" colKey="avg_pct" sort={sort} align="right" />
+            <SortTh label="win %" colKey="win_pct" sort={sort} align="right" />
+            <SortTh label="t" colKey="t" sort={sort} align="right" />
+          </tr></thead>
+          <tbody>
+            {sort.rows.map((r, i) => (
+              <tr key={i}>
+                <td style={{ fontWeight: 600 }}>{r.exit}</td>
+                <td className="dim">{r.name}</td>
+                <td style={{ textAlign: 'right' }} className="dim">{fmtN(r.trades)}</td>
+                <td style={{ textAlign: 'right' }} className={signCls(r.avg_pct)}>{sPct(r.avg_pct)}</td>
+                <td style={{ textAlign: 'right' }} className="dim">{pctR(r.win_pct)}</td>
+                <td style={{ textAlign: 'right' }} className="dim">{num2(r.t)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+// Plain sortable exit-ladder (all crossovers / daily benchmark).
+function RsiLadderTable({ rows }) {
+  const sort = useSortedRows(rows || [], 'avg_pct', 'desc');
+  const fmtN = (v) => (v == null ? '–' : Number(v).toLocaleString());
+  const sPct = (v) => (v == null ? '–' : `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%`);
+  const pctR = (v) => (v == null ? '–' : `${Number(v).toFixed(1)}%`);
+  const num2 = (v) => (v == null ? '–' : Number(v).toFixed(2));
+  const signCls = (v) => (v == null ? 'dim' : v > 0 ? 'good' : 'bad');
+  return (
+    <table className="studies-table">
+      <thead><tr>
+        <SortTh label="exit" colKey="exit" sort={sort} align="left" />
+        <SortTh label="name" colKey="name" sort={sort} align="left" />
+        <SortTh label="trades" colKey="trades" sort={sort} align="right" />
+        <SortTh label="avg %" colKey="avg_pct" sort={sort} align="right" />
+        <SortTh label="win %" colKey="win_pct" sort={sort} align="right" />
+        <SortTh label="t" colKey="t" sort={sort} align="right" />
+      </tr></thead>
+      <tbody>
+        {sort.rows.map((r, i) => (
+          <tr key={i}>
+            <td style={{ fontWeight: 600 }}>{r.exit}</td>
+            <td className="dim">{r.name}</td>
+            <td style={{ textAlign: 'right' }} className="dim">{fmtN(r.trades)}</td>
+            <td style={{ textAlign: 'right' }} className={signCls(r.avg_pct)}>{sPct(r.avg_pct)}</td>
+            <td style={{ textAlign: 'right' }} className="dim">{pctR(r.win_pct)}</td>
+            <td style={{ textAlign: 'right' }} className="dim">{num2(r.t)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function RsiIntradayPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [tf, setTf] = useState('4h');
+
+  const load = (which) => { setErr(null); apiFetch(`/rsi-intraday?tf=${which}`).then(setData).catch(e => setErr(e.message)); };
+  useEffect(() => { load(tf); }, [tf]);
+
+  const run = () => {
+    setRunning(true);
+    apiFetch(`/rsi-intraday?tf=${tf}`, { method: 'POST' }).then(() => {
+      const t = setInterval(() => apiFetch(`/rsi-intraday?tf=${tf}`).then(d => {
+        if (d && d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(e => { setErr(e.message); setRunning(false); });
+  };
+
+  // RSI-level lead strip: per bucket, the longest-hold row ('40b' exit if present, else last row).
+  const RSI_ORDER = ['<25', '25-35', '35-45', '45-55', '55+'];
+  const longestRow = (arr) => {
+    const rows = Array.isArray(arr) ? arr : [];
+    if (!rows.length) return null;
+    return rows.find(r => r.exit === '40b') || rows[rows.length - 1];
+  };
+
+  if (err) return (
+    <div className="darkpool-page">
+      <h1>RSI Intraday Crossover</h1>
+      <ErrorBanner message={err} onRetry={() => load(tf)} onDismiss={() => setErr(null)} />
+    </div>
+  );
+  if (!data) return <div className="loading">Loading RSI intraday study...</div>;
+
+  if (!data.computed) {
+    return (
+      <div className="darkpool-page">
+        <h1>RSI Intraday Crossover</h1>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.note || data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={run} disabled={running}>{running ? 'Running…' : 'Run study'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const params = data.params || {};
+  const availTf = data.available_tf || ['4h', '8h', '12h'];
+  const byRsi = data.backtest_by_rsi || {};
+  const hist = params.history || {};
+
+  const rsiStrip = RSI_ORDER.map(k => {
+    const r = longestRow(byRsi[k]);
+    return { label: k, value: r ? r.avg_pct : null, n: r ? r.trades : null };
+  });
+
+  return (
+    <div className="darkpool-page">
+      <h1>RSI Intraday Crossover <LastUpdatedChip value={data.last_updated} /></h1>
+      <div className="filters" style={{ margin: '4px 0 8px' }}>
+        {availTf.map(t => (
+          <button key={t} className={tf === t ? 'active' : ''} onClick={() => setTf(t)}>{t}</button>
+        ))}
+      </div>
+      <p className="subtitle darkpool-muted">
+        RSI({params.rsi_period ?? 14}) crossing above its SMA({params.sma_period ?? 14}). Averaged across all crossovers it
+        looks like noise — bucket it by how oversold the cross was and the edge appears.
+        {hist.from ? ` History ${hist.from} → ${hist.to}.` : ''}
+        {params.n_with_data != null ? ` ${Number(params.n_with_data).toLocaleString()} names with ${data.tf || tf} data (${params.n_daily != null ? Number(params.n_daily).toLocaleString() : '—'} daily).` : ''}
+      </p>
+
+      {/* ── LEAD: the tail ─────────────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Edge by RSI level at the cross ({data.tf || tf})</h2>
+        </div>
+        <div style={{ maxWidth: 360 }}>
+          <TailStrip buckets={rsiStrip} />
+        </div>
+        <p className="subtitle" style={{ marginTop: 10 }}>
+          Only the oversold buckets (<b>&lt;35</b>) carry the edge — the deeper the RSI at the cross, the stronger the bounce.
+          Crosses fired above 45 are noise.
+        </p>
+      </div>
+
+      {/* ── Per-bucket exit ladders ────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Exit ladder by RSI bucket ({data.tf || tf})</h2>
+        </div>
+        {RSI_ORDER.filter(k => Array.isArray(byRsi[k]) && byRsi[k].length).map(k => (
+          <RsiBucketTable key={k} bucket={k} rows={byRsi[k]} />
+        ))}
+      </div>
+
+      {/* ── All crossovers + daily benchmark ───────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>All {data.tf || tf} crossovers (no RSI filter)</h2>
+        </div>
+        <RsiLadderTable rows={data.backtest_tf || []} />
+      </div>
+
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Daily benchmark (same signal, daily bars)</h2>
+        </div>
+        <RsiLadderTable rows={data.backtest_daily || []} />
+      </div>
+
+      {data.note && <p className="subtitle" style={{ marginTop: 8, fontStyle: 'italic' }}>{data.note}</p>}
+    </div>
+  );
+}
+
 function VolShockBacktestTable({ sig }) {
   const sort = useSortedRows((sig && sig.rows) || [], 'avg_pct', 'desc');
   const fmtN = (v) => (v == null ? '–' : Number(v).toLocaleString());
@@ -5945,6 +6376,19 @@ function VolShockPage() {
   const btOrder = ['vol_shock_up', 'vol_shock_dn', 'vol_shock_dn3', 'vol_shock_up_hivol', 'vol_shock_dn_hivol', 'vol_shock_dn3_hivol'];
   const btKeys = btOrder.filter(k => backtest[k]).concat(Object.keys(backtest).filter(k => !btOrder.includes(k)));
 
+  // Shock-size gradient at H=10 for one direction: one bar per σ threshold (1.5σ, 2σ, 3σ),
+  // value = mean fwd %. Shows the size ramp at a glance above the detailed table.
+  const contStrip = (rows) => {
+    const seen = new Set(), out = [];
+    (rows || []).filter(r => Number(r.H) === 10).forEach(r => {
+      if (r.thr == null || seen.has(r.thr)) return;
+      seen.add(r.thr);
+      out.push({ label: `${num2(r.thr)}σ`, value: r.mean_pct, n: r.episodes });
+    });
+    out.sort((a, b) => parseFloat(a.label) - parseFloat(b.label));
+    return out;
+  };
+
   return (
     <div className="darkpool-page">
       <h1>Vol-Shock Continuation <LastUpdatedChip value={data.last_updated} /></h1>
@@ -5970,11 +6414,19 @@ function VolShockPage() {
           <div style={{ marginBottom: 12 }}>
             <h4 style={{ margin: '6px 0' }}>Good day (+σ) → keeps rising?</h4>
             <p className="subtitle darkpool-muted">For UP shocks, a positive edge % = momentum (kept rising above baseline).</p>
+            <div style={{ maxWidth: 260, marginBottom: 6 }}>
+              <div className="subtitle darkpool-muted" style={{ margin: '2px 0' }}>Shock-size gradient — mean fwd % at H=10</div>
+              <TailStrip buckets={contStrip(cont.up)} />
+            </div>
             <ContTable rows={cont.up} />
           </div>
           <div>
             <h4 style={{ margin: '6px 0' }}>Bad day (−σ) → keeps falling?</h4>
             <p className="subtitle darkpool-muted">For DN shocks, a negative edge % = it reversed (bounced back up).</p>
+            <div style={{ maxWidth: 260, marginBottom: 6 }}>
+              <div className="subtitle darkpool-muted" style={{ margin: '2px 0' }}>Shock-size gradient — mean fwd % at H=10</div>
+              <TailStrip buckets={contStrip(cont.dn)} />
+            </div>
             <ContTable rows={cont.dn} />
           </div>
         </div>
