@@ -63,6 +63,7 @@ x-backend-volumes: &backend-volumes
   - ./congress_backtest.py:/app/congress_backtest.py
   - ./vol_shock_study.py:/app/vol_shock_study.py
   - ./burst_scan.py:/app/burst_scan.py
+  - ./rsi_4h_study.py:/app/rsi_4h_study.py
   - ./.data:/app/.data
 
 services:
