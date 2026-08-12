@@ -129,6 +129,74 @@ function LastUpdatedChip({ value }) {
   return <span className="last-updated-chip">Updated: {d.toLocaleString()}</span>;
 }
 
+// ---- Server-side pagination + infinite scroll --------------------------------
+// usePagedList(path, params): fetches page 1 of `path?paginate=1&<params>` and appends further pages
+// (by offset) via loadMore(). Any change to `params` (ordering / dir / search / category / regime / …)
+// discards the loaded pages and re-fetches from offset 0 — this is how server-side sort replaces the
+// old client-side sort on the large tables. Returns { rows, meta, loading, error, hasMore, loadMore }.
+//   rows  — accumulated result rows across the loaded pages
+//   meta  — the non-row envelope keys (total, total_studies, categories, last_updated, …)
+function usePagedList(path, params) {
+  const [rows, setRows] = useState([]);
+  const [meta, setMeta] = useState({});
+  const [nextOffset, setNextOffset] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  // Serialize params so the effect keys off value, not object identity (which would loop forever).
+  const key = JSON.stringify(params || {});
+
+  const buildUrl = useCallback((offset) => {
+    const qs = new URLSearchParams({ paginate: '1', offset: String(offset) });
+    const p = JSON.parse(key);
+    Object.entries(p).forEach(([k, v]) => { if (v != null && v !== '') qs.set(k, v); });
+    return `${path}?${qs.toString()}`;
+  }, [path, key]);
+
+  useEffect(() => {
+    let live = true;
+    setLoading(true); setError(null);
+    apiFetch(buildUrl(0))
+      .then(d => {
+        if (!live) return;
+        // eslint-disable-next-line no-unused-vars
+        const { results, next_offset, ...rest } = d;
+        setRows(results || []); setMeta(rest);
+        setNextOffset(next_offset == null ? null : next_offset); setLoading(false);
+      })
+      .catch(e => { if (live) { setError(e.message || 'Failed to load.'); setLoading(false); } });
+    return () => { live = false; };
+  }, [buildUrl]);
+
+  const loadMore = useCallback(() => {
+    if (nextOffset == null || loading) return;
+    setLoading(true);
+    apiFetch(buildUrl(nextOffset))
+      .then(d => {
+        setRows(prev => [...prev, ...(d.results || [])]);
+        setNextOffset(d.next_offset == null ? null : d.next_offset); setLoading(false);
+      })
+      .catch(e => { setError(e.message || 'Failed to load more.'); setLoading(false); });
+  }, [nextOffset, loading, buildUrl]);
+
+  return { rows, meta, loading, error, hasMore: nextOffset != null, loadMore };
+}
+
+// IntersectionObserver sentinel — invokes onVisible() when scrolled near view. Place at a list's end.
+function ScrollSentinel({ onVisible, disabled }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (disabled) return undefined;
+    const el = ref.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return undefined;
+    const obs = new IntersectionObserver(
+      entries => { if (entries[0].isIntersecting) onVisible(); },
+      { rootMargin: '400px' });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [onVisible, disabled]);
+  return <div ref={ref} className="scroll-sentinel" aria-hidden="true" style={{ height: 1 }} />;
+}
+
 // Site-wide plain-English glossary. Wrap any jargon in <Term k="cagr">CAGR</Term> to get a hover ?.
 const GLOSSARY = {
   cagr: ['CAGR', 'Compound Annual Growth Rate — the smoothed yearly % an investment would need to grow at to go from start value to end value over the period. Strips out the lumpiness of individual years.'],
@@ -1270,9 +1338,9 @@ function StudyChartView({ study, onBack }) {
 }
 
 function StudiesPage() {
-  const [data, setData] = useState(null);
   const [regime, setRegime] = useState(null);
   const [search, setSearch] = useState('');
+  const [dsearch, setDsearch] = useState('');          // debounced -> server query
   const [catFilter, setCatFilter] = useState('all');
   const [sortBy, setSortBy] = useState('avg_return');
   const [sortDir, setSortDir] = useState('desc');
@@ -1281,72 +1349,61 @@ function StudiesPage() {
   const [tradesLoading, setTradesLoading] = useState(null);
   const [studyDetail, setStudyDetail] = useState(null);
   const [signalFilter, setSignalFilter] = useState(null);
+  const [signalFilterName, setSignalFilterName] = useState(null);
   const [exitFilter, setExitFilter] = useState(null);
+  const [exitFilterName, setExitFilterName] = useState(null);
   const [regimeFilter, setRegimeFilter] = useState(null);
 
+  // Debounce the search box so a keystroke doesn't re-query the server on every character.
+  useEffect(() => { const t = setTimeout(() => setDsearch(search), 300); return () => clearTimeout(t); }, [search]);
+
+  // All filtering + sorting now happens server-side (the table is 25k+ rows); the page pulls one
+  // page at a time and appends on scroll. Changing any of these params refetches from offset 0.
+  const params = React.useMemo(() => ({
+    ordering: sortBy, dir: sortDir, search: dsearch,
+    category: catFilter === 'all' ? '' : catFilter,
+    signal: signalFilter || '', exit: exitFilter || '', regime: regimeFilter || '',
+  }), [sortBy, sortDir, dsearch, catFilter, signalFilter, exitFilter, regimeFilter]);
+  const { rows, meta, loading, error, hasMore, loadMore } = usePagedList('/studies', params);
+
+  useEffect(() => { fetch(`${API}/regime`).then(r => r.json()).then(setRegime).catch(() => {}); }, []);
+
+  // Deep link to a specific study chart (#/study/<signal>/<exit>/<sector>): fetch just that study
+  // (the full list is no longer in memory to search).
   useEffect(() => {
-    fetch(`${API}/studies`).then(r => r.json()).then(d => {
-      setData(d);
-      // Check if URL points to a specific study chart
-      const init = parseHash();
-      if (init.view === 'study_chart' && d.studies) {
-        const match = d.studies.find(s => s.signal === init.signal && s.exit === init.exit);
-        if (match) setStudyDetail({...match, chartSector: init.sector});
-      }
-    }).catch(() => {});
-    fetch(`${API}/regime`).then(r => r.json()).then(d => setRegime(d)).catch(() => {});
-  }, []);
-
-  if (!data) return <div className="loading">Loading studies...</div>;
-
-  const categories = [...new Set(data.studies.map(s => s.category))].sort();
-
-  let filtered = data.studies.filter(s => {
-    if (catFilter !== 'all' && s.category !== catFilter) return false;
-    if (signalFilter && s.signal !== signalFilter) return false;
-    if (exitFilter && s.exit !== exitFilter) return false;
-    if (search && !s.name.toLowerCase().includes(search.toLowerCase()) && !s.signal_name.toLowerCase().includes(search.toLowerCase())) return false;
-    if (regimeFilter) {
-      const [rType, rKey] = regimeFilter.split(':');
-      const bucket = s[rType];
-      if (!bucket || !bucket[rKey]) return false;
+    const init = parseHash();
+    if (init.view === 'study_chart' && init.signal && init.exit) {
+      apiFetch(`/studies?paginate=1&signal=${encodeURIComponent(init.signal)}&exit=${encodeURIComponent(init.exit)}`)
+        .then(d => { const m = (d.results || [])[0]; if (m) setStudyDetail({ ...m, chartSector: init.sector }); })
+        .catch(() => {});
     }
-    return true;
-  });
-
-  // When regime filter active, use regime-specific stats for sorting
-  if (regimeFilter) {
-    const [rType, rKey] = regimeFilter.split(':');
-    filtered = filtered.map(s => {
-      const rd = s[rType]?.[rKey];
-      if (!rd) return s;
-      return {...s, _regime_return: rd.avg_return, _regime_wr: rd.win_rate, _regime_trades: rd.trades};
-    });
-  }
-
-  filtered.sort((a, b) => {
-    let ak = sortBy, bk = sortBy;
-    if (regimeFilter && sortBy === 'avg_return') ak = bk = '_regime_return';
-    if (regimeFilter && sortBy === 'win_rate') ak = bk = '_regime_wr';
-    if (regimeFilter && sortBy === 'total_trades') ak = bk = '_regime_trades';
-    const av = a[ak] ?? a[sortBy] ?? 0, bv = b[bk] ?? b[sortBy] ?? 0;
-    if (typeof av === 'string' || typeof bv === 'string') return sortDir === 'desc' ? String(bv).localeCompare(String(av)) : String(av).localeCompare(String(bv));
-    return sortDir === 'desc' ? bv - av : av - bv;
-  });
-
-  const profitable = data.studies.filter(s => s.avg_return > 0).length;
-  const bestAvg = Math.max(...data.studies.map(s => s.avg_return));
+  }, []);
 
   if (studyDetail) {
     return <StudyChartView study={studyDetail} onBack={() => setStudyDetail(null)} />;
   }
+  if (error && !rows.length) return <div className="studies-page"><ErrorBanner message={error} /></div>;
+  if (loading && !rows.length) return <div className="loading">Loading studies...</div>;
+
+  const categories = meta.categories || [];
+
+  // Server already filtered + sorted. When a regime filter is active, surface that bucket's stats
+  // for display (each row still carries the full by_regime/by_curve/… JSON).
+  let filtered = rows;
+  if (regimeFilter) {
+    const [rType, rKey] = regimeFilter.split(':');
+    filtered = rows.map(s => {
+      const rd = s[rType]?.[rKey];
+      return rd ? { ...s, _regime_return: rd.avg_return, _regime_wr: rd.win_rate, _regime_trades: rd.trades } : s;
+    });
+  }
 
   return (
     <div className="studies-page">
-      <h1>Indicator Studies <span className="dim">({filtered.length}{filtered.length !== data.studies.length ? ` / ${data.studies.length}` : ''})</span>
-        <LastUpdatedChip value={data.last_updated || data.computed_at} />
+      <h1>Indicator Studies <span className="dim">({rows.length.toLocaleString()} of {(meta.total ?? 0).toLocaleString()})</span>
+        <LastUpdatedChip value={meta.last_updated} />
       </h1>
-      <p className="subtitle">{profitable} profitable / {data.studies.length} total across all sector ETFs (5y daily backtest).</p>
+      <p className="subtitle">{(meta.total ?? 0).toLocaleString()} studies matching, across all sector ETFs (5y daily backtest). Sorted & filtered server-side; scroll to load more.</p>
 
       {regime && (
         <div className="regime-bar">
@@ -1370,13 +1427,13 @@ function StudiesPage() {
           <div className="filters">
             {signalFilter && <>
               <span className="dim">Signal: </span>
-              <button className="active">{data.studies.find(s => s.signal === signalFilter)?.signal_name || signalFilter}</button>
-              <button onClick={() => setSignalFilter(null)}>x</button>
+              <button className="active">{signalFilterName || signalFilter}</button>
+              <button onClick={() => { setSignalFilter(null); setSignalFilterName(null); }}>x</button>
             </>}
             {exitFilter && <>
               <span className="dim" style={{marginLeft: signalFilter ? 8 : 0}}>Exit: </span>
-              <button className="active">{data.studies.find(s => s.exit === exitFilter)?.exit_name || exitFilter}</button>
-              <button onClick={() => setExitFilter(null)}>x</button>
+              <button className="active">{exitFilterName || exitFilter}</button>
+              <button onClick={() => { setExitFilter(null); setExitFilterName(null); }}>x</button>
             </>}
           </div>
         )}
@@ -1425,9 +1482,9 @@ function StudiesPage() {
                 }
               }} style={{cursor:'pointer'}}>
                 <td className="dim">{s.id}</td>
-                <td className="clickable" onClick={e => { e.stopPropagation(); setSignalFilter(s.signal); }}>{s.signal_name} <span className="dim" style={{fontSize:10}}>(D)</span></td>
+                <td className="clickable" onClick={e => { e.stopPropagation(); setSignalFilter(s.signal); setSignalFilterName(s.signal_name); }}>{s.signal_name} <span className="dim" style={{fontSize:10}}>(D)</span></td>
                 <td><span className="study-cat">{s.category}</span></td>
-                <td className="clickable dim" onClick={e => { e.stopPropagation(); setExitFilter(s.exit); }}>{s.exit_name}</td>
+                <td className="clickable dim" onClick={e => { e.stopPropagation(); setExitFilter(s.exit); setExitFilterName(s.exit_name); }}>{s.exit_name}</td>
                 <td>{(s._regime_trades ?? s.total_trades).toLocaleString()}</td>
                 <td className={s.t_stat == null ? 'dim' : Math.abs(s.t_stat) >= 2 ? 'good' : Math.abs(s.t_stat) < 1 ? 'bad' : ''}
                     title={s.eff_trades != null ? `${s.eff_trades.toLocaleString()} independent (overlap-deduped) trades` : ''}>
@@ -1631,6 +1688,9 @@ function StudiesPage() {
           ))}
         </tbody>
       </table>
+      {hasMore && <ScrollSentinel onVisible={loadMore} disabled={loading} />}
+      {loading && rows.length > 0 && <div className="loading dim" style={{padding:12}}>Loading more…</div>}
+      {!hasMore && rows.length > 0 && <div className="dim" style={{padding:12,textAlign:'center'}}>All {(meta.total ?? rows.length).toLocaleString()} loaded.</div>}
     </div>
   );
 }
@@ -1733,7 +1793,6 @@ function StockDrilldownPage() {
 }
 
 function TrendStudiesPage() {
-  const [data, setData] = useState(null);
   const [detail, setDetail] = useState(null);
   const [sortBy, setSortBy] = useState('total_return');
   const [sortDir, setSortDir] = useState('desc');
@@ -1742,9 +1801,12 @@ function TrendStudiesPage() {
   const MODE_LABELS = { etf: 'ETF', momentum: 'Momentum stock', hibeta: 'Hi-beta stock' };
   const logSort = useSortedRows(detail && detail.trade_log, null, 'desc');
 
-  useEffect(() => {
-    fetch(`${API}/trend-studies`).then(r => r.json()).then(d => setData(d)).catch(() => {});
-  }, []);
+  // Server-side sort + mode filter + infinite scroll (mirrors StudiesPage). Changing any param
+  // refetches from offset 0. The detail view fetches its own heavy row (equity/trade_log) separately.
+  const params = React.useMemo(() => ({
+    ordering: sortBy, dir: sortDir, mode: modeFilter === 'all' ? '' : modeFilter,
+  }), [sortBy, sortDir, modeFilter]);
+  const { rows, meta, loading, error, hasMore, loadMore } = usePagedList('/trend-studies', params);
 
   // Draw equity curve for detail view
   useEffect(() => {
@@ -1799,8 +1861,6 @@ function TrendStudiesPage() {
     ctx.fillStyle = '#7d8590'; ctx.fillText(`SPY: +${detail.spy_total}%`, pad.l + 200, 16);
   }, [detail]);
 
-  if (!data) return <div className="loading">Loading trend studies...</div>;
-
   if (detail) {
     return (
       <div className="studies-page">
@@ -1845,20 +1905,21 @@ function TrendStudiesPage() {
     );
   }
 
-  let sorted = data.strategies.filter(s => modeFilter === 'all' || (s.hold_mode || 'etf') === modeFilter);
-  sorted.sort((a, b) => {
-    const av = a[sortBy] ?? 0, bv = b[sortBy] ?? 0;
-    return sortDir === 'desc' ? bv - av : av - bv;
-  });
-  const modes = data.modes && data.modes.length ? data.modes : ['etf'];
+  if (error && !rows.length) return <div className="studies-page"><ErrorBanner message={error} /></div>;
+  if (loading && !rows.length) return <div className="loading">Loading trend studies...</div>;
+
+  // Server already applied the mode filter + sort; render the loaded rows as-is.
+  const modes = meta.modes && meta.modes.length ? meta.modes : ['etf'];
+  // Only these header keys are in the server's TREND_ORDER whitelist; the rest stay non-sortable.
+  const TREND_SORTABLE = new Set(['lookback_months','hold_months','total_return','annual_return','alpha','max_drawdown','win_rate','num_trades','t_stat']);
 
   const thClick = (col) => { if (sortBy === col) setSortDir(d => d === 'desc' ? 'asc' : 'desc'); else { setSortBy(col); setSortDir('desc'); } };
   const thArrow = (col) => sortBy === col ? (sortDir === 'desc' ? ' \u25BC' : ' \u25B2') : '';
 
   return (
     <div className="studies-page">
-      <h1>Trend Studies <span className="dim">({sorted.length})</span>
-        <LastUpdatedChip value={data.last_updated || data.computed_at} />
+      <h1>Trend Studies <span className="dim">({rows.length.toLocaleString()} of {(meta.total ?? 0).toLocaleString()})</span>
+        <LastUpdatedChip value={meta.last_updated} />
       </h1>
       <p className="subtitle">Sector momentum rotation backtests. Buy top N sectors by trailing return, hold, rebalance. 5Y backtest excluding crypto. <b>Hold mode</b> = what you buy in each winning sector: the ETF, its top-momentum stock, or its highest-beta stock (both stock picks point-in-time).</p>
 
@@ -1874,12 +1935,14 @@ function TrendStudiesPage() {
         <thead>
           <tr>
             {[['hold_mode','Hold'],['lookback_months','Lookback'],['hold_months','Hold Mo'],['top_n','Top N'],['total_return','Total Ret'],['annual_return','Annual'],['spy_total','SPY'],['alpha','Alpha'],['max_drawdown','Max DD'],['win_rate','Win%'],['num_trades','Trades'],['t_stat','Sig (t)']].map(([k,l]) => (
-              <th key={k} className="sortable" onClick={() => thClick(k)}><Term k={TH_KEY[k]}>{l}</Term>{thArrow(k)}</th>
+              TREND_SORTABLE.has(k)
+                ? <th key={k} className="sortable" onClick={() => thClick(k)}><Term k={TH_KEY[k]}>{l}</Term>{thArrow(k)}</th>
+                : <th key={k}><Term k={TH_KEY[k]}>{l}</Term></th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {sorted.map(s => (
+          {rows.map(s => (
             <tr key={s.id} className={s.alpha > 0 ? 'row-bullish' : 'row-bearish'} style={{cursor:'pointer'}} onClick={() => {
               fetch(`${API}/trend-studies/${s.id}`).then(r => r.json()).then(d => setDetail(d));
             }}>
@@ -1901,6 +1964,9 @@ function TrendStudiesPage() {
           ))}
         </tbody>
       </table>
+      {hasMore && <ScrollSentinel onVisible={loadMore} disabled={loading} />}
+      {loading && rows.length > 0 && <div className="loading dim" style={{padding:12}}>Loading more…</div>}
+      {!hasMore && rows.length > 0 && <div className="dim" style={{padding:12,textAlign:'center'}}>All {(meta.total ?? rows.length).toLocaleString()} loaded.</div>}
     </div>
   );
 }
@@ -2329,9 +2395,8 @@ function DocsPage() {
 }
 
 function StockStudiesPage() {
-  const [data, setData] = useState(null);
-  const [err, setErr] = useState(null);
   const [search, setSearch] = useState('');
+  const [dsearch, setDsearch] = useState('');          // debounced -> server query
   const [catFilter, setCatFilter] = useState('all');
   const [sortBy, setSortBy] = useState('avg_return');
   const [sortDir, setSortDir] = useState('desc');
@@ -2341,16 +2406,23 @@ function StockStudiesPage() {
   const [expanded, setExpanded] = useState(null);
   const [running, setRunning] = useState(false);
   const [sectors, setSectors] = useState([]);
+  const [refreshKey, setRefreshKey] = useState(0);      // bump to force a refetch (post-sweep)
   const [drillSector, setDrillSector] = useState({});   // rowKey -> sector name
   const [drillData, setDrillData] = useState({});        // rowKey -> result
   const [drillLoading, setDrillLoading] = useState(null); // rowKey currently loading
 
-  const load = () => {
-    fetch(`${API}/stock-studies?limit=1000`).then(r => r.json())
-      .then(d => setData(d)).catch(e => setErr(e.message));
-  };
+  // Debounce search so a keystroke doesn't re-query the 24k-row table on every character.
+  useEffect(() => { const t = setTimeout(() => setDsearch(search), 300); return () => clearTimeout(t); }, [search]);
+
+  // Server-side filter (search/category/min_trades) + sort + infinite scroll. `refreshKey` is an
+  // ignored-by-server param that forces a refetch after a sweep completes.
+  const params = React.useMemo(() => ({
+    ordering: sortBy, dir: sortDir, search: dsearch,
+    category: catFilter === 'all' ? '' : catFilter, min_trades: minTrades, refreshKey,
+  }), [sortBy, sortDir, dsearch, catFilter, minTrades, refreshKey]);
+  const { rows: pageRows, meta, loading, error, hasMore, loadMore } = usePagedList('/stock-studies', params);
+
   useEffect(() => {
-    load();
     fetch(`${API}/sectors`).then(r => r.json()).then(d => setSectors(d || [])).catch(() => {});
   }, []);
 
@@ -2371,22 +2443,22 @@ function StockStudiesPage() {
         // Poll for freshness; sweep takes minutes.
         const t = setInterval(() => {
           fetch(`${API}/stock-studies?limit=1`).then(r => r.json()).then(d => {
-            if (d.computed) { clearInterval(t); setRunning(false); load(); }
+            if (d.computed) { clearInterval(t); setRunning(false); setRefreshKey(k => k + 1); }
           }).catch(() => {});
         }, 15000);
       }).catch(() => setRunning(false));
   };
 
-  if (err) return <div className="error">Error: {err}</div>;
-  if (!data) return <div className="loading">Loading stock studies...</div>;
+  if (error && !pageRows.length) return <div className="studies-page"><ErrorBanner message={error} /></div>;
+  if (loading && !pageRows.length) return <div className="loading">Loading stock studies...</div>;
 
-  if (!data.computed) {
+  if (meta.computed === false) {
     return (
       <div className="studies-page">
         <h1>Stock Indicator Studies</h1>
         <p className="subtitle">Every signal × every exit, run across all individual stocks, with fundamental-bucket breakdowns.</p>
         <div className="empty-state" style={{padding:'40px 0'}}>
-          <p>{data.message || 'Not computed yet.'}</p>
+          <p>{meta.message || 'Not computed yet.'}</p>
           <button className="refresh-btn" onClick={runSweep} disabled={running}>
             {running ? 'Running sweep (minutes)...' : 'Run all-on-all sweep'}
           </button>
@@ -2395,7 +2467,7 @@ function StockStudiesPage() {
     );
   }
 
-  const dimMeta = data.dimension_meta || {};
+  const dimMeta = meta.dimension_meta || {};
   const isSnapshot = (dim) => dimMeta[dim] && dimMeta[dim].pit === false;
 
   // Slice-by-dimension: reframe every row to a chosen dimension+bucket's stats.
@@ -2407,24 +2479,19 @@ function StockStudiesPage() {
     return { avg_return: r.avg_return, win_rate: r.win_rate, trades: r.trades, avg_mae: r.avg_mae, clean_pct: r.clean_pct };
   };
 
-  const categories = data.categories || [];
-  let rows = data.results.map(r => ({ r, m: metricsOf(r) })).filter(({ r, m }) => {
-    if (!m) return false;                                   // slicing: drop rows lacking the bucket
-    if (catFilter !== 'all' && r.category !== catFilter) return false;
-    if (m.trades < minTrades) return false;
-    if (search) {
-      const q = search.toLowerCase();
-      if (!(`${r.signal_name} ${r.signal_key} ${r.exit_name} ${r.exit_key}`.toLowerCase().includes(q))) return false;
-    }
-    return true;
-  });
-  rows.sort((x, y) => {
-    const a = x.r, b = y.r;
-    const key = (sortBy === 'avg_return' || sortBy === 'win_rate' || sortBy === 'trades' || sortBy === 'avg_mae' || sortBy === 'clean_pct') ? null : sortBy;
-    const av = key ? (a[key] ?? 0) : x.m[sortBy], bv = key ? (b[key] ?? 0) : y.m[sortBy];
-    if (typeof av === 'string') return sortDir === 'desc' ? String(bv).localeCompare(String(av)) : String(av).localeCompare(String(bv));
-    return sortDir === 'desc' ? bv - av : av - bv;
-  });
+  const categories = meta.categories || [];
+  // Server already applied search / category / min_trades / sort. Slice-by-dimension is a client-side
+  // reframe of the LOADED rows (each row carries its own by_dimension), so when a slice is active we
+  // drop rows missing that bucket and re-sort the loaded rows by the sliced metric.
+  let rows = pageRows.map(r => ({ r, m: metricsOf(r) }));
+  if (slicing) {
+    rows = rows.filter(({ m }) => m);
+    rows.sort((x, y) => {
+      const av = x.m[sortBy] ?? x.r[sortBy] ?? 0, bv = y.m[sortBy] ?? y.r[sortBy] ?? 0;
+      if (typeof av === 'string') return sortDir === 'desc' ? String(bv).localeCompare(String(av)) : String(av).localeCompare(String(bv));
+      return sortDir === 'desc' ? bv - av : av - bv;
+    });
+  }
 
   const setSort = (col) => {
     if (sortBy === col) setSortDir(d => d === 'desc' ? 'asc' : 'desc');
@@ -2432,10 +2499,10 @@ function StockStudiesPage() {
   };
   const arrow = (col) => sortBy === col ? (sortDir === 'desc' ? ' ▼' : ' ▲') : '';
 
-  // PIT dimensions available to slice by, and buckets for the chosen one.
+  // PIT dimensions available to slice by, and buckets for the chosen one (from loaded rows).
   const pitDims = Object.keys(dimMeta).filter(d => !isSnapshot(d));
   const sliceBuckets = sliceDim
-    ? [...new Set(data.results.flatMap(r => (r.by_dimension?.[sliceDim] || []).map(b => b.bucket)))].filter(x => x !== 'NA').sort()
+    ? [...new Set(pageRows.flatMap(r => (r.by_dimension?.[sliceDim] || []).map(b => b.bucket)))].filter(x => x !== 'NA').sort()
     : [];
 
   // Best-amplifying POINT-IN-TIME bucket (excludes snapshot dims + the NA no-data bucket,
@@ -2454,13 +2521,12 @@ function StockStudiesPage() {
 
   return (
     <div className="studies-page">
-      <h1>Stock Indicator Studies <span className="dim">({rows.length} / {data.n_results})</span>
-        <LastUpdatedChip value={data.last_updated || data.computed_at} />
+      <h1>Stock Indicator Studies <span className="dim">({rows.length.toLocaleString()} of {(meta.total ?? meta.n_results ?? 0).toLocaleString()})</span>
+        <LastUpdatedChip value={meta.last_updated} />
       </h1>
       <p className="subtitle">
-        {data.n_signals} signals × {data.n_exits} exits over {data.universe_size} stocks (5y daily).
-        Expand a row for the fundamental-bucket breakdown.
-        {data.computed_at && <span className="dim"> · updated {new Date(data.computed_at).toLocaleString()}</span>}
+        {(meta.total ?? meta.n_results ?? 0).toLocaleString()} signal × exit combos over {meta.universe_size} stocks (5y daily).
+        Expand a row for the fundamental-bucket breakdown. Sorted &amp; filtered server-side; scroll to load more.
       </p>
 
       <div className="studies-controls">
@@ -2513,7 +2579,7 @@ function StockStudiesPage() {
           </tr>
         </thead>
         <tbody>
-          {rows.slice(0, 400).map(({ r, m }, i) => {
+          {rows.map(({ r, m }, i) => {
             const key = `${r.signal_key}|${r.exit_key}`;
             const isOpen = expanded === key;
             return (
@@ -2611,31 +2677,34 @@ function StockStudiesPage() {
           })}
         </tbody>
       </table>
-      {rows.length > 400 && <p className="dim" style={{marginTop:8}}>Showing top 400 of {rows.length}. Narrow with filters.</p>}
+      {!slicing && hasMore && <ScrollSentinel onVisible={loadMore} disabled={loading} />}
+      {loading && pageRows.length > 0 && <div className="loading dim" style={{padding:12}}>Loading more…</div>}
+      {slicing && <p className="dim" style={{marginTop:8}}>Slice view reframes the {pageRows.length} currently-loaded rows; scroll with the slice cleared to load more.</p>}
+      {!slicing && !hasMore && pageRows.length > 0 && <div className="dim" style={{padding:12,textAlign:'center'}}>All {(meta.total ?? pageRows.length).toLocaleString()} loaded.</div>}
     </div>
   );
 }
 
 function FiringNowPage() {
-  const [data, setData] = useState(null);
-  const [err, setErr] = useState(null);
   const [sigFilter, setSigFilter] = useState('all');
   const [sectorFilter, setSectorFilter] = useState('all');
   const [maxDays, setMaxDays] = useState(5);
   const [running, setRunning] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);   // bump to force a refetch (post-scan)
   const [peMap, setPeMap] = useState({});
-  // P/E is sourced from the shared /fundamentals feed by ticker (fallback to the row's own
-  // pe_ratio). Memoized accessor keeps useSortedRows' 'pe' column stable across renders.
-  const peAccessors = React.useMemo(() => ({
-    pe: r => {
-      const v = peMap[r.ticker];
-      return v != null ? v : (r.pe_ratio != null ? r.pe_ratio : null);
-    },
-  }), [peMap]);
-  const fSort = useSortedRows(data && data.results, null, 'desc', peAccessors);
+  // Default sort = most-recently-fired first. Filter + sort now happen server-side; scroll loads more.
+  const [sortBy, setSortBy] = useState('days_ago');
+  const [sortDir, setSortDir] = useState('asc');
 
-  const load = () => fetch(`${API}/live-signals?limit=2000`).then(r => r.json()).then(setData).catch(e => setErr(e.message));
-  useEffect(() => { load(); }, []);
+  const params = React.useMemo(() => ({
+    ordering: sortBy, dir: sortDir,
+    signal: sigFilter === 'all' ? '' : sigFilter,
+    sector: sectorFilter === 'all' ? '' : sectorFilter,
+    max_days: maxDays, refreshKey,
+  }), [sortBy, sortDir, sigFilter, sectorFilter, maxDays, refreshKey]);
+  const { rows, meta, loading, error, hasMore, loadMore } = usePagedList('/live-signals', params);
+
+  // P/E is sourced from the shared /fundamentals feed by ticker (fallback to the row's own pe_ratio).
   useEffect(() => {
     apiFetch('/fundamentals')
       .then(d => {
@@ -2654,47 +2723,44 @@ function FiringNowPage() {
     setRunning(true);
     fetch(`${API}/live-signals`, { method: 'POST' }).then(r => r.json()).then(() => {
       const t = setInterval(() => fetch(`${API}/live-signals?limit=1`).then(r => r.json()).then(d => {
-        if (d.computed) { clearInterval(t); setRunning(false); load(); }
+        if (d.computed) { clearInterval(t); setRunning(false); setRefreshKey(k => k + 1); }
       }).catch(() => {}), 8000);
-    }).catch(() => setRunning(false));
+    }).catch(() => {});
   };
 
-  if (err) return <div className="error">Error: {err}</div>;
-  if (!data) return <div className="loading">Loading firing signals...</div>;
-  if (!data.computed) {
+  // Shim so the existing <SortTh> headers drive the server-side sort state.
+  const setSort = (col) => { if (sortBy === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc'); else { setSortBy(col); setSortDir('desc'); } };
+  const fSort = { sortKey: sortBy, sortDir, requestSort: setSort };
+
+  if (error && !rows.length) return <div className="studies-page"><ErrorBanner message={error} /></div>;
+  if (loading && !rows.length) return <div className="loading">Loading firing signals...</div>;
+  if (meta.computed === false) {
     return (
       <div className="studies-page">
         <h1>Firing Now</h1>
         <p className="subtitle">Stocks currently triggering the top signals across all sectors.</p>
         <div className="empty-state" style={{padding:'40px 0'}}>
-          <p>{data.message || 'Not scanned yet.'}</p>
+          <p>{meta.message || 'Not scanned yet.'}</p>
           <button className="refresh-btn" onClick={runScan} disabled={running}>{running ? 'Scanning...' : 'Run firing scan'}</button>
         </div>
       </div>
     );
   }
 
-  let rows = fSort.rows.filter(r => {
-    if (sigFilter !== 'all' && r.signal_key !== sigFilter) return false;
-    if (sectorFilter !== 'all' && !(r.sectors || []).includes(sectorFilter)) return false;
-    if (r.days_ago > maxDays) return false;
-    return true;
-  });
-
-  // Sector heat: how many firing per sector (covers "which sectors are lighting up").
+  // Server already filtered by signal/sector/max_days; derive sector heat from the loaded rows.
   const sectorCounts = {};
   rows.forEach(r => (r.sectors || []).forEach(s => { sectorCounts[s] = (sectorCounts[s] || 0) + 1; }));
   const sectorHeat = Object.entries(sectorCounts).sort((a, b) => b[1] - a[1]).slice(0, 12);
-  const allSectors = [...new Set(data.results.flatMap(r => r.sectors || []))].sort();
+  const allSectors = [...new Set(rows.flatMap(r => r.sectors || []))].sort();
 
   return (
     <div className="studies-page">
-      <h1>Firing Now <span className="dim">({rows.length} shown / {data.n_firing})</span>
-        <LastUpdatedChip value={data.last_updated || data.computed_at} />
+      <h1>Firing Now <span className="dim">({rows.length.toLocaleString()} of {(meta.total ?? 0).toLocaleString()}{meta.n_firing != null ? ` · ${meta.n_firing.toLocaleString()} firing` : ''})</span>
+        <LastUpdatedChip value={meta.last_updated || meta.computed_at} />
       </h1>
       <p className="subtitle">
         Stocks triggering a top signal within the last {maxDays} bars, with the signal's historical edge + fundamentals.
-        {data.computed_at && <span className="dim"> · scanned {new Date(data.computed_at).toLocaleString()}</span>}
+        {meta.computed_at && <span className="dim"> · scanned {new Date(meta.computed_at).toLocaleString()}</span>}
       </p>
 
       <div className="sector-heat">
@@ -2709,7 +2775,7 @@ function FiringNowPage() {
         <div className="filters">
           <span className="dim" style={{fontSize:11}}>Signal:</span>
           <button className={sigFilter === 'all' ? 'active' : ''} onClick={() => setSigFilter('all')}>All</button>
-          {data.signals.map(s => <button key={s} className={sigFilter === s ? 'active' : ''} onClick={() => setSigFilter(s)}>{s}</button>)}
+          {(meta.signals || []).map(s => <button key={s} className={sigFilter === s ? 'active' : ''} onClick={() => setSigFilter(s)}>{s}</button>)}
         </div>
         <div className="filters">
           <span className="dim" style={{fontSize:11}}>Fired within:</span>
@@ -2728,10 +2794,10 @@ function FiringNowPage() {
           <SortTh colKey="ticker" sort={fSort}><Term k="ticker">Ticker</Term></SortTh><SortTh colKey="signal_name" sort={fSort}><Term k="signal">Signal</Term></SortTh><SortTh colKey="days_ago" sort={fSort} align="right"><Term k="fired">Fired</Term></SortTh>
           <SortTh colKey="hist_avg_return" sort={fSort} align="right"><Term k="histedge">Hist Ret</Term></SortTh><SortTh colKey="hist_win_rate" sort={fSort} align="right"><Term k="winrate">Hist Win%</Term></SortTh>
           <SortTh colKey="hist_avg_mae" sort={fSort} align="right"><Term k="avgdip">Hist Dip</Term></SortTh><SortTh colKey="hist_clean_pct" sort={fSort} align="right"><Term k="cleanpct">Clean%</Term></SortTh>
-          <SortTh colKey="last_close" sort={fSort} align="right"><Term k="lastclose">Last</Term></SortTh><th><Term k="marketcap">Mkt Cap</Term></th><SortTh colKey="pe" sort={fSort} align="right"><Term k="pe">P/E</Term></SortTh><th><Term k="smartmoney">Smart money</Term></th><th><Term k="sector">Sectors</Term></th>
+          <SortTh colKey="last_close" sort={fSort} align="right"><Term k="lastclose">Last</Term></SortTh><th><Term k="marketcap">Mkt Cap</Term></th><SortTh colKey="forward_pe" sort={fSort} align="right"><Term k="pe">P/E</Term></SortTh><th><Term k="smartmoney">Smart money</Term></th><th><Term k="sector">Sectors</Term></th>
         </tr></thead>
         <tbody>
-          {rows.slice(0, 500).map(r => (
+          {rows.map(r => (
             <tr key={`${r.ticker}|${r.signal_key}`} className="study-row">
               <td><b>{r.ticker}</b></td>
               <td title={r.signal_key} className="dim">{r.signal_name}</td>
@@ -2759,7 +2825,9 @@ function FiringNowPage() {
           ))}
         </tbody>
       </table>
-      {rows.length > 500 && <p className="dim" style={{marginTop:8}}>Showing 500 of {rows.length}. Narrow with filters.</p>}
+      {hasMore && <ScrollSentinel onVisible={loadMore} disabled={loading} />}
+      {loading && rows.length > 0 && <div className="loading dim" style={{padding:12}}>Loading more…</div>}
+      {!hasMore && rows.length > 0 && <div className="dim" style={{padding:12,textAlign:'center'}}>All {(meta.total ?? rows.length).toLocaleString()} loaded.</div>}
     </div>
   );
 }
