@@ -469,7 +469,11 @@ class FundamentalsListView(APIView):
                 if isinstance(v, float) and not math.isfinite(v):
                     row[k] = None
             result.append(row)
-        return Response({'fundamentals': result, 'total': len(result)})
+        # Fundamental has no computed/updated column; the report `date` is the freshness proxy.
+        from django.db.models import Max
+        last = Fundamental.objects.aggregate(m=Max('date'))['m']
+        return Response({'fundamentals': result, 'total': len(result),
+                         'last_updated': str(last) if last else None})
 
 
 class TrendStudyListView(APIView):
@@ -501,7 +505,10 @@ class TrendStudyListView(APIView):
             })
         # .order_by() clears the model's default ordering, else it pollutes DISTINCT.
         modes = sorted(TrendStudy.objects.order_by().values_list("hold_mode", flat=True).distinct())
-        return Response({"total": len(data), "strategies": data, "modes": modes})
+        from django.db.models import Max
+        last = TrendStudy.objects.aggregate(m=Max('computed_at'))['m']
+        return Response({"total": len(data), "strategies": data, "modes": modes,
+                         "last_updated": last.isoformat() if last else None})
 
 
 class TrendStudyDetailView(APIView):
@@ -554,7 +561,10 @@ class StockDrilldownListView(APIView):
                 "best_stocks": d.best_stocks,
                 "worst_stocks": d.worst_stocks,
             })
-        return Response({"total": len(data), "drilldowns": data})
+        from django.db.models import Max
+        last = StockDrilldown.objects.aggregate(m=Max('computed_at'))['m']
+        return Response({"total": len(data), "drilldowns": data,
+                         "last_updated": last.isoformat() if last else None})
 
 
 class RefreshView(APIView):
@@ -1024,9 +1034,12 @@ class NewsEffectView(APIView):
             r["llm_horizon"] = r.pop("local_horizon")
             r["llm_rating"] = r.pop("local_rating")
             clean.append({k: _f(v) for k, v in r.items()})
+        from django.db.models import Max
+        _last = NewsItem.objects.aggregate(m=Max('created_at'))['m']
         return Response({
             "n_total": n_total, "n_effect": n_effect, "cats": cats, "acats": acats,
             "returned": len(clean), "offset": offset, "limit": limit, "results": clean,
+            "last_updated": _last.isoformat() if _last else None,
         })
 
 
@@ -1227,9 +1240,12 @@ class NewsClusterView(APIView):
         def _f(v):
             return None if (isinstance(v, float) and not math.isfinite(v)) else v
         out = [{k: _f(v) for k, v in c.items()} for c in clusters[:limit]]
+        from django.db.models import Max
+        _last = NewsItem.objects.aggregate(m=Max('created_at'))['m']
         return Response({
             "n_total": n_total, "n_faded": n_faded, "returned": len(out),
             "gap": gap, "min_items": min_items, "results": out,
+            "last_updated": _last.isoformat() if _last else None,
         })
 
 
