@@ -36,6 +36,91 @@ function ErrorBanner({ message, onRetry, onDismiss }) {
   );
 }
 
+// ---- Reusable table sorting ---------------------------------------------------
+// useSortedRows(rows, initialKey, initialDir, accessors)
+//   - requestSort(key): toggles dir if same key, else selects key with a sensible
+//     default direction ('desc' for numbers, 'asc' for strings).
+//   - Sorting detects the value type per key from the first non-null value; numbers
+//     compare numerically, strings via case-insensitive localeCompare. null/undefined/
+//     NaN ALWAYS sort to the bottom regardless of direction. Stable for equal keys.
+//   - accessors[key](row) supplies the sort value for computed/derived columns.
+function sortValue(row, key, accessors) {
+  if (accessors && accessors[key]) return accessors[key](row);
+  return row ? row[key] : undefined;
+}
+function isNil(v) {
+  return v === null || v === undefined || (typeof v === 'number' && isNaN(v));
+}
+function useSortedRows(rows, initialKey = null, initialDir = 'desc', accessors = null) {
+  const [sortKey, setSortKey] = useState(initialKey);
+  const [sortDir, setSortDir] = useState(initialDir);
+  const requestSort = useCallback((key) => {
+    setSortKey(prevKey => {
+      if (prevKey === key) {
+        setSortDir(d => (d === 'asc' ? 'desc' : 'asc'));
+        return prevKey;
+      }
+      // New column: infer default direction from the first non-null value's type.
+      let firstVal;
+      if (Array.isArray(rows)) {
+        for (let i = 0; i < rows.length; i++) {
+          const v = sortValue(rows[i], key, accessors);
+          if (!isNil(v)) { firstVal = v; break; }
+        }
+      }
+      setSortDir(typeof firstVal === 'string' ? 'asc' : 'desc');
+      return key;
+    });
+  }, [rows, accessors]);
+
+  const sortedRows = React.useMemo(() => {
+    if (!Array.isArray(rows) || !sortKey) return rows;
+    // Detect type from first non-null value.
+    let sample;
+    for (let i = 0; i < rows.length; i++) {
+      const v = sortValue(rows[i], sortKey, accessors);
+      if (!isNil(v)) { sample = v; break; }
+    }
+    const isString = typeof sample === 'string';
+    const dirMul = sortDir === 'asc' ? 1 : -1;
+    // Decorate with original index for a stable sort.
+    const decorated = rows.map((row, i) => ({ row, i, v: sortValue(row, sortKey, accessors) }));
+    decorated.sort((a, b) => {
+      const an = isNil(a.v), bn = isNil(b.v);
+      if (an && bn) return a.i - b.i;      // both null -> keep order
+      if (an) return 1;                     // nulls always to the bottom
+      if (bn) return -1;
+      let cmp;
+      if (isString) cmp = String(a.v).localeCompare(String(b.v), undefined, { sensitivity: 'base' });
+      else cmp = a.v < b.v ? -1 : a.v > b.v ? 1 : 0;
+      if (cmp !== 0) return cmp * dirMul;
+      return a.i - b.i;                     // stable for equal keys
+    });
+    return decorated.map(d => d.row);
+  }, [rows, sortKey, sortDir, accessors]);
+
+  return { rows: sortedRows, sortKey, sortDir, requestSort };
+}
+
+// Reusable sortable header cell. `sort` is the object returned by useSortedRows.
+function SortTh({ label, colKey, sort, className, title, align, style, children }) {
+  const active = sort && sort.sortKey === colKey;
+  const arrow = active ? (sort.sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+  const cls = 'sortable-th' + (active ? ' sorted' : '') + (className ? ' ' + className : '');
+  const st = { ...(align ? { textAlign: align } : {}), ...(style || {}) };
+  return (
+    <th
+      className={cls}
+      title={title}
+      style={st}
+      onClick={() => sort && sort.requestSort(colKey)}
+    >
+      {children != null ? children : label}
+      <span className="sort-arrow">{arrow || '⇅'}</span>
+    </th>
+  );
+}
+
 // Site-wide plain-English glossary. Wrap any jargon in <Term k="cagr">CAGR</Term> to get a hover ?.
 const GLOSSARY = {
   cagr: ['CAGR', 'Compound Annual Growth Rate — the smoothed yearly % an investment would need to grow at to go from start value to end value over the period. Strips out the lumpiness of individual years.'],
@@ -256,9 +341,10 @@ function SectorTable({ data, onSectorClick, onEtfClick, sortCol, sortDir, onSort
         <thead>
           <tr>
             <th>#</th>
-            {['sector','etf','rsi','rsi_sma','sortino','omega','cvar','ulcer','up_capture','down_capture','beta','corr_spy','corr_qqq','beta_qqq','signal','crossover_days_ago','gap_pct'].map(key => {
-              const labels = {sector:'Sector',etf:'ETF',rsi:'RSI',rsi_sma:'SMA',sortino:'Sortino',omega:'Omega',cvar:'CVaR',ulcer:'Ulcer',up_capture:'Up%',down_capture:'Dn%',beta:'Beta',corr_spy:'cSPY',corr_qqq:'cQQQ',beta_qqq:'βQQQ',signal:'Signal',crossover_days_ago:'Cr',gap_pct:'Gap'};
+            {['sector','etf','pe','rsi','rsi_sma','sortino','omega','cvar','ulcer','up_capture','down_capture','beta','corr_spy','corr_qqq','beta_qqq','signal','crossover_days_ago','gap_pct'].map(key => {
+              const labels = {sector:'Sector',etf:'ETF',pe:'P/E',rsi:'RSI',rsi_sma:'SMA',sortino:'Sortino',omega:'Omega',cvar:'CVaR',ulcer:'Ulcer',up_capture:'Up%',down_capture:'Dn%',beta:'Beta',corr_spy:'cSPY',corr_qqq:'cQQQ',beta_qqq:'βQQQ',signal:'Signal',crossover_days_ago:'Cr',gap_pct:'Gap'};
               const tips = {
+                pe: 'Forward P/E of the sector ETF (falls back to trailing P/E) from the fundamentals feed. Lower = cheaper relative to expected earnings.',
                 rsi: 'RSI(10): Relative Strength Index over 10 days. Above 50 = bullish momentum, below 50 = bearish.',
                 rsi_sma: 'SMA(10) of RSI: 10-period simple moving average of the RSI. RSI crossing above this = buy signal.',
                 sortino: 'Sortino Ratio (10d): Return per unit of downside risk. Higher = better risk-adjusted returns. Green = beats SPY.',
@@ -290,6 +376,7 @@ function SectorTable({ data, onSectorClick, onEtfClick, sortCol, sortDir, onSort
               <td className="dim">{i + 1}</td>
               <td className="sector-name" onClick={() => onSectorClick(r.sector)}>{r.sector}</td>
               <td className="etf clickable" onClick={() => onEtfClick(r.etf)}>{r.etf}</td>
+              <td className="dim">{r.pe != null ? r.pe.toFixed(1) : '–'}</td>
               <td className={r.rsi_above_sma ? 'good' : 'bad'}>{r.rsi?.toFixed(0)}</td>
               <td className="dim">{r.rsi_sma?.toFixed(0)}</td>
               <td><Val val={r.sortino} spyVal={data.spy_sortino} /><Arrow trend={r.sortino_trend} /></td>
@@ -740,6 +827,10 @@ function ChartView({ ticker, onClose, embedded = false, sectorEtf = null }) {
 }
 
 function StockTable({ sector, data, onBack, onTickerClick }) {
+  const sort = useSortedRows(data && data.stocks, null, 'desc', {
+    cross: r => r.crossover_days_ago,
+    gap: r => r.gap_pct,
+  });
   if (!data) return <div className="loading">Loading stocks for {sector}...</div>;
   if (!data.stocks || data.stocks.length === 0) return null;
   return (
@@ -750,12 +841,12 @@ function StockTable({ sector, data, onBack, onTickerClick }) {
       <table>
         <thead>
           <tr>
-            <th><Term k="rank">#</Term></th><th><Term k="ticker">Ticker</Term></th><th><Term k="weight">Wt%</Term></th><th><Term k="price">Price</Term></th><th><Term k="ret1w">1W</Term></th><th><Term k="ret1m">1M</Term></th>
-            <th><Term k="rsi">RSI</Term></th><th><Term k="sma">SMA</Term></th><th><Term k="spread">Spread</Term></th><th><Term k="sortino">Sortino</Term></th><th><Term k="beta">Beta</Term></th><th><Term k="cross">Cross</Term></th><th><Term k="gap">Gap</Term></th><th><Term k="signal">Signal</Term></th>
+            <th><Term k="rank">#</Term></th><SortTh colKey="ticker" sort={sort}><Term k="ticker">Ticker</Term></SortTh><SortTh colKey="weight" sort={sort}><Term k="weight">Wt%</Term></SortTh><SortTh colKey="price" sort={sort}><Term k="price">Price</Term></SortTh><SortTh colKey="return_1w" sort={sort}><Term k="ret1w">1W</Term></SortTh><SortTh colKey="return_1m" sort={sort}><Term k="ret1m">1M</Term></SortTh>
+            <SortTh colKey="rsi" sort={sort}><Term k="rsi">RSI</Term></SortTh><SortTh colKey="rsi_sma" sort={sort}><Term k="sma">SMA</Term></SortTh><SortTh colKey="rsi_spread" sort={sort}><Term k="spread">Spread</Term></SortTh><SortTh colKey="sortino" sort={sort}><Term k="sortino">Sortino</Term></SortTh><SortTh colKey="beta" sort={sort}><Term k="beta">Beta</Term></SortTh><SortTh colKey="cross" sort={sort}><Term k="cross">Cross</Term></SortTh><SortTh colKey="gap" sort={sort}><Term k="gap">Gap</Term></SortTh><SortTh colKey="signal" sort={sort}><Term k="signal">Signal</Term></SortTh>
           </tr>
         </thead>
         <tbody>
-          {data.stocks.map((s, i) => (
+          {sort.rows.map((s, i) => (
             <tr key={s.ticker} className={s.rsi_above_sma ? 'row-bullish' : 'row-bearish'}>
               <td className="dim">{i + 1}</td>
               <td className="ticker clickable" onClick={() => onTickerClick(s.ticker, data.etf)}>{s.ticker}</td>
@@ -1111,6 +1202,9 @@ function StudyChartView({ study, onBack }) {
 
   const trades = (sectorTrades?.trades || []).filter(t => (t.etf || t.sector) === sector);
   const wins = trades.filter(t => (t.return ?? t.return_pct ?? 0) > 0).length;
+  const tradesSort = useSortedRows(trades, null, 'desc', {
+    ret: t => (t.return ?? t.return_pct ?? 0),
+  });
 
   return (
     <div className="study-chart-page">
@@ -1137,9 +1231,9 @@ function StudyChartView({ study, onBack }) {
           <h3 style={{fontSize:14,marginBottom:8}}>Trades on {sector}</h3>
           <div className="trades-table-wrap">
             <table className="trades-table">
-              <thead><tr><th><Term k="entrydate">Entry</Term></th><th><Term k="exitdate">Exit</Term></th><th><Term k="entry">Entry $</Term></th><th><Term k="exitprice">Exit $</Term></th><th><Term k="retcol">Return</Term></th><th><Term k="spy">SPY</Term></th><th><Term k="alphacol">Alpha</Term></th><th><Term k="avghold">Hold</Term></th><th><Term k="drawdown">DD</Term></th><th><Term k="peak">Peak</Term></th><th><Term k="peak">Peak Ret</Term></th><th><Term k="ret90d">90d Ret</Term></th></tr></thead>
+              <thead><tr><SortTh colKey="entry_date" sort={tradesSort}><Term k="entrydate">Entry</Term></SortTh><SortTh colKey="exit_date" sort={tradesSort}><Term k="exitdate">Exit</Term></SortTh><SortTh colKey="entry_price" sort={tradesSort}><Term k="entry">Entry $</Term></SortTh><SortTh colKey="exit_price" sort={tradesSort}><Term k="exitprice">Exit $</Term></SortTh><SortTh colKey="ret" sort={tradesSort}><Term k="retcol">Return</Term></SortTh><SortTh colKey="spy_ret" sort={tradesSort}><Term k="spy">SPY</Term></SortTh><SortTh colKey="alpha" sort={tradesSort}><Term k="alphacol">Alpha</Term></SortTh><SortTh colKey="hold_days" sort={tradesSort}><Term k="avghold">Hold</Term></SortTh><SortTh colKey="max_drawdown" sort={tradesSort}><Term k="drawdown">DD</Term></SortTh><SortTh colKey="peak_day" sort={tradesSort}><Term k="peak">Peak</Term></SortTh><SortTh colKey="peak_ret" sort={tradesSort}><Term k="peak">Peak Ret</Term></SortTh><SortTh colKey="ret_90d" sort={tradesSort}><Term k="ret90d">90d Ret</Term></SortTh></tr></thead>
               <tbody>
-                {trades.map((t, i) => {
+                {tradesSort.rows.map((t, i) => {
                   const ret = t.return ?? t.return_pct ?? 0;
                   return (
                     <tr key={i} className={ret > 0 ? 'row-bullish' : 'row-bearish'}>
@@ -1637,6 +1731,7 @@ function TrendStudiesPage() {
   const [modeFilter, setModeFilter] = useState('all');
   const equityCanvas = useRef(null);
   const MODE_LABELS = { etf: 'ETF', momentum: 'Momentum stock', hibeta: 'Hi-beta stock' };
+  const logSort = useSortedRows(detail && detail.trade_log, null, 'desc');
 
   useEffect(() => {
     fetch(`${API}/trend-studies`).then(r => r.json()).then(d => setData(d)).catch(() => {});
@@ -1721,9 +1816,9 @@ function TrendStudiesPage() {
             <h3 style={{fontSize:14,marginBottom:8}}>Rotation Log</h3>
             <div className="trades-table-wrap">
               <table className="trades-table">
-                <thead><tr><th><Term k="datecol">Date</Term></th><th><Term k="endcol">End</Term></th><th><Term k="sector">Sectors</Term></th>{detail.hold_mode && detail.hold_mode !== 'etf' && <th><Term k="held">Held ({MODE_LABELS[detail.hold_mode] || detail.hold_mode})</Term></th>}<th><Term k="retcol">Return</Term></th></tr></thead>
+                <thead><tr><SortTh colKey="date" sort={logSort}><Term k="datecol">Date</Term></SortTh><SortTh colKey="end_date" sort={logSort}><Term k="endcol">End</Term></SortTh><th><Term k="sector">Sectors</Term></th>{detail.hold_mode && detail.hold_mode !== 'etf' && <th><Term k="held">Held ({MODE_LABELS[detail.hold_mode] || detail.hold_mode})</Term></th>}<SortTh colKey="return_pct" sort={logSort}><Term k="retcol">Return</Term></SortTh></tr></thead>
                 <tbody>
-                  {detail.trade_log.map((t, i) => (
+                  {logSort.rows.map((t, i) => (
                     <tr key={i} className={t.return_pct > 0 ? 'row-bullish' : 'row-bearish'}>
                       <td>{t.date}</td>
                       <td>{t.end_date}</td>
@@ -1840,6 +1935,9 @@ function TradeJournalPage() {
   const wins = closed.filter(e => (e.side === 'BUY' ? e.exit_price > e.price : e.exit_price < e.price)).length;
   const tickers = [...new Set(entries.map(e => e.ticker))].sort();
   const filtered = filter === 'all' ? entries : entries.filter(e => e.ticker === filter);
+  const jSort = useSortedRows(filtered, null, 'desc', {
+    pnl: e => (e.exit_price ? (e.side === 'BUY' ? e.exit_price - e.price : e.price - e.exit_price) * (e.quantity || 1) : null),
+  });
 
   return (
     <div className="studies-page">
@@ -1928,10 +2026,10 @@ function TradeJournalPage() {
           <div className="trades-table-wrap">
             <table className="trades-table">
               <thead>
-                <tr><th><Term k="datecol">Date</Term></th><th><Term k="ticker">Ticker</Term></th><th><Term k="side">Side</Term></th><th><Term k="entry">Entry</Term></th><th><Term k="exitprice">Exit</Term></th><th><Term k="exitdate">Exit Date</Term></th><th><Term k="qty">Qty</Term></th><th><Term k="pnl">P&L</Term></th><th><Term k="strategy">Strategy</Term></th><th><Term k="notes">Notes</Term></th><th></th></tr>
+                <tr><SortTh colKey="date" sort={jSort}><Term k="datecol">Date</Term></SortTh><SortTh colKey="ticker" sort={jSort}><Term k="ticker">Ticker</Term></SortTh><SortTh colKey="side" sort={jSort}><Term k="side">Side</Term></SortTh><SortTh colKey="price" sort={jSort}><Term k="entry">Entry</Term></SortTh><SortTh colKey="exit_price" sort={jSort}><Term k="exitprice">Exit</Term></SortTh><SortTh colKey="exit_date" sort={jSort}><Term k="exitdate">Exit Date</Term></SortTh><SortTh colKey="quantity" sort={jSort}><Term k="qty">Qty</Term></SortTh><SortTh colKey="pnl" sort={jSort}><Term k="pnl">P&L</Term></SortTh><SortTh colKey="strategy" sort={jSort}><Term k="strategy">Strategy</Term></SortTh><SortTh colKey="notes" sort={jSort}><Term k="notes">Notes</Term></SortTh><th></th></tr>
               </thead>
               <tbody>
-                {filtered.map(e => {
+                {jSort.rows.map(e => {
                   const pnl = e.exit_price ? (e.side === 'BUY' ? e.exit_price - e.price : e.price - e.exit_price) * (e.quantity || 1) : null;
                   const pnlPct = e.exit_price && e.price ? ((e.side === 'BUY' ? e.exit_price - e.price : e.price - e.exit_price) / e.price * 100) : null;
                   return (
@@ -2516,9 +2614,32 @@ function FiringNowPage() {
   const [sectorFilter, setSectorFilter] = useState('all');
   const [maxDays, setMaxDays] = useState(5);
   const [running, setRunning] = useState(false);
+  const [peMap, setPeMap] = useState({});
+  // P/E is sourced from the shared /fundamentals feed by ticker (fallback to the row's own
+  // pe_ratio). Memoized accessor keeps useSortedRows' 'pe' column stable across renders.
+  const peAccessors = React.useMemo(() => ({
+    pe: r => {
+      const v = peMap[r.ticker];
+      return v != null ? v : (r.pe_ratio != null ? r.pe_ratio : null);
+    },
+  }), [peMap]);
+  const fSort = useSortedRows(data && data.results, null, 'desc', peAccessors);
 
   const load = () => fetch(`${API}/live-signals?limit=2000`).then(r => r.json()).then(setData).catch(e => setErr(e.message));
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    apiFetch('/fundamentals')
+      .then(d => {
+        const fr = (d && d.fundamentals) || [];
+        const m = {};
+        fr.forEach(x => {
+          const v = x.forward_pe != null ? x.forward_pe : x.pe_ratio;
+          if (x.ticker != null && v != null) m[x.ticker] = v;
+        });
+        setPeMap(m);
+      })
+      .catch(() => {});
+  }, []);
 
   const runScan = () => {
     setRunning(true);
@@ -2544,7 +2665,7 @@ function FiringNowPage() {
     );
   }
 
-  let rows = data.results.filter(r => {
+  let rows = fSort.rows.filter(r => {
     if (sigFilter !== 'all' && r.signal_key !== sigFilter) return false;
     if (sectorFilter !== 'all' && !(r.sectors || []).includes(sectorFilter)) return false;
     if (r.days_ago > maxDays) return false;
@@ -2595,10 +2716,10 @@ function FiringNowPage() {
 
       <table className="studies-table">
         <thead><tr>
-          <th><Term k="ticker">Ticker</Term></th><th><Term k="signal">Signal</Term></th><th style={{textAlign:'right'}}><Term k="fired">Fired</Term></th>
-          <th style={{textAlign:'right'}}><Term k="histedge">Hist Ret</Term></th><th style={{textAlign:'right'}}><Term k="winrate">Hist Win%</Term></th>
-          <th style={{textAlign:'right'}}><Term k="avgdip">Hist Dip</Term></th><th style={{textAlign:'right'}}><Term k="cleanpct">Clean%</Term></th>
-          <th style={{textAlign:'right'}}><Term k="lastclose">Last</Term></th><th><Term k="marketcap">Mkt Cap</Term></th><th><Term k="pe">PE</Term></th><th><Term k="smartmoney">Smart money</Term></th><th><Term k="sector">Sectors</Term></th>
+          <SortTh colKey="ticker" sort={fSort}><Term k="ticker">Ticker</Term></SortTh><SortTh colKey="signal_name" sort={fSort}><Term k="signal">Signal</Term></SortTh><SortTh colKey="days_ago" sort={fSort} align="right"><Term k="fired">Fired</Term></SortTh>
+          <SortTh colKey="hist_avg_return" sort={fSort} align="right"><Term k="histedge">Hist Ret</Term></SortTh><SortTh colKey="hist_win_rate" sort={fSort} align="right"><Term k="winrate">Hist Win%</Term></SortTh>
+          <SortTh colKey="hist_avg_mae" sort={fSort} align="right"><Term k="avgdip">Hist Dip</Term></SortTh><SortTh colKey="hist_clean_pct" sort={fSort} align="right"><Term k="cleanpct">Clean%</Term></SortTh>
+          <SortTh colKey="last_close" sort={fSort} align="right"><Term k="lastclose">Last</Term></SortTh><th><Term k="marketcap">Mkt Cap</Term></th><SortTh colKey="pe" sort={fSort} align="right"><Term k="pe">P/E</Term></SortTh><th><Term k="smartmoney">Smart money</Term></th><th><Term k="sector">Sectors</Term></th>
         </tr></thead>
         <tbody>
           {rows.slice(0, 500).map(r => (
@@ -2612,7 +2733,10 @@ function FiringNowPage() {
               <td style={{textAlign:'right'}} className={r.hist_clean_pct == null ? 'dim' : r.hist_clean_pct >= 40 ? 'good' : r.hist_clean_pct < 20 ? 'bad' : ''}>{r.hist_clean_pct != null ? `${r.hist_clean_pct.toFixed(0)}%` : '–'}</td>
               <td style={{textAlign:'right'}} className="dim">{r.last_close}</td>
               <td>{(r.fund_buckets || {})['Market cap'] || <span className="dim">–</span>}</td>
-              <td className="dim">{r.pe_ratio != null ? r.pe_ratio.toFixed(1) : '–'}</td>
+              <td style={{textAlign:'right'}} className="dim">{(() => {
+                const v = peMap[r.ticker] != null ? peMap[r.ticker] : r.pe_ratio;
+                return v != null ? v.toFixed(1) : '–';
+              })()}</td>
               <td style={{fontSize:11}}>{(() => {
                 const fmt = v => v >= 1e9 ? `$${(v/1e9).toFixed(1)}B` : v >= 1e6 ? `$${(v/1e6).toFixed(1)}M` : `$${(v/1e3).toFixed(0)}K`;
                 const p = [];
@@ -2638,6 +2762,7 @@ function NewsHorizonPage() {
   const [robustOnly, setRobustOnly] = useState(true);
   const [catFilter, setCatFilter] = useState('all');
   const [running, setRunning] = useState(false);
+  const hSort = useSortedRows(data && data.results, null, 'desc');
 
   const load = () => fetch(`${API}/news-horizon?limit=2000`).then(r => r.json()).then(setData).catch(e => setErr(e.message));
   useEffect(() => { load(); }, []);
@@ -2666,7 +2791,7 @@ function NewsHorizonPage() {
     );
   }
 
-  let rows = data.results.filter(r => {
+  let rows = hSort.rows.filter(r => {
     if (stance !== 'all' && r.stance !== stance) return false;
     if (robustOnly && !r.robust) return false;
     if (catFilter !== 'all' && r.cat !== catFilter) return false;
@@ -2706,10 +2831,10 @@ function NewsHorizonPage() {
 
       <table className="studies-table">
         <thead><tr>
-          <th><Term k="ticker">Ticker</Term></th><th><Term k="newstype">News type</Term></th><th><Term k="dir">Dir</Term></th><th style={{textAlign:'right'}}><Term k="dayabn">Day-1 β-adj</Term></th>
-          <th><Term k="horizon">Horizon</Term></th><th style={{textAlign:'right'}}><Term k="window_ret">Window</Term></th><th><Term k="stance">Stance</Term></th>
-          <th style={{textAlign:'right'}}><Term k="histdrift">Hist drift</Term></th><th style={{textAlign:'right'}}><Term k="marketcap">Mkt cap</Term></th>
-          <th style={{textAlign:'right'}}><Term k="lastclose">Last</Term></th><th><Term k="sector">Sectors</Term></th>
+          <SortTh colKey="ticker" sort={hSort}><Term k="ticker">Ticker</Term></SortTh><SortTh colKey="cat" sort={hSort}><Term k="newstype">News type</Term></SortTh><SortTh colKey="direction" sort={hSort}><Term k="dir">Dir</Term></SortTh><SortTh colKey="pop_pct" sort={hSort} align="right"><Term k="dayabn">Day-1 β-adj</Term></SortTh>
+          <SortTh colKey="horizon" sort={hSort}><Term k="horizon">Horizon</Term></SortTh><SortTh colKey="days_left" sort={hSort} align="right"><Term k="window_ret">Window</Term></SortTh><SortTh colKey="stance" sort={hSort}><Term k="stance">Stance</Term></SortTh>
+          <SortTh colKey="exp_drift" sort={hSort} align="right"><Term k="histdrift">Hist drift</Term></SortTh><SortTh colKey="market_cap" sort={hSort} align="right"><Term k="marketcap">Mkt cap</Term></SortTh>
+          <SortTh colKey="last_close" sort={hSort} align="right"><Term k="lastclose">Last</Term></SortTh><th><Term k="sector">Sectors</Term></th>
         </tr></thead>
         <tbody>
           {rows.slice(0, 500).map(r => (
@@ -3177,6 +3302,7 @@ function SmartMoneyPopup({ ticker, onClose }) {
     fetch(`${API}/smart-money?ticker=${encodeURIComponent(ticker)}`)
       .then(r => r.json()).then(j => j.error ? setErr(j.error) : setD(j)).catch(e => setErr(e.message));
   }, [ticker]);
+  const smSort = useSortedRows(d && d.insider, null, 'desc');
   const money = v => v == null ? '–' : v >= 1e9 ? `$${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `$${(v / 1e6).toFixed(2)}M` : `$${(v / 1e3).toFixed(0)}K`;
   const filingList = (arr, tip) => arr.length
     ? <ul className="sm-pop-list">{arr.map((f, i) => <li key={i}><span className="dim">{f.filed_date}</span> <span className="mono">{f.accession}</span></li>)}</ul>
@@ -3211,8 +3337,8 @@ function SmartMoneyPopup({ ticker, onClose }) {
             </div>
             {d.insider.length
               ? <table className="studies-table" style={{ marginTop: 6 }}>
-                  <thead><tr><th><Term k="filed">Filed</Term></th><th style={{ textAlign: 'right' }}><Term k="buys">Buys</Term></th><th style={{ textAlign: 'right' }}><Term k="ntx">#tx</Term></th><th style={{ textAlign: 'right' }}><Term k="sells">Sells</Term></th></tr></thead>
-                  <tbody>{d.insider.map((it, i) => (
+                  <thead><tr><SortTh colKey="filed_date" sort={smSort}><Term k="filed">Filed</Term></SortTh><SortTh colKey="buy_value" sort={smSort} align="right"><Term k="buys">Buys</Term></SortTh><SortTh colKey="buy_count" sort={smSort} align="right"><Term k="ntx">#tx</Term></SortTh><SortTh colKey="sell_value" sort={smSort} align="right"><Term k="sells">Sells</Term></SortTh></tr></thead>
+                  <tbody>{smSort.rows.map((it, i) => (
                     <tr key={i}>
                       <td className="dim">{it.filed_date}</td>
                       <td style={{ textAlign: 'right' }} className={it.buy_value ? 'good' : 'dim'}>{it.buy_value ? money(it.buy_value) : '–'}</td>
@@ -3412,6 +3538,8 @@ function AdDivergencePage() {
   const [smTicker, setSmTicker] = useState(null);
   const [hideKnives, setHideKnives] = useState(true);
   const [hideLowQual, setHideLowQual] = useState(true);
+  const primedSort = useSortedRows(data && data.results, null, 'desc');
+  const watchSort = useSortedRows(data && data.results, null, 'desc');
 
   const load = () => fetch(`${API}/ad-divergence?limit=1000`).then(r => r.json()).then(setData).catch(e => setErr(e.message));
   useEffect(() => { load(); }, []);
@@ -3455,8 +3583,8 @@ function AdDivergencePage() {
   const primedAll = data.results.filter(r => r.primed);
   const nKnives = primedAll.filter(r => r.knife).length;
   const nLowQual = primedAll.filter(r => r.low_quality && !r.knife).length;
-  const primed = primedAll.filter(r => !drop(r));
-  const watch = data.results.filter(r => !r.primed && !drop(r));
+  const primed = primedSort.rows.filter(r => r.primed && !drop(r));
+  const watch = watchSort.rows.filter(r => !r.primed && !drop(r));
   const bucket = r => (r.fund_buckets || {})['Market cap'] || null;
 
   return (
@@ -3477,10 +3605,10 @@ function AdDivergencePage() {
       </p>
       <table className="studies-table">
         <thead><tr>
-          <th><Term k="ticker">Ticker</Term></th><th><Term k="trigger">Capitulation trigger</Term></th><th style={{textAlign:'right'}}><Term k="fired">Fired</Term></th>
-          <th style={{textAlign:'right'}}><Term k="fires60d">Fires 60d</Term></th><th style={{textAlign:'right'}}><Term k="pctofflow">% off low</Term></th>
-          <th style={{textAlign:'right'}}><Term k="histedge">Hist Ret</Term></th><th style={{textAlign:'right'}}><Term k="winrate">Hist Win%</Term></th><th style={{textAlign:'right'}}><Term k="ntrades">Trades</Term></th>
-          <th><Term k="bestexit">Best exit</Term></th><th style={{textAlign:'right'}}><Term k="lastclose">Last</Term></th><th><Term k="marketcap">Mkt Cap</Term></th><th><Term k="pe">PE</Term></th><th><Term k="smartmoney">Smart money</Term></th><th><Term k="sector">Sectors</Term></th>
+          <SortTh colKey="ticker" sort={primedSort}><Term k="ticker">Ticker</Term></SortTh><th><Term k="trigger">Capitulation trigger</Term></th><SortTh colKey="min_days_ago" sort={primedSort} align="right"><Term k="fired">Fired</Term></SortTh>
+          <SortTh colKey="fires_60d" sort={primedSort} align="right"><Term k="fires60d">Fires 60d</Term></SortTh><SortTh colKey="pct_above_low" sort={primedSort} align="right"><Term k="pctofflow">% off low</Term></SortTh>
+          <SortTh colKey="hist_avg_return" sort={primedSort} align="right"><Term k="histedge">Hist Ret</Term></SortTh><SortTh colKey="hist_win_rate" sort={primedSort} align="right"><Term k="winrate">Hist Win%</Term></SortTh><SortTh colKey="hist_trades" sort={primedSort} align="right"><Term k="ntrades">Trades</Term></SortTh>
+          <SortTh colKey="best_exit_key" sort={primedSort}><Term k="bestexit">Best exit</Term></SortTh><SortTh colKey="last_close" sort={primedSort} align="right"><Term k="lastclose">Last</Term></SortTh><th><Term k="marketcap">Mkt Cap</Term></th><SortTh colKey="pe_ratio" sort={primedSort}><Term k="pe">PE</Term></SortTh><th><Term k="smartmoney">Smart money</Term></th><th><Term k="sector">Sectors</Term></th>
         </tr></thead>
         <tbody>
           {primed.map(r => (
@@ -3513,7 +3641,7 @@ function AdDivergencePage() {
       <p className="subtitle">The weaker version of the read: money-flow is diverging up, but no price-capitulation signal is firing yet. Worth watching for a trigger.</p>
       <table className="studies-table">
         <thead><tr>
-          <th><Term k="ticker">Ticker</Term></th><th style={{textAlign:'right'}}><Term k="lastclose">Last</Term></th><th><Term k="marketcap">Mkt Cap</Term></th><th><Term k="pe">PE</Term></th><th><Term k="smartmoney">Smart money</Term></th><th><Term k="sector">Sectors</Term></th>
+          <SortTh colKey="ticker" sort={watchSort}><Term k="ticker">Ticker</Term></SortTh><SortTh colKey="last_close" sort={watchSort} align="right"><Term k="lastclose">Last</Term></SortTh><th><Term k="marketcap">Mkt Cap</Term></th><SortTh colKey="pe_ratio" sort={watchSort}><Term k="pe">PE</Term></SortTh><th><Term k="smartmoney">Smart money</Term></th><th><Term k="sector">Sectors</Term></th>
         </tr></thead>
         <tbody>
           {watch.map(r => (
@@ -3579,6 +3707,11 @@ function IntersectionPage() {
       }).catch(() => setRunning(false));
   };
 
+  const iSort = useSortedRows(result && result.rows, null, 'desc', {
+    combo0: r => (r.combo || [])[0],
+    combo1: r => (r.combo || [])[1],
+    combo2: r => (r.combo || [])[2],
+  });
   if (!meta) return <div className="loading">Loading…</div>;
   return (
     <div className="studies-page">
@@ -3611,9 +3744,9 @@ function IntersectionPage() {
             <span className="dim">{(result.dims || []).join(' ∩ ')}</span>
           </div>
           <table className="studies-table">
-            <thead><tr>{(result.dims || []).map(d => <th key={d}><Term k="dimcol">{d}</Term></th>)}<th style={{textAlign:'right'}}><Term k="avgreturn">Avg</Term></th><th style={{textAlign:'right'}}><Term k="lift">Lift</Term></th><th style={{textAlign:'right'}}><Term k="winrate">Win%</Term></th><th style={{textAlign:'right'}}><Term k="ntrades">Trades</Term></th></tr></thead>
+            <thead><tr>{(result.dims || []).map((d, di) => <SortTh key={d} colKey={`combo${di}`} sort={iSort}><Term k="dimcol">{d}</Term></SortTh>)}<SortTh colKey="avg" sort={iSort} align="right"><Term k="avgreturn">Avg</Term></SortTh><SortTh colKey="lift" sort={iSort} align="right"><Term k="lift">Lift</Term></SortTh><SortTh colKey="wr" sort={iSort} align="right"><Term k="winrate">Win%</Term></SortTh><SortTh colKey="trades" sort={iSort} align="right"><Term k="ntrades">Trades</Term></SortTh></tr></thead>
             <tbody>
-              {(result.rows || []).map((r, i) => (
+              {iSort.rows.map((r, i) => (
                 <tr key={i} className={r.lift > 0 ? 'row-bullish' : 'row-bearish'}>
                   {r.combo.map((c, j) => <td key={j} style={{fontSize:11}}>{c}</td>)}
                   <td style={{textAlign:'right'}} className={r.avg > 0 ? 'good' : 'bad'}><b>{r.avg > 0 ? '+' : ''}{r.avg}%</b></td>
@@ -3644,6 +3777,10 @@ function PlaybookPage() {
       }).catch(() => {}), 8000);
     }).catch(() => setRunning(false));
   };
+  const pbSort = useSortedRows(d && d.candidates, null, 'desc', {
+    risk: c => (c.risk ? c.risk.score : null),
+    histedge: c => c.hist_avg_return,
+  });
   if (err) return <div className="error">Error: {err}</div>;
   if (!d) return <div className="loading">Loading playbook...</div>;
 
@@ -3710,12 +3847,12 @@ function PlaybookPage() {
       <Step n="3" title="Today's candidates through the full funnel" sub="Ranked A-first, IN-sector first, freshest fire first. Quality-filtered (≥$300M, ≥$5, no penny-microcaps). Historical edge = the trigger's best exit from the sweep (directional, survivorship-caveated).">
         <table className="studies-table">
           <thead><tr>
-            <th><Term k="mode">Mode</Term></th><th><Term k="ticker">Ticker</Term></th><th><Term k="sector">Sector</Term></th><th><Term k="trigger">Trigger</Term></th><th><Term k="risk">Risk</Term></th><th style={{ textAlign: 'right' }}><Term k="fired">Fired</Term></th>
-            <th><Term k="adline">A/D</Term></th><th style={{ textAlign: 'right' }}><Term k="pct52w">%52w</Term></th><th style={{ textAlign: 'right' }}><Term k="histedge">Hist edge</Term></th>
-            <th style={{ textAlign: 'right' }}><Term k="lastclose">Last</Term></th><th><Term k="marketcap">Mkt cap</Term></th><th><Term k="smartmoney">Smart money</Term></th>
+            <SortTh colKey="mode" sort={pbSort}><Term k="mode">Mode</Term></SortTh><SortTh colKey="ticker" sort={pbSort}><Term k="ticker">Ticker</Term></SortTh><SortTh colKey="sector" sort={pbSort}><Term k="sector">Sector</Term></SortTh><SortTh colKey="trigger" sort={pbSort}><Term k="trigger">Trigger</Term></SortTh><SortTh colKey="risk" sort={pbSort}><Term k="risk">Risk</Term></SortTh><SortTh colKey="days_ago" sort={pbSort} align="right"><Term k="fired">Fired</Term></SortTh>
+            <SortTh colKey="ad_state" sort={pbSort}><Term k="adline">A/D</Term></SortTh><SortTh colKey="pct_52w" sort={pbSort} align="right"><Term k="pct52w">%52w</Term></SortTh><SortTh colKey="histedge" sort={pbSort} align="right"><Term k="histedge">Hist edge</Term></SortTh>
+            <SortTh colKey="last_close" sort={pbSort} align="right"><Term k="lastclose">Last</Term></SortTh><SortTh colKey="market_cap" sort={pbSort}><Term k="marketcap">Mkt cap</Term></SortTh><th><Term k="smartmoney">Smart money</Term></th>
           </tr></thead>
           <tbody>
-            {cands.map(c => (
+            {pbSort.rows.map(c => (
               <tr key={c.ticker} className="study-row">
                 <td><span className={`pb-mode pb-mode-${c.mode.toLowerCase()}`}>{c.mode}</span></td>
                 <td><b>{c.ticker}</b></td>
@@ -3754,11 +3891,15 @@ function PaperTrackRecord() {
   const load = () => fetch(`${API}/paper-trades`).then(r => r.json()).then(setD).catch(() => {});
   useEffect(() => { load(); }, []);
   const run = () => { setRunning(true); fetch(`${API}/paper-trades`, { method: 'POST' }).then(() => setTimeout(() => { load(); setRunning(false); }, 12000)).catch(() => setRunning(false)); };
+  const groupedTrades = d
+    ? (d.trades || []).filter(t => t.status === 'open').concat((d.trades || []).filter(t => t.status === 'closed'))
+    : null;
+  const pSort = useSortedRows(groupedTrades, null, 'desc', {
+    nowexit: t => (t.status === 'closed' ? t.exit_price : t.last_price),
+  });
   if (!d) return null;
   const s = d.summary || {};
   const trades = (d.trades || []);
-  const open = trades.filter(t => t.status === 'open');
-  const closed = trades.filter(t => t.status === 'closed');
   return (
     <div className="pb-step" style={{ marginTop: 18 }}>
       <div className="pb-step-head"><span className="pb-num">✓</span><div><b>Live paper track record</b><div className="subtitle" style={{ margin: '2px 0 0' }}>Forward out-of-sample: each Playbook pick is paper-bought when it first appears and closed on the sort_gt1 exit. This is the real evidence, accumulating over time.
@@ -3772,9 +3913,9 @@ function PaperTrackRecord() {
           <div className="fwd-card"><div className="fwd-num dim">{s.open_unrealized_avg != null ? (s.open_unrealized_avg > 0 ? '+' : '') + s.open_unrealized_avg + '%' : '–'}</div><div className="fwd-lbl">open unrealized</div></div>
         </div>
         <table className="studies-table">
-          <thead><tr><th><Term k="status">Status</Term></th><th><Term k="mode">Mode</Term></th><th><Term k="ticker">Ticker</Term></th><th><Term k="sector">Sector</Term></th><th><Term k="entrydate">Entry</Term></th><th style={{ textAlign: 'right' }}><Term k="entry">Entry $</Term></th><th style={{ textAlign: 'right' }}><Term k="exitprice">Now/Exit $</Term></th><th style={{ textAlign: 'right' }}><Term k="retcol">Return</Term></th></tr></thead>
+          <thead><tr><SortTh colKey="status" sort={pSort}><Term k="status">Status</Term></SortTh><SortTh colKey="mode" sort={pSort}><Term k="mode">Mode</Term></SortTh><SortTh colKey="ticker" sort={pSort}><Term k="ticker">Ticker</Term></SortTh><SortTh colKey="sector" sort={pSort}><Term k="sector">Sector</Term></SortTh><SortTh colKey="entry_date" sort={pSort}><Term k="entrydate">Entry</Term></SortTh><SortTh colKey="entry_price" sort={pSort} align="right"><Term k="entry">Entry $</Term></SortTh><SortTh colKey="nowexit" sort={pSort} align="right"><Term k="exitprice">Now/Exit $</Term></SortTh><SortTh colKey="ret_pct" sort={pSort} align="right"><Term k="retcol">Return</Term></SortTh></tr></thead>
           <tbody>
-            {open.concat(closed).slice(0, 60).map(t => (
+            {pSort.rows.slice(0, 60).map(t => (
               <tr key={`${t.ticker}|${t.entry_date}`} className="study-row">
                 <td><span className={t.status === 'open' ? 'good' : 'dim'}>{t.status}</span></td>
                 <td><span className={`pb-mode pb-mode-${(t.mode || 'a').toLowerCase()}`}>{t.mode}</span></td>
@@ -4070,6 +4211,14 @@ function BacktestLabPage() {
   const [sortBy, setSortBy] = useState('total_return');
   const [sortDir, setSortDir] = useState('desc');
   const [decomp, setDecomp] = useState(null);
+  const p2Sort = useSortedRows(data && data.phase2 && data.phase2.signals, null, 'desc', {
+    is_avg: s => (s.is || {}).avg,
+    is_t: s => (s.is || {}).t,
+    is_n: s => (s.is || {}).n,
+    oos_avg: s => (s.oos || {}).avg,
+    oos_t: s => (s.oos || {}).t,
+    oos_n: s => (s.oos || {}).n,
+  });
 
   const load = () => {
     setLoading(true); setErr(null);
@@ -4196,6 +4345,55 @@ function BacktestLabPage() {
           </table>
         </div>
 
+        {decomp && decomp.computed && (() => {
+          const dc = decomp.decomposition || {};
+          const rpp = (decomp.sma200_rotation || {}).rotation_plus_pick || {};
+          const pickArms = [
+            { label: '6-mo momentum rotation → cheapest-P/B (value) stock pick', s: dc.lowpb && dc.lowpb.arm3_rotation_plus_pick && dc.lowpb.arm3_rotation_plus_pick.summary },
+            { label: '6-mo momentum rotation → momentum stock pick', s: dc.momentum && dc.momentum.arm3_rotation_plus_pick && dc.momentum.arm3_rotation_plus_pick.summary },
+            { label: '200-day-MA rotation → cheapest-P/B (value) stock pick', s: rpp.lowpb && rpp.lowpb.summary },
+            { label: '200-day-MA rotation → momentum stock pick', s: rpp.momentum && rpp.momentum.summary },
+          ].filter(a => a.s);
+          if (!pickArms.length) return null;
+          return (
+            <div className="bt-pick-beats" style={{ marginTop: 20 }}>
+              <h2 className="bt-section">…but add the stock pick and it beats SPY</h2>
+              <p className="subtitle">ETF rotation alone doesn't beat SPY — rotating then buying the cheapest-P/B stock in each winning sector does (+264%, t2.19).</p>
+              <div className="bt-table-wrap">
+                <table className="studies-table bt-table">
+                  <thead><tr>
+                    <th>Rotation + pick</th>
+                    <th style={{ textAlign: 'right' }}>Total Return</th>
+                    <th style={{ textAlign: 'right' }}>vs SPY</th>
+                    <th style={{ textAlign: 'right' }}><Term k="sharpe">Sharpe</Term></th>
+                    <th style={{ textAlign: 'right' }}><Term k="drawdown">Max DD</Term></th>
+                    <th style={{ textAlign: 'right' }}>Sig (t)</th>
+                    <th style={{ textAlign: 'right' }}>Periods</th>
+                  </tr></thead>
+                  <tbody>
+                    {pickArms.map((a, i) => {
+                      const s = a.s;
+                      const beat = (s.vs_spy ?? 0) > 0;
+                      const sig = s.t_stat != null && Math.abs(s.t_stat) >= 2;
+                      return (
+                        <tr key={i} className={beat ? 'bt-beat' : ''}>
+                          <td>{beat ? <b>{a.label}</b> : a.label}</td>
+                          <td style={{ textAlign: 'right' }} className={beat ? 'good' : ''}><b>{fmtPct(s.total_return)}</b></td>
+                          <td style={{ textAlign: 'right' }} className={beat ? 'good' : 'bad'}>{fmtPct(s.vs_spy)}</td>
+                          <td style={{ textAlign: 'right' }}>{fmtNum(s.sharpe)}</td>
+                          <td style={{ textAlign: 'right' }} className="bad">{fmtPct(s.max_drawdown, false)}</td>
+                          <td style={{ textAlign: 'right' }} className={sig ? 'good' : s.t_stat != null && Math.abs(s.t_stat) < 1 ? 'bad' : ''}>{fmtNum(s.t_stat)}</td>
+                          <td style={{ textAlign: 'right' }}>{s.periods ?? '–'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          );
+        })()}
+
         {topStrat && topStrat.curve && topStrat.curve.length > 1 && <>
           <div className="bt-curve-head">
             <span className="bt-legend"><span className="bt-swatch strat" /> {topStrat.label} <span className="dim">(top)</span></span>
@@ -4234,12 +4432,12 @@ function BacktestLabPage() {
         <div className="bt-table-wrap">
           <table className="studies-table bt-table">
             <thead><tr>
-              <th>Signal</th><th>Exit</th>
-              <th style={{ textAlign: 'right' }}>IS avg</th><th style={{ textAlign: 'right' }}>IS t</th><th style={{ textAlign: 'right' }}>IS n</th>
-              <th style={{ textAlign: 'right' }}>OOS avg</th><th style={{ textAlign: 'right' }}>OOS t</th><th style={{ textAlign: 'right' }}>OOS n</th>
+              <SortTh colKey="signal" sort={p2Sort}>Signal</SortTh><SortTh colKey="exit" sort={p2Sort}>Exit</SortTh>
+              <SortTh colKey="is_avg" sort={p2Sort} align="right">IS avg</SortTh><SortTh colKey="is_t" sort={p2Sort} align="right">IS t</SortTh><SortTh colKey="is_n" sort={p2Sort} align="right">IS n</SortTh>
+              <SortTh colKey="oos_avg" sort={p2Sort} align="right">OOS avg</SortTh><SortTh colKey="oos_t" sort={p2Sort} align="right">OOS t</SortTh><SortTh colKey="oos_n" sort={p2Sort} align="right">OOS n</SortTh>
             </tr></thead>
             <tbody>
-              {p2.signals.map((s, i) => {
+              {p2Sort.rows.map((s, i) => {
                 const is = s.is || {}, oos = s.oos || {};
                 const robust = oos.t != null && Math.abs(oos.t) >= 2;
                 return (
@@ -4301,6 +4499,11 @@ function ResearchPage() {
       }).catch(() => {}), 15000);
     }).catch(() => setRunning(false));
   };
+  const rMatrix = useSortedRows(d && d.matrix, null, 'desc');
+  const rTf = useSortedRows(d && d.timeframe, null, 'desc');
+  const rReg = useSortedRows(d && d.regimes, null, 'desc');
+  const rCap = useSortedRows(d && d.capband, null, 'desc');
+  const rTrig = useSortedRows(d && d.triggers, null, 'desc');
   if (!d) return <div className="loading">Loading research...</div>;
   const pct = (v, plus) => v == null ? '–' : `${plus && v > 0 ? '+' : ''}${v}%`;
   const best = (arr, key) => Math.max(...arr.map(x => x[key] ?? -1e9));
@@ -4317,8 +4520,8 @@ function ResearchPage() {
       {!d.computed ? <div className="empty-state" style={{ padding: '30px 0' }}><button className="refresh-btn" onClick={run} disabled={running}>{running ? 'Running…' : 'Run research'}</button></div> : <>
 
         <Sec t="① Trigger × Exit matrix" sub="Which entry trigger and exit gives the best portfolio. Green = best CAGR / Sharpe in column.">
-          <table className="studies-table"><thead><tr><th><Term k="signal">Trigger</Term></th><th><Term k="exit">Exit</Term></th><th style={{ textAlign: 'right' }}><Term k="cagr">CAGR</Term></th><th style={{ textAlign: 'right' }}><Term k="drawdown">Max DD</Term></th><th style={{ textAlign: 'right' }}><Term k="sharpe">Sharpe</Term></th><th style={{ textAlign: 'right' }}><Term k="cagr">OOS CAGR</Term></th></tr></thead>
-            <tbody>{d.matrix.map((m, i) => (
+          <table className="studies-table"><thead><tr><SortTh colKey="trigger" sort={rMatrix}><Term k="signal">Trigger</Term></SortTh><SortTh colKey="exit" sort={rMatrix}><Term k="exit">Exit</Term></SortTh><SortTh colKey="cagr" sort={rMatrix} align="right"><Term k="cagr">CAGR</Term></SortTh><SortTh colKey="dd" sort={rMatrix} align="right"><Term k="drawdown">Max DD</Term></SortTh><SortTh colKey="sharpe" sort={rMatrix} align="right"><Term k="sharpe">Sharpe</Term></SortTh><SortTh colKey="oos_cagr" sort={rMatrix} align="right"><Term k="cagr">OOS CAGR</Term></SortTh></tr></thead>
+            <tbody>{rMatrix.rows.map((m, i) => (
               <tr key={i} className="study-row">
                 <td>{m.trigger}</td><td className="dim">{m.exit}</td>
                 <td style={{ textAlign: 'right' }} className={m.cagr === best(d.matrix, 'cagr') ? 'good' : ''}>{pct(m.cagr, 1)}</td>
@@ -4329,18 +4532,18 @@ function ResearchPage() {
         </Sec>
 
         <Sec t="② Entry timeframe" sub="Daily vs weekly vs multi-timeframe mix (exit = sort_gt1).">
-          <table className="studies-table"><thead><tr><th><Term k="timeframe">Timeframe</Term></th><th style={{ textAlign: 'right' }}><Term k="ntrades">n</Term></th><th style={{ textAlign: 'right' }}><Term k="cagr">CAGR</Term></th><th style={{ textAlign: 'right' }}><Term k="drawdown">Max DD</Term></th><th style={{ textAlign: 'right' }}><Term k="sharpe">Sharpe</Term></th></tr></thead>
-            <tbody>{d.timeframe.map((t, i) => (<tr key={i} className="study-row"><td><b>{t.tf}</b></td><td style={{ textAlign: 'right' }} className="dim">{t.n}</td><td style={{ textAlign: 'right' }}>{pct(t.cagr, 1)}</td><td style={{ textAlign: 'right' }} className="dim">{pct(t.dd)}</td><td style={{ textAlign: 'right' }} className={t.sharpe === best(d.timeframe, 'sharpe') ? 'good' : ''}>{t.sharpe}</td></tr>))}</tbody></table>
+          <table className="studies-table"><thead><tr><SortTh colKey="tf" sort={rTf}><Term k="timeframe">Timeframe</Term></SortTh><SortTh colKey="n" sort={rTf} align="right"><Term k="ntrades">n</Term></SortTh><SortTh colKey="cagr" sort={rTf} align="right"><Term k="cagr">CAGR</Term></SortTh><SortTh colKey="dd" sort={rTf} align="right"><Term k="drawdown">Max DD</Term></SortTh><SortTh colKey="sharpe" sort={rTf} align="right"><Term k="sharpe">Sharpe</Term></SortTh></tr></thead>
+            <tbody>{rTf.rows.map((t, i) => (<tr key={i} className="study-row"><td><b>{t.tf}</b></td><td style={{ textAlign: 'right' }} className="dim">{t.n}</td><td style={{ textAlign: 'right' }}>{pct(t.cagr, 1)}</td><td style={{ textAlign: 'right' }} className="dim">{pct(t.dd)}</td><td style={{ textAlign: 'right' }} className={t.sharpe === best(d.timeframe, 'sharpe') ? 'good' : ''}>{t.sharpe}</td></tr>))}</tbody></table>
         </Sec>
 
         <Sec t="③ Market regime (when to be in cash)" sub="Price (SPY<200dMA) vs curve-steepening vs always-in.">
-          <table className="studies-table"><thead><tr><th><Term k="regime">Regime</Term></th><th style={{ textAlign: 'right' }}><Term k="cagr">CAGR</Term></th><th style={{ textAlign: 'right' }}><Term k="drawdown">Max DD</Term></th><th style={{ textAlign: 'right' }}><Term k="sharpe">Sharpe</Term></th></tr></thead>
-            <tbody>{d.regimes.map((x, i) => (<tr key={i} className="study-row"><td>{x.regime}</td><td style={{ textAlign: 'right' }}>{pct(x.cagr, 1)}</td><td style={{ textAlign: 'right' }} className="dim">{pct(x.dd)}</td><td style={{ textAlign: 'right' }} className={x.sharpe === best(d.regimes, 'sharpe') ? 'good' : ''}>{x.sharpe}</td></tr>))}</tbody></table>
+          <table className="studies-table"><thead><tr><SortTh colKey="regime" sort={rReg}><Term k="regime">Regime</Term></SortTh><SortTh colKey="cagr" sort={rReg} align="right"><Term k="cagr">CAGR</Term></SortTh><SortTh colKey="dd" sort={rReg} align="right"><Term k="drawdown">Max DD</Term></SortTh><SortTh colKey="sharpe" sort={rReg} align="right"><Term k="sharpe">Sharpe</Term></SortTh></tr></thead>
+            <tbody>{rReg.rows.map((x, i) => (<tr key={i} className="study-row"><td>{x.regime}</td><td style={{ textAlign: 'right' }}>{pct(x.cagr, 1)}</td><td style={{ textAlign: 'right' }} className="dim">{pct(x.dd)}</td><td style={{ textAlign: 'right' }} className={x.sharpe === best(d.regimes, 'sharpe') ? 'good' : ''}>{x.sharpe}</td></tr>))}</tbody></table>
         </Sec>
 
         <Sec t="④ Risk by market-cap band" sub="Where the win rate and the 50%+ upside live.">
-          <table className="studies-table"><thead><tr><th><Term k="capband">Cap band</Term></th><th style={{ textAlign: 'right' }}><Term k="ntrades">n</Term></th><th style={{ textAlign: 'right' }}><Term k="winrate">Win%</Term></th><th style={{ textAlign: 'right' }}><Term k="avgreturn">Avg</Term></th><th style={{ textAlign: 'right' }}><Term k="hit50">Hit +50%</Term></th></tr></thead>
-            <tbody>{d.capband.map((c, i) => (<tr key={i} className="study-row"><td>{c.band}</td><td style={{ textAlign: 'right' }} className="dim">{c.n}</td><td style={{ textAlign: 'right' }} className={c.win === best(d.capband, 'win') ? 'good' : ''}>{c.win}%</td><td style={{ textAlign: 'right' }}>{pct(c.avg, 1)}</td><td style={{ textAlign: 'right' }} className={c.hit50 === best(d.capband, 'hit50') ? 'good' : 'dim'}>{c.hit50}%</td></tr>))}</tbody></table>
+          <table className="studies-table"><thead><tr><SortTh colKey="band" sort={rCap}><Term k="capband">Cap band</Term></SortTh><SortTh colKey="n" sort={rCap} align="right"><Term k="ntrades">n</Term></SortTh><SortTh colKey="win" sort={rCap} align="right"><Term k="winrate">Win%</Term></SortTh><SortTh colKey="avg" sort={rCap} align="right"><Term k="avgreturn">Avg</Term></SortTh><SortTh colKey="hit50" sort={rCap} align="right"><Term k="hit50">Hit +50%</Term></SortTh></tr></thead>
+            <tbody>{rCap.rows.map((c, i) => (<tr key={i} className="study-row"><td>{c.band}</td><td style={{ textAlign: 'right' }} className="dim">{c.n}</td><td style={{ textAlign: 'right' }} className={c.win === best(d.capband, 'win') ? 'good' : ''}>{c.win}%</td><td style={{ textAlign: 'right' }}>{pct(c.avg, 1)}</td><td style={{ textAlign: 'right' }} className={c.hit50 === best(d.capband, 'hit50') ? 'good' : 'dim'}>{c.hit50}%</td></tr>))}</tbody></table>
         </Sec>
 
         {d.mpt && <Sec t="⑤ MPT allocation across cap bands" sub="Inverse-vol weights + per-band Sharpe (bands are weakly correlated → diversification helps).">
@@ -4349,8 +4552,8 @@ function ResearchPage() {
         </Sec>}
 
         {d.triggers && <Sec t="⑥ Trigger × Accumulation grid" sub="Per-trade (sort_gt1 exit, Mode A only). Shows each trigger with vs without the accum-divergence requirement — accumulation is the biggest single lever.">
-          <table className="studies-table"><thead><tr><th><Term k="trigger">Trigger</Term></th><th><Term k="accumdiv">Accum-div?</Term></th><th style={{ textAlign: 'right' }}><Term k="ntrades">n</Term></th><th style={{ textAlign: 'right' }}><Term k="winrate">Win%</Term></th><th style={{ textAlign: 'right' }}><Term k="avgreturn">Avg</Term></th><th style={{ textAlign: 'right' }}><Term k="median">Median</Term></th></tr></thead>
-            <tbody>{d.triggers.map((t, i) => (
+          <table className="studies-table"><thead><tr><SortTh colKey="trigger" sort={rTrig}><Term k="trigger">Trigger</Term></SortTh><SortTh colKey="accum" sort={rTrig}><Term k="accumdiv">Accum-div?</Term></SortTh><SortTh colKey="n" sort={rTrig} align="right"><Term k="ntrades">n</Term></SortTh><SortTh colKey="win" sort={rTrig} align="right"><Term k="winrate">Win%</Term></SortTh><SortTh colKey="avg" sort={rTrig} align="right"><Term k="avgreturn">Avg</Term></SortTh><SortTh colKey="median" sort={rTrig} align="right"><Term k="median">Median</Term></SortTh></tr></thead>
+            <tbody>{rTrig.rows.map((t, i) => (
               <tr key={i} className="study-row">
                 <td>{t.trigger}</td>
                 <td className={t.accum ? 'good' : 'dim'}>{t.accum ? 'required' : 'ignored'}</td>
@@ -4460,18 +4663,20 @@ function NewsEventStudyPage() {
     ? <td key={c.key} className="dim">{r[c.key] == null ? '–' : r[c.key]}</td>
     : <td key={c.key} className={c.raw ? '' : cls(r[c.key])}>{r[c.key] == null ? '–' : (c.raw ? num(r[c.key]) : pct(r[c.key]))}</td>;
 
-  const Table = ({ title, note, rows, k0, k1 }) => (
+  const Table = ({ title, note, rows, k0, k1 }) => {
+    const tSort = useSortedRows(rows, null, 'desc');
+    return (
     <div style={{ marginBottom: 26 }}>
       <h3 style={{ marginBottom: 2 }}>{title}</h3>
       {note && <p className="subtitle" style={{ marginTop: 0 }}>{note}</p>}
       <div style={{ overflowX: 'auto' }}>
         <table className="studies-table">
           <thead><tr>
-            <th>{k0[1]}</th><th>{k1[1]}</th><th>n</th>
-            {RET_COLS.map(c => <th key={c.key}>{c.label}</th>)}
+            <SortTh colKey={k0[0]} sort={tSort}>{k0[1]}</SortTh><SortTh colKey={k1[0]} sort={tSort}>{k1[1]}</SortTh><SortTh colKey="n" sort={tSort}>n</SortTh>
+            {RET_COLS.map(c => <SortTh key={c.key} colKey={c.key} sort={tSort}>{c.label}</SortTh>)}
           </tr></thead>
           <tbody>
-            {(rows || []).map((r, i) => (
+            {tSort.rows.map((r, i) => (
               <tr key={i}>
                 <td>{r[k0[0]]}</td><td>{r[k1[0]]}</td><td>{r.n}</td>
                 {RET_COLS.map(c => cell(r, c))}
@@ -4481,7 +4686,8 @@ function NewsEventStudyPage() {
         </table>
       </div>
     </div>
-  );
+    );
+  };
 
   return (
     <div className="studies-page">
@@ -4545,6 +4751,7 @@ function IvCalibrationPage() {
   const [running, setRunning] = useState(false);
   const [order, setOrder] = useState('over');
   const [q, setQ] = useState('');
+  const ivSort = useSortedRows(data && data.per_ticker, null, 'desc');
 
   const load = () => fetch(`${API}/iv-calibration`).then(r => r.json()).then(setData).catch(e => setErr(e.message));
   useEffect(() => { load(); }, []);
@@ -4571,8 +4778,10 @@ function IvCalibrationPage() {
   }
 
   const a = data.aggregate || {};
-  let rows = (data.per_ticker || []).filter(r => !q || r.ticker.toLowerCase().includes(q.toLowerCase()));
-  rows = [...rows].sort((x, y) => order === 'over' ? x.median_ratio - y.median_ratio : y.median_ratio - x.median_ratio).slice(0, 60);
+  // Header-click sort (ivSort) takes precedence when active; otherwise use the over/under preset.
+  let rows = ivSort.rows.filter(r => !q || r.ticker.toLowerCase().includes(q.toLowerCase()));
+  if (!ivSort.sortKey) rows = [...rows].sort((x, y) => order === 'over' ? x.median_ratio - y.median_ratio : y.median_ratio - x.median_ratio);
+  rows = rows.slice(0, 60);
   const ratioCls = v => v < 0.5 ? 'bad' : v > 0.8 ? 'good' : 'dim';
   const cards = [
     ['Median ratio', a.median_ratio, 'fair ~0.67'],
@@ -4617,7 +4826,7 @@ function IvCalibrationPage() {
 
       <div style={{ overflowX: 'auto' }}>
         <table className="studies-table">
-          <thead><tr><th>Ticker</th><th>days</th><th>median ratio</th><th>% exceed 1σ</th><th>avg IV</th></tr></thead>
+          <thead><tr><SortTh colKey="ticker" sort={ivSort}>Ticker</SortTh><SortTh colKey="n" sort={ivSort}>days</SortTh><SortTh colKey="median_ratio" sort={ivSort}>median ratio</SortTh><SortTh colKey="pct_1sig" sort={ivSort}>% exceed 1σ</SortTh><SortTh colKey="avg_iv" sort={ivSort}>avg IV</SortTh></tr></thead>
           <tbody>
             {rows.map(r => (
               <tr key={r.ticker}>
@@ -4693,10 +4902,15 @@ function AltDataPage() {
   const [cRunning, setCRunning] = useState(false);
   const [dRunning, setDRunning] = useState(false);
   const [horizon, setHorizon] = useState(null);
+  const [congressBt, setCongressBt] = useState(null);
 
   const loadCongress = () => apiFetch('/congress-study').then(setCongress).catch(e => setCErr(e.message));
   const loadDelisted = () => apiFetch('/delisted-survivorship').then(setDelisted).catch(e => setDErr(e.message));
-  useEffect(() => { loadCongress(); loadDelisted(); }, []);
+  useEffect(() => {
+    loadCongress();
+    loadDelisted();
+    apiFetch('/congress-backtest').then(setCongressBt).catch(() => {});
+  }, []);
 
   // Poll after a POST until the study reports computed:true.
   const runCongress = () => {
@@ -4727,21 +4941,28 @@ function AltDataPage() {
   // Render a {label: {n,avg_ar,t_stat,win_rate}} slice as a compact sub-table.
   const Slice = ({ title, obj, limit }) => {
     const entries = Object.entries(obj || {}).sort((a, b) => (b[1]?.n ?? 0) - (a[1]?.n ?? 0));
-    const rows = limit ? entries.slice(0, limit) : entries;
-    if (!rows.length) return null;
+    const baseRows = limit ? entries.slice(0, limit) : entries;
+    const sliceSort = useSortedRows(baseRows, null, 'desc', {
+      label: r => r[0],
+      n: r => r[1]?.n,
+      avg_ar: r => r[1]?.avg_ar,
+      win_rate: r => r[1]?.win_rate,
+      t_stat: r => r[1]?.t_stat,
+    });
+    if (!baseRows.length) return null;
     return (
       <div style={{ minWidth: 260, flex: '1 1 300px' }}>
         <h4 style={{ margin: '4px 0 6px' }}>{title}</h4>
         <table className="studies-table">
           <thead><tr>
-            <th style={{ textAlign: 'left' }}>Bucket</th>
-            <th style={{ textAlign: 'right' }}>n</th>
-            <th style={{ textAlign: 'right' }}>AR</th>
-            <th style={{ textAlign: 'right' }}>Win%</th>
-            <th style={{ textAlign: 'right' }}>t</th>
+            <SortTh colKey="label" sort={sliceSort} align="left">Bucket</SortTh>
+            <SortTh colKey="n" sort={sliceSort} align="right">n</SortTh>
+            <SortTh colKey="avg_ar" sort={sliceSort} align="right">AR</SortTh>
+            <SortTh colKey="win_rate" sort={sliceSort} align="right">Win%</SortTh>
+            <SortTh colKey="t_stat" sort={sliceSort} align="right">t</SortTh>
           </tr></thead>
           <tbody>
-            {rows.map(([label, s]) => (
+            {sliceSort.rows.map(([label, s]) => (
               <tr key={label}>
                 <td>{label}</td>
                 <td style={{ textAlign: 'right' }}>{fmtN(s.n)}</td>
@@ -4847,6 +5068,24 @@ function AltDataPage() {
             </p>
           </>
         )}
+
+        {/* ── Follow-the-trades backtest ─────────────────────────────── */}
+        {congressBt && congressBt.computed !== false && congressBt.strategies && (() => {
+          const pretty = { follow_all_buys: 'Follow all buys', senate_buys_only: 'Senate buys only', large_buys_50k: 'Large buys (≥$50k)', follow_sells: 'Follow sells' };
+          const strats = Object.entries(congressBt.strategies)
+            .filter(([, v]) => v && v.curve && v.curve.length > 1)
+            .sort((a, b) => ((b[1].summary || {}).total_return ?? -Infinity) - ((a[1].summary || {}).total_return ?? -Infinity));
+          if (!strats.length) return null;
+          return (
+            <div style={{ marginTop: 14 }}>
+              <h4 style={{ margin: '10px 0 4px' }}>Follow-the-trades backtest (equity curve vs SPY)</h4>
+              {strats.map(([name, v], i) => (
+                <BacktestPanel key={name} title={pretty[name] || name} curve={v.curve} summary={v.summary} collapsible={i !== 0} />
+              ))}
+              <p className="subtitle" style={{ marginTop: 8, fontStyle: 'italic' }}>{congressBt.note}</p>
+            </div>
+          );
+        })()}
       </div>
 
       {/* ── Card 2: Delisted-survivorship audit ──────────────────────── */}
@@ -4943,6 +5182,8 @@ function DarkPoolPage() {
   const [detail, setDetail] = useState(null);
   const [detailErr, setDetailErr] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [bt, setBt] = useState(null);
+  const snapSort = useSortedRows(snap && snap.snapshot, null, 'desc');
 
   const loadSnap = () => { setSnapErr(null); apiFetch('/dark-pool').then(setSnap).catch(e => setSnapErr(e.message)); };
 
@@ -4958,10 +5199,11 @@ function DarkPoolPage() {
       .catch(e => { setDetailErr(e.message); setDetailLoading(false); });
   };
 
-  // On mount: market snapshot + preload the default ticker overlay.
+  // On mount: market snapshot + preload the default ticker overlay + historical backtest.
   useEffect(() => {
     loadSnap();
     loadTicker('CLF');
+    apiFetch('/darkpool-backtest').then(setBt).catch(() => {});
     // eslint-disable-next-line
   }, []);
 
@@ -5043,13 +5285,13 @@ function DarkPoolPage() {
         {snap && Array.isArray(snap.snapshot) && (
           <table className="studies-table darkpool-snap-table">
             <thead><tr>
-              <th style={{ textAlign: 'left' }}>Ticker</th>
-              <th>Off-exchange %</th>
-              <th style={{ textAlign: 'right' }}>Total volume</th>
-              <th style={{ textAlign: 'right' }}>Date</th>
+              <SortTh colKey="ticker" sort={snapSort} align="left">Ticker</SortTh>
+              <SortTh colKey="off_pct" sort={snapSort}>Off-exchange %</SortTh>
+              <SortTh colKey="total_vol" sort={snapSort} align="right">Total volume</SortTh>
+              <SortTh colKey="date" sort={snapSort} align="right">Date</SortTh>
             </tr></thead>
             <tbody>
-              {snap.snapshot.map((r) => {
+              {snapSort.rows.map((r) => {
                 const p = Number(r.off_pct);
                 const cls = p >= 0.6 ? 'bad' : p >= 0.45 ? 'good' : 'dim';
                 return (
@@ -5143,6 +5385,49 @@ function DarkPoolPage() {
             </tbody>
           </table>
         )}
+      </div>
+
+      {/* ── Historical dark-pool backtest ───────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Historical dark-pool backtest — equity curve vs SPY</h2>
+          {bt && (bt.last_updated || bt.computed_at) && <span className="last-updated-chip">Updated: {new Date(bt.last_updated || bt.computed_at).toLocaleString()}</span>}
+        </div>
+        {bt && bt.computed === false && (
+          <p className="subtitle darkpool-muted">{bt.note || 'Dark-pool backtest not computed yet — check back after the nightly sweep.'}</p>
+        )}
+        {bt && bt.computed !== false && bt.strategies && (() => {
+          const strats = Object.entries(bt.strategies)
+            .filter(([, v]) => v && v.curve && v.curve.length > 1)
+            .sort((a, b) => ((b[1].summary || {}).total_return ?? -Infinity) - ((a[1].summary || {}).total_return ?? -Infinity));
+          if (!strats.length) return <p className="subtitle darkpool-muted">No dark-pool strategies to show yet.</p>;
+          return (
+            <>
+              {strats.map(([name, v], i) => (
+                <BacktestPanel key={name} title={name} curve={v.curve} summary={v.summary} collapsible={i !== 0} />
+              ))}
+              {bt.buckets && Object.keys(bt.buckets).length > 0 && (
+                <table className="studies-table" style={{ marginTop: 12 }}>
+                  <thead><tr>
+                    <th style={{ textAlign: 'left' }}>Dark-pool bucket</th>
+                    <th style={{ textAlign: 'right' }}>Avg next-month return</th>
+                    <th style={{ textAlign: 'right' }}>n</th>
+                  </tr></thead>
+                  <tbody>
+                    {Object.entries(bt.buckets).map(([label, b]) => (
+                      <tr key={label}>
+                        <td>{label}</td>
+                        <td style={{ textAlign: 'right' }} className={b.avg_ret_pct > 0 ? 'good' : 'bad'}>{fmtAr(b.avg_ret_pct)}</td>
+                        <td style={{ textAlign: 'right' }} className="dim">{fmtN(b.n)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {bt.note && <p className="subtitle" style={{ marginTop: 8, fontStyle: 'italic' }}>{bt.note}</p>}
+            </>
+          );
+        })()}
       </div>
     </div>
   );
@@ -5289,8 +5574,25 @@ export default function App() {
   const [sortDir, setSortDir] = useState('desc');
   const [filter, setFilter] = useState('all');
   const [dashInterval, setDashInterval] = useState('1d');
+  const [peMap, setPeMap] = useState({});
 
   const [backendDown, setBackendDown] = useState(false);
+
+  // Fetch fundamentals ONCE and build a { ticker: forward_pe ?? pe_ratio } map so the
+  // dashboard board (SectorTable, keyed by ETF ticker) can show a P/E column.
+  useEffect(() => {
+    apiFetch('/fundamentals')
+      .then(d => {
+        const rows = (d && d.fundamentals) || [];
+        const m = {};
+        rows.forEach(r => {
+          const v = r.forward_pe != null ? r.forward_pe : r.pe_ratio;
+          if (r.ticker != null && v != null) m[r.ticker] = v;
+        });
+        setPeMap(m);
+      })
+      .catch(() => {});
+  }, []);
 
   const loadScan = (force = false, interval = dashInterval) => {
     setLoading(true);
@@ -5389,7 +5691,7 @@ export default function App() {
       if (filter === 'rotate') return s.rsi_crossover && s.bullish;
       if (filter === 'bearish') return s.signal === 'BEARISH';
       return true;
-    })
+    }).map(s => ({ ...s, pe: peMap[s.etf] != null ? peMap[s.etf] : null }))
   } : null;
 
   return (

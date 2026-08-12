@@ -216,6 +216,20 @@ thead th {
 th.sortable { cursor: pointer; }
 th.sortable:hover { color: var(--blue); }
 
+/* Reusable click-to-sort header cell (SortTh + useSortedRows). */
+th.sortable-th { cursor: pointer; user-select: none; }
+th.sortable-th:hover { color: var(--blue); }
+th.sortable-th .sort-arrow {
+  font-size: 9px;
+  margin-left: 3px;
+  color: var(--dim);
+  opacity: 0.22;
+  transition: opacity 0.12s ease;
+}
+th.sortable-th:hover .sort-arrow { opacity: 0.6; }
+th.sortable-th.sorted { color: var(--blue); }
+th.sortable-th.sorted .sort-arrow { opacity: 1; color: var(--blue); }
+
 tbody td {
   padding: 6px;
   border-bottom: 1px solid var(--border);
@@ -1070,6 +1084,14 @@ tbody tr:hover, .studies-table tbody tr:hover { background: var(--accent-weak); 
 }
 .bt-table td, .bt-table th { white-space: nowrap; }
 .bt-table tr.bt-beat td { background: rgba(63, 185, 80, 0.07); }
+/* "…but add the stock pick and it beats SPY" — clearly separated callout below Phase 1 */
+.bt-pick-beats {
+  border-top: 2px solid var(--green);
+  padding-top: 6px;
+  background: rgba(63, 185, 80, 0.04);
+  border-radius: 6px;
+  padding: 8px 10px 12px;
+}
 
 /* per-year beats-SPY grid */
 .bt-year-grid { font-variant-numeric: tabular-nums; }
