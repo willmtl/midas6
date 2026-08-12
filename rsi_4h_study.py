@@ -128,36 +128,59 @@ def fixed_for(tf):
     return [(f"{b}b", b, day_label(b, tf)) for b in FIXED_BARS]
 
 
+# Bucket every crossover by how OVERSOLD it was at the cross (RSI level) — averaging across all
+# crossovers blends a deep-oversold snap-back with a nothing mid-range cross and hides the edge.
+RSI_BUCKETS = [("<25", 0, 25), ("25-35", 25, 35), ("35-45", 35, 45),
+               ("45-55", 45, 55), ("55+", 55, 200)]
+
+
 def _entries_exits(close):
     rsi = ta.momentum.rsi(close, window=RSI_P)
     sma = rsi.rolling(SMA_P).mean()
     up = (rsi > sma) & (rsi.shift(1) <= sma.shift(1))       # RSI crosses above its SMA
     dn = (rsi < sma) & (rsi.shift(1) >= sma.shift(1))       # exit trigger: crosses back below
-    return up.fillna(False).values, dn.fillna(False).values
+    return up.fillna(False).values, dn.fillna(False).values, rsi.values
+
+
+def _rsi_bucket(v):
+    if v is None or not np.isfinite(v):
+        return None
+    for label, lo, hi in RSI_BUCKETS:
+        if lo <= v < hi:
+            return label
+    return None
 
 
 def backtest_df(df, fixed):
-    """Return {exit_key: [returns]} for one instrument (episode-deduped entries)."""
+    """Return (flat, by_bucket): flat = {exit_key: [returns]}; by_bucket = {rsi_bucket: {exit: [ret]}}
+    keyed by the RSI level AT the crossover. Episode-deduped entries."""
     close = df["Close"].reset_index(drop=True)
     n = len(close)
-    up, dn = _entries_exits(close)
-    idxs = [i for i in range(n) if up[i]]
-    idxs = sorted(_episode_starts(idxs, gap=GAP))
+    up, dn, rsi = _entries_exits(close)
+    idxs = sorted(_episode_starts([i for i in range(n) if up[i]], gap=GAP))
     cvals = close.values
-    res = {k: [] for k, _, _ in fixed}
-    res["rsi_x_dn"] = []      # hold until RSI crosses back below its SMA
+    keys = [k for k, _, _ in fixed] + ["rsi_x_dn"]
+    flat = {k: [] for k in keys}
+    by_bucket = {b[0]: {k: [] for k in keys} for b in RSI_BUCKETS}
     for i in idxs:
         ep = float(cvals[i])
         if ep <= 0:
             continue
+        bkt = by_bucket.get(_rsi_bucket(rsi[i]))
         for k, bars, _ in fixed:
             j = i + bars
             if j < n:
-                res[k].append((cvals[j] - ep) / ep * 100)
+                r = (cvals[j] - ep) / ep * 100
+                flat[k].append(r)
+                if bkt is not None:
+                    bkt[k].append(r)
         j = next((q for q in range(i + 1, n) if dn[q]), None)   # RSI cross-down exit
         if j is not None:
-            res["rsi_x_dn"].append((cvals[j] - ep) / ep * 100)
-    return res
+            r = (cvals[j] - ep) / ep * 100
+            flat["rsi_x_dn"].append(r)
+            if bkt is not None:
+                bkt["rsi_x_dn"].append(r)
+    return flat, by_bucket
 
 
 def agg_rows(pool, fixed):
@@ -178,25 +201,35 @@ def agg_rows(pool, fixed):
     return rows
 
 
+def _acc_buckets(bpool, flat, byb):
+    for b, d in byb.items():
+        for k, v in d.items():
+            bpool[b].setdefault(k, []).extend(v)
+
+
 def daily_backtest(tickers, fixed):
-    """Same RSI(14) crossover on DAILY DB candles, same exit bars, as a benchmark."""
+    """Same RSI(14) crossover on DAILY DB candles, same exit bars + RSI-level buckets, as a benchmark."""
     from seq_fundamental_study import load_candles
     pool = {}
+    bpool = {b[0]: {} for b in RSI_BUCKETS}
     daily = load_candles(tickers)
     n_used = 0
     for tk, df in daily.items():
         if len(df) < MIN_BARS:
             continue
         n_used += 1
-        r = backtest_df(df, fixed)
-        for k, v in r.items():
+        flat, byb = backtest_df(df, fixed)
+        for k, v in flat.items():
             pool.setdefault(k, []).extend(v)
-    return agg_rows(pool, fixed), n_used
+        _acc_buckets(bpool, flat, byb)
+    by_rsi = {b: agg_rows(bpool[b], fixed) for b in bpool}
+    return agg_rows(pool, fixed), by_rsi, n_used
 
 
 def run_tf(tf, etfs, years, allow_fetch):
     fixed = fixed_for(tf)
     pool = {}
+    bpool = {b[0]: {} for b in RSI_BUCKETS}
     got, spans = 0, []
     for i, tk in enumerate(etfs):
         df = get_tf(tk, tf, years, allow_fetch)
@@ -204,24 +237,29 @@ def run_tf(tf, etfs, years, allow_fetch):
             continue
         got += 1
         spans.append((tk, str(df.index[0].date()), str(df.index[-1].date())))
-        r = backtest_df(df, fixed)
-        for k, v in r.items():
+        flat, byb = backtest_df(df, fixed)
+        for k, v in flat.items():
             pool.setdefault(k, []).extend(v)
+        _acc_buckets(bpool, flat, byb)
         if (i + 1) % 20 == 0:
             print(f"  [{tf}] ...{i + 1}/{len(etfs)} ({got} with data)", flush=True)
     rows = agg_rows(pool, fixed)
-    rows_d, n_daily = daily_backtest([s[0] for s in spans] or etfs, fixed)
+    by_rsi = {b: agg_rows(bpool[b], fixed) for b in bpool}
+    rows_d, daily_by_rsi, n_daily = daily_backtest([s[0] for s in spans] or etfs, fixed)
     earliest = min((s[1] for s in spans), default=None)
     latest = max((s[2] for s in spans), default=None)
     payload = {
         "computed_at": pd.Timestamp.utcnow().isoformat(),
         "params": {"rsi_period": RSI_P, "sma_period": SMA_P, "timeframe": tf,
                    "universe": "93 sector ETFs", "n_with_data": got, "n_daily": n_daily,
-                   "episode_gap_bars": GAP, "history": {"from": earliest, "to": latest}},
-        "backtest_tf": rows, "backtest_daily": rows_d,
+                   "episode_gap_bars": GAP, "history": {"from": earliest, "to": latest},
+                   "rsi_buckets": [b[0] for b in RSI_BUCKETS]},
+        "backtest_tf": rows, "backtest_by_rsi": by_rsi,
+        "backtest_daily": rows_d, "daily_by_rsi": daily_by_rsi,
         "note": (f"EODHD 1h resampled to {tf} (8h/12h derived from cached 4h). Entry at the crossover "
-                 "bar's close; episode-deduped; NO fees. Exit holds are in BARS. Daily column runs the "
-                 "identical RSI(14) crossover on DB daily candles."),
+                 "bar's close; episode-deduped; NO fees. Exit holds are in BARS. backtest_by_rsi splits "
+                 "every crossover by the RSI level AT the cross (how oversold). Daily column = same "
+                 "RSI(14) crossover on DB daily candles."),
     }
     (STUD / f"rsi_{tf}_backtest.json").write_text(json.dumps(payload, indent=2, default=str))
     try:
@@ -233,10 +271,19 @@ def run_tf(tf, etfs, years, allow_fetch):
                       "computed_at": timezone.now()})
     except Exception as e:
         print(f"DB save failed [{tf}]:", e, flush=True)
-    print(f"\n=== RSI(14) crossover — {tf.upper()} ({got} ETFs, {earliest}→{latest}) ===", flush=True)
+    print(f"\n=== RSI(14) crossover — {tf.upper()} ({got} ETFs, {earliest}→{latest}) — ALL crossovers ===", flush=True)
     for r in rows:
         print(f"  {r['exit']:8} {r['name']:22} n={r['trades']:>6} avg {r['avg_pct']:>+6.2f}% "
               f"win {r['win_pct']:>5}% t={r['t']}", flush=True)
+    print(f"--- {tf.upper()} bucketed by RSI level AT the cross (longest hold {rows and fixed[-1][0]}) ---", flush=True)
+    longk = fixed[-1][0]
+    for label, _, _ in RSI_BUCKETS:
+        r = next((x for x in by_rsi[label] if x["exit"] == longk), None)
+        mid = next((x for x in by_rsi[label] if x["exit"] == "10b"), None)
+        if r:
+            m = f"  10b avg {mid['avg_pct']:+.2f}% t={mid['t']}" if mid else ""
+            print(f"  RSI {label:6} {longk} n={r['trades']:>5} avg {r['avg_pct']:>+6.2f}% "
+                  f"win {r['win_pct']:>5}% t={r['t']}{m}", flush=True)
     return payload
 
 
