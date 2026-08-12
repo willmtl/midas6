@@ -4673,11 +4673,353 @@ function ResearchHub() {
       <HubTabs initKey="sectors" tabs={[
         { key: 'sectors', label: 'Sectors', hash: '/research/sectors', match: ['sectors'], el: <StudiesPage /> },
         { key: 'stocks', label: 'Stock Indicator Studies', hash: '/research/stocks', match: ['stocks'], el: <StockStudiesPage /> },
+        { key: 'fundamentals', label: 'Fundamentals', hash: '/research/fundamentals', match: ['fundamentals'], el: <FundamentalsPage /> },
         { key: 'trends', label: 'Trend Studies', hash: '/research/trends', match: ['trends', 'trend'], el: <TrendStudiesPage /> },
         { key: 'backtest', label: 'Backtest', hash: '/research/backtest', match: ['backtest'], el: <BacktestPage /> },
         { key: 'lab', label: 'Research/Lab', hash: '/research/lab', match: ['lab'], el: <ResearchPage /> },
         { key: 'intersect', label: 'Intersections', hash: '/research/intersect', match: ['intersect'], el: <IntersectionPage /> },
       ]} />
+    </div>
+  );
+}
+
+// ── Alt-data validation (exploratory) ────────────────────────────────────────
+// Two OBSERVATIONAL studies surfaced side-by-side. NOT wired into signals/risk-rating.
+function AltDataPage() {
+  const [congress, setCongress] = useState(null);
+  const [delisted, setDelisted] = useState(null);
+  const [cErr, setCErr] = useState(null);
+  const [dErr, setDErr] = useState(null);
+  const [cRunning, setCRunning] = useState(false);
+  const [dRunning, setDRunning] = useState(false);
+  const [horizon, setHorizon] = useState(null);
+
+  const loadCongress = () => apiFetch('/congress-study').then(setCongress).catch(e => setCErr(e.message));
+  const loadDelisted = () => apiFetch('/delisted-survivorship').then(setDelisted).catch(e => setDErr(e.message));
+  useEffect(() => { loadCongress(); loadDelisted(); }, []);
+
+  // Poll after a POST until the study reports computed:true.
+  const runCongress = () => {
+    setCRunning(true);
+    fetch(`${API}/congress-study`, { method: 'POST' }).then(() => {
+      const t = setInterval(() => apiFetch('/congress-study').then(d => {
+        if (d.computed) { clearInterval(t); setCRunning(false); setCongress(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setCRunning(false));
+  };
+  const runDelisted = () => {
+    setDRunning(true);
+    fetch(`${API}/delisted-survivorship`, { method: 'POST' }).then(() => {
+      const t = setInterval(() => apiFetch('/delisted-survivorship').then(d => {
+        if (d.computed) { clearInterval(t); setDRunning(false); setDelisted(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setDRunning(false));
+  };
+
+  const arCls = (v) => (v == null ? 'dim' : v > 0 ? 'good' : 'bad');
+  const tCls = (v) => (v != null && Math.abs(v) >= 2 ? 'good' : 'dim');
+  const fmtAr = (v) => (v == null ? '–' : `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%`);
+  const fmtT = (v) => (v == null ? '–' : Number(v).toFixed(2));
+  const fmtWr = (v) => (v == null ? '–' : `${Number(v).toFixed(1)}%`);
+  const fmtN = (v) => (v == null ? '–' : Number(v).toLocaleString());
+  const updated = (d) => d && (d.last_updated || d.computed_at);
+
+  // Render a {label: {n,avg_ar,t_stat,win_rate}} slice as a compact sub-table.
+  const Slice = ({ title, obj, limit }) => {
+    const entries = Object.entries(obj || {}).sort((a, b) => (b[1]?.n ?? 0) - (a[1]?.n ?? 0));
+    const rows = limit ? entries.slice(0, limit) : entries;
+    if (!rows.length) return null;
+    return (
+      <div style={{ minWidth: 260, flex: '1 1 300px' }}>
+        <h4 style={{ margin: '4px 0 6px' }}>{title}</h4>
+        <table className="studies-table">
+          <thead><tr>
+            <th style={{ textAlign: 'left' }}>Bucket</th>
+            <th style={{ textAlign: 'right' }}>n</th>
+            <th style={{ textAlign: 'right' }}>AR</th>
+            <th style={{ textAlign: 'right' }}>Win%</th>
+            <th style={{ textAlign: 'right' }}>t</th>
+          </tr></thead>
+          <tbody>
+            {rows.map(([label, s]) => (
+              <tr key={label}>
+                <td>{label}</td>
+                <td style={{ textAlign: 'right' }}>{fmtN(s.n)}</td>
+                <td style={{ textAlign: 'right' }} className={arCls(s.avg_ar)}>{fmtAr(s.avg_ar)}</td>
+                <td style={{ textAlign: 'right' }} className="dim">{fmtWr(s.win_rate)}</td>
+                <td style={{ textAlign: 'right' }} className={tCls(s.t_stat)}>{fmtT(s.t_stat)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  // Chosen horizon for the slice breakdowns (default to first available).
+  const horizons = (congress && congress.horizons) || [];
+  const hSel = horizon != null ? horizon : (horizons[0] != null ? horizons[0] : null);
+  const hData = congress && congress.by_horizon ? congress.by_horizon[String(hSel)] : null;
+
+  // Top-N of a plain {label: count} breakdown.
+  const topEntries = (obj, n) => Object.entries(obj || {}).sort((a, b) => b[1] - a[1]).slice(0, n);
+
+  return (
+    <div className="altdata-page">
+      <h1>&#127963; Alt-Data</h1>
+      <p className="subtitle">Alt-data validation — exploratory, not wired into signals/risk-rating.</p>
+
+      {/* ── Card 1: Congressional trades ─────────────────────────────── */}
+      <div className="altdata-card">
+        <div className="altdata-card-head">
+          <h2>Congressional Trades</h2>
+          {updated(congress) && <span className="last-updated-chip">Updated: {new Date(updated(congress)).toLocaleString()}</span>}
+        </div>
+        {cErr && <ErrorBanner message={cErr} onRetry={() => { setCErr(null); loadCongress(); }} onDismiss={() => setCErr(null)} />}
+        {!congress && !cErr && <div className="loading">Loading congressional-trade study...</div>}
+        {congress && congress.computed === false && (
+          <div className="empty-state" style={{ padding: '24px 0' }}>
+            <p>{congress.message || 'Not computed yet.'}</p>
+            <button className="refresh-btn" onClick={runCongress} disabled={cRunning}>{cRunning ? 'Running…' : 'Run study'}</button>
+          </div>
+        )}
+        {congress && congress.computed !== false && congress.by_horizon && (
+          <>
+            <p className="subtitle" style={{ marginTop: 4 }}>
+              Point-in-time on the public <b>disclosure (report) date</b>; market-adjusted vs {congress.benchmark || 'SPY'}
+              {' '}(AR = stock return − benchmark return). <b>OBSERVATIONAL — not a tradeable backtest and NOT wired to risk-rating.</b>
+            </p>
+            <div className="altdata-meta">
+              {congress.universe_size != null && <span>Universe: <b>{fmtN(congress.universe_size)}</b></span>}
+              {congress.trades_used != null && <span>Disclosures used: <b>{fmtN(congress.trades_used)}</b></span>}
+            </div>
+
+            <h4 style={{ margin: '10px 0 4px' }}>Buy vs sell, market-adjusted, by holding horizon</h4>
+            <table className="studies-table">
+              <thead><tr>
+                <th style={{ textAlign: 'left' }}>Horizon</th>
+                <th style={{ textAlign: 'left' }}>Side</th>
+                <th style={{ textAlign: 'right' }}>n</th>
+                <th style={{ textAlign: 'right' }}>AR</th>
+                <th style={{ textAlign: 'right' }}>Win%</th>
+                <th style={{ textAlign: 'right' }}>t</th>
+              </tr></thead>
+              <tbody>
+                {horizons.map(h => {
+                  const s = congress.by_horizon[String(h)] || {};
+                  return ['buy', 'sell', 'overall'].map((side, i) => {
+                    const v = s[side];
+                    if (!v) return null;
+                    return (
+                      <tr key={`${h}-${side}`}>
+                        <td>{i === 0 ? <b>{h}d</b> : ''}</td>
+                        <td className="dim">{side}</td>
+                        <td style={{ textAlign: 'right' }}>{fmtN(v.n)}</td>
+                        <td style={{ textAlign: 'right' }} className={arCls(v.avg_ar)}>{fmtAr(v.avg_ar)}</td>
+                        <td style={{ textAlign: 'right' }} className="dim">{fmtWr(v.win_rate)}</td>
+                        <td style={{ textAlign: 'right' }} className={tCls(v.t_stat)}>{fmtT(v.t_stat)}</td>
+                      </tr>
+                    );
+                  });
+                })}
+              </tbody>
+            </table>
+
+            {horizons.length > 1 && (
+              <div className="altdata-meta" style={{ marginTop: 10 }}>
+                <span>Slice breakdowns for horizon:</span>
+                {horizons.map(h => (
+                  <button key={h} className={`altdata-hbtn ${String(hSel) === String(h) ? 'active' : ''}`} onClick={() => setHorizon(h)}>{h}d</button>
+                ))}
+              </div>
+            )}
+            {hData && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24, marginTop: 8 }}>
+                <Slice title="Buy · by chamber" obj={hData.buy_by_chamber} />
+                <Slice title="Sell · by chamber" obj={hData.sell_by_chamber} />
+                <Slice title="Buy · by amount bucket" obj={hData.buy_by_amount_bucket} />
+                <Slice title="Buy · by transaction type" obj={hData.buy_by_transaction_type} />
+                <Slice title="Buy · top members" obj={hData.buy_by_member_top15} limit={10} />
+              </div>
+            )}
+            <p className="subtitle" style={{ marginTop: 8, fontStyle: 'italic' }}>
+              AR green when positive; t green when |t| ≥ 2. {congress.note}
+            </p>
+          </>
+        )}
+      </div>
+
+      {/* ── Card 2: Delisted-survivorship audit ──────────────────────── */}
+      <div className="altdata-card">
+        <div className="altdata-card-head">
+          <h2>Delisted Survivorship Audit</h2>
+          {updated(delisted) && <span className="last-updated-chip">Updated: {new Date(updated(delisted)).toLocaleString()}</span>}
+        </div>
+        {dErr && <ErrorBanner message={dErr} onRetry={() => { setDErr(null); loadDelisted(); }} onDismiss={() => setDErr(null)} />}
+        {!delisted && !dErr && <div className="loading">Loading survivorship audit...</div>}
+        {delisted && delisted.computed === false && (
+          <div className="empty-state" style={{ padding: '24px 0' }}>
+            <p>{delisted.message || 'Not computed yet.'}</p>
+            <button className="refresh-btn" onClick={runDelisted} disabled={dRunning}>{dRunning ? 'Running…' : 'Run audit'}</button>
+          </div>
+        )}
+        {delisted && delisted.computed !== false && delisted.bias_magnitude && (
+          <>
+            <p className="subtitle" style={{ marginTop: 4 }}>
+              How much of the historical opportunity set our survivor-only universe never sees — a rough upper bound on upward bias.
+            </p>
+            <div className="altdata-statgrid">
+              <div className="altdata-stat">
+                <div className="altdata-stat-v">{fmtN(delisted.universe?.universe_size)}</div>
+                <div className="altdata-stat-l">Current study universe (survivors)</div>
+              </div>
+              <div className="altdata-stat">
+                <div className="altdata-stat-v">{fmtN(delisted.delisted?.common_stock_count)}</div>
+                <div className="altdata-stat-l">Delisted common stocks</div>
+              </div>
+              <div className="altdata-stat">
+                <div className="altdata-stat-v">{fmtN(delisted.delisted?.total_rows)}</div>
+                <div className="altdata-stat-l">Total delisted rows (all types)</div>
+              </div>
+              <div className="altdata-stat">
+                <div className="altdata-stat-v bad">{delisted.bias_magnitude?.ratio_delisted_common_over_universe_plus_delisted_common != null
+                  ? `${(delisted.bias_magnitude.ratio_delisted_common_over_universe_plus_delisted_common * 100).toFixed(1)}%` : '–'}</div>
+                <div className="altdata-stat-l">Bias magnitude — share of dead common names never tracked</div>
+              </div>
+            </div>
+            {delisted.bias_magnitude?.interpretation && (
+              <p className="subtitle" style={{ fontStyle: 'italic' }}>{delisted.bias_magnitude.interpretation}</p>
+            )}
+
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24, marginTop: 8 }}>
+              <div style={{ minWidth: 220, flex: '1 1 240px' }}>
+                <h4 style={{ margin: '4px 0 6px' }}>Delisted by security type</h4>
+                <table className="studies-table">
+                  <thead><tr><th style={{ textAlign: 'left' }}>Type</th><th style={{ textAlign: 'right' }}>Count</th></tr></thead>
+                  <tbody>
+                    {topEntries(delisted.breakdown_by_type, 10).map(([k, v]) => (
+                      <tr key={k}><td>{k}</td><td style={{ textAlign: 'right' }}>{fmtN(v)}</td></tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div style={{ minWidth: 220, flex: '1 1 240px' }}>
+                <h4 style={{ margin: '4px 0 6px' }}>Delisted by exchange (top 10)</h4>
+                <table className="studies-table">
+                  <thead><tr><th style={{ textAlign: 'left' }}>Exchange</th><th style={{ textAlign: 'right' }}>Count</th></tr></thead>
+                  <tbody>
+                    {topEntries(delisted.breakdown_by_exchange, 10).map(([k, v]) => (
+                      <tr key={k}><td>{k}</td><td style={{ textAlign: 'right' }}>{fmtN(v)}</td></tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {Array.isArray(delisted.implications) && delisted.implications.length > 0 && (
+              <div style={{ marginTop: 10 }}>
+                <h4 style={{ margin: '4px 0 6px' }}>Implications</h4>
+                <ul className="altdata-implications">
+                  {delisted.implications.map((s, i) => <li key={i}>{s}</li>)}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Fundamentals table with a compact analyst rating-distribution column (surfaces the
+// EODHD analyst consensus now imported per ticker). Lives in the Research hub.
+function FundamentalsPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [sortCol, setSortCol] = useState('market_cap');
+  const [sortDir, setSortDir] = useState('desc');
+  const [search, setSearch] = useState('');
+
+  useEffect(() => { apiFetch('/fundamentals').then(setData).catch(e => setErr(e.message)); }, []);
+
+  if (err) return <div className="error">Error: {err}</div>;
+  if (!data) return <div className="loading">Loading fundamentals...</div>;
+
+  const capFmt = (v) => {
+    if (v == null) return '–';
+    if (v >= 1e12) return `$${(v / 1e12).toFixed(2)}T`;
+    if (v >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
+    if (v >= 1e6) return `$${(v / 1e6).toFixed(0)}M`;
+    return `$${Number(v).toLocaleString()}`;
+  };
+  const num = (v, d = 1) => (v == null ? '–' : Number(v).toFixed(d));
+  // Compact analyst readout: SB·B·H·S·SS, strong-buy count in green. Full breakdown in title.
+  const analystCell = (r) => {
+    const parts = [r.analyst_strong_buy, r.analyst_buy, r.analyst_hold, r.analyst_sell, r.analyst_strong_sell];
+    const hasDist = parts.some(p => p != null);
+    const mean = r.analyst_rating_mean;
+    if (!hasDist && mean == null) return <span className="dim">–</span>;
+    const title = `Strong Buy ${r.analyst_strong_buy ?? '–'} · Buy ${r.analyst_buy ?? '–'} · Hold ${r.analyst_hold ?? '–'} · Sell ${r.analyst_sell ?? '–'} · Strong Sell ${r.analyst_strong_sell ?? '–'}${mean != null ? ` · mean ${Number(mean).toFixed(2)}/5 (higher = more bullish)` : ''}`;
+    return (
+      <span title={title}>
+        {hasDist && (
+          <span className="analyst-dist">
+            <span className="good">{r.analyst_strong_buy ?? 0}</span>
+            <span className="dim">·{r.analyst_buy ?? 0}·{r.analyst_hold ?? 0}·{r.analyst_sell ?? 0}·</span>
+            <span className="bad">{r.analyst_strong_sell ?? 0}</span>
+          </span>
+        )}
+        {mean != null && <span className="analyst-mean"> {Number(mean).toFixed(1)}</span>}
+      </span>
+    );
+  };
+
+  const q = search.trim().toLowerCase();
+  let rows = (data.fundamentals || []).filter(r => !q || (r.ticker && r.ticker.toLowerCase().includes(q)) || (r.sector && r.sector.toLowerCase().includes(q)));
+  rows = [...rows].sort((a, b) => {
+    const av = a[sortCol], bv = b[sortCol];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;              // nulls sort last regardless of dir
+    if (bv == null) return -1;
+    if (typeof av === 'string') return sortDir === 'desc' ? String(bv).localeCompare(String(av)) : String(av).localeCompare(String(bv));
+    return sortDir === 'desc' ? bv - av : av - bv;
+  });
+
+  const setSort = (col) => { if (sortCol === col) setSortDir(d => d === 'desc' ? 'asc' : 'desc'); else { setSortCol(col); setSortDir('desc'); } };
+  const arrow = (col) => sortCol === col ? (sortDir === 'desc' ? ' ▼' : ' ▲') : '';
+  const cols = [
+    ['ticker', 'Ticker', 'left'], ['sector', 'Sector', 'left'], ['market_cap', 'Mkt cap', 'right'],
+    ['pe_ratio', 'P/E', 'right'], ['forward_pe', 'Fwd P/E', 'right'], ['revenue_growth', 'Rev growth', 'right'],
+    ['profit_margin', 'Margin', 'right'], ['analyst_rating_mean', 'Analyst', 'right'],
+  ];
+
+  return (
+    <div className="studies-page">
+      <h1>Fundamentals <span className="dim">({data.total ?? rows.length})</span></h1>
+      <p className="subtitle">Per-ticker fundamentals with EODHD analyst consensus. The "Analyst" column shows Strong-Buy·Buy·Hold·Sell·Strong-Sell counts and the mean rating (1–5, higher = more bullish); sortable by mean.</p>
+      <input className="fund-search" placeholder="Filter by ticker or sector…" value={search} onChange={e => setSearch(e.target.value)} style={{ margin: '4px 0 10px', padding: '6px 10px', width: 260 }} />
+      <table className="studies-table">
+        <thead><tr>
+          {cols.map(([k, l, align]) => (
+            <th key={k} className="sortable" style={{ textAlign: align }} onClick={() => setSort(k)}>{l}{arrow(k)}</th>
+          ))}
+        </tr></thead>
+        <tbody>
+          {rows.slice(0, 500).map(r => (
+            <tr key={r.ticker}>
+              <td><b>{r.ticker}</b></td>
+              <td className="dim" style={{ fontSize: 11 }}>{r.sector || '–'}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{capFmt(r.market_cap)}</td>
+              <td style={{ textAlign: 'right' }}>{num(r.pe_ratio)}</td>
+              <td style={{ textAlign: 'right' }}>{num(r.forward_pe)}</td>
+              <td style={{ textAlign: 'right' }} className={r.revenue_growth > 0 ? 'good' : (r.revenue_growth < 0 ? 'bad' : 'dim')}>{r.revenue_growth == null ? '–' : `${(r.revenue_growth * 100).toFixed(1)}%`}</td>
+              <td style={{ textAlign: 'right' }} className={r.profit_margin > 0 ? 'good' : (r.profit_margin < 0 ? 'bad' : 'dim')}>{r.profit_margin == null ? '–' : `${(r.profit_margin * 100).toFixed(1)}%`}</td>
+              <td style={{ textAlign: 'right' }}>{analystCell(r)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {rows.length > 500 && <p className="subtitle">Showing first 500 of {rows.length} matches — filter to narrow.</p>}
     </div>
   );
 }
@@ -4695,6 +5037,7 @@ function parseHash() {
   const h = window.location.pathname;
   if (h.startsWith('/settings')) return { view: 'settings' };
   if (h.startsWith('/live')) return { view: 'live' };
+  if (h.startsWith('/alt-data')) return { view: 'altdata' };
   if (h.startsWith('/backtest')) return { view: 'backtestlab' };
   if (h.startsWith('/news')) return { view: 'news' };
   if (h.startsWith('/research')) return { view: 'research' };
@@ -4765,7 +5108,8 @@ export default function App() {
     const applyRoute = () => {
       const r = parseHash();
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
-                       journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab' };
+                       journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
+                       altdata: 'altdata' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
       else if (r.view === 'sector') { setPage('dashboard'); handleSectorClick(r.sector); }
       else if (r.view === 'chart') { setPage('dashboard'); setChartTicker(r.ticker); }
@@ -4865,6 +5209,10 @@ export default function App() {
             <span className="sidebar-icon">&#9660;</span>
             Stock Drilldown
           </li>
+          <li className={`sidebar-item ${page === 'altdata' ? 'active' : ''}`} onClick={() => { setPage('altdata'); navigate('/alt-data'); }}>
+            <span className="sidebar-icon">&#127963;</span>
+            Alt-Data
+          </li>
           <li className={`sidebar-item ${page === 'journal' ? 'active' : ''}`} onClick={() => { setPage('journal'); navigate('/journal'); }}>
             <span className="sidebar-icon">&#9998;</span>
             Trade Journal
@@ -4880,7 +5228,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
