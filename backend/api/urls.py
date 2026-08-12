@@ -54,6 +54,8 @@ urlpatterns = [
     # Alt-data validation studies (analysis only, not wired to risk-rating)
     path("congress-study", views.CongressStudyView.as_view(), name="congress-study"),
     path("delisted-survivorship", views.DelistedSurvivorshipView.as_view(), name="delisted-survivorship"),
+    # Dark pool: daily Polygon off-% + official weekly FINRA ATS off-% (overlay) + amplifier result
+    path("dark-pool", views.DarkPoolView.as_view(), name="dark-pool"),
     # Forward paper-trade track record of Playbook picks
     path("paper-trades", views.PaperTradesView.as_view(), name="paper-trades"),
     # Research/Lab: trigger×exit / timeframe / regime / cap-band / MPT comparisons

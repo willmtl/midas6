@@ -352,6 +352,65 @@ class RegimeHistoryView(APIView):
             return Response({"error": str(e)})
 
 
+class DarkPoolView(APIView):
+    """Off-exchange / dark-pool activity. With ?ticker= : the daily Polygon blended off-% series
+    (DarkPoolDay) + the official weekly FINRA ATS off-% series (DarkPoolWeek, keyed by publish date)
+    for the overlay chart. Without a ticker: a market snapshot (top tickers by latest daily off-%) +
+    the 'Dark-pool share' amplifier result from the stock-study sweep (null until the sweep populates
+    it)."""
+
+    def get(self, request):
+        from core.models import DarkPoolDay, DarkPoolWeek, StockStudy
+        from django.db.models import Max
+        tk = (request.GET.get("ticker") or "").upper().strip()
+        if tk:
+            daily = list(DarkPoolDay.objects.filter(ticker=tk, off_pct__isnull=False)
+                         .order_by("date").values("date", "off_pct", "total_vol", "off_vol"))
+            weekly = list(DarkPoolWeek.objects.filter(ticker=tk, off_pct__isnull=False,
+                          source="finra_ats").order_by("week_start")
+                          .values("week_start", "off_pct", "ats_shares", "published_date"))
+            for d in daily:
+                d["date"] = str(d["date"])
+            for w in weekly:
+                w["week_start"] = str(w["week_start"])
+                w["published_date"] = str(w["published_date"]) if w["published_date"] else None
+            return Response({
+                "ticker": tk, "daily": daily, "weekly": weekly,
+                "daily_last": daily[-1] if daily else None,
+                "weekly_last": weekly[-1] if weekly else None,
+            })
+
+        # Market snapshot: latest daily-file date, top tickers by off-%.
+        latest = DarkPoolDay.objects.aggregate(m=Max("date"))["m"]
+        snap = []
+        if latest:
+            snap = list(DarkPoolDay.objects.filter(date=latest, off_pct__isnull=False,
+                        total_vol__gt=0).order_by("-off_pct")
+                        .values("ticker", "off_pct", "total_vol")[:40])
+            for s in snap:
+                s["date"] = str(latest)
+        # Amplifier: does high dark-pool share amplify a robust signal's edge? Pull the
+        # 'Dark-pool share' dimension buckets from the highest-sample stock study that has them.
+        amp = None
+        for s in (StockStudy.objects.filter(total_trades__gte=500)
+                  .order_by("-total_trades").values("signal_key", "exit_key", "avg_return",
+                                                     "win_rate", "total_trades", "by_dimension")[:200]):
+            bd = s.get("by_dimension") or {}
+            buckets = bd.get("Dark-pool share") or {}
+            if isinstance(buckets, dict) and buckets:
+                amp = {"signal": s["signal_key"], "exit": s["exit_key"],
+                       "base_avg_return": s["avg_return"], "base_win_rate": s["win_rate"],
+                       "base_trades": s["total_trades"], "buckets": buckets}
+                break
+        return Response({
+            "snapshot": snap, "snapshot_date": str(latest) if latest else None,
+            "amplifier": amp,
+            "finra_last_week": str(DarkPoolWeek.objects.aggregate(m=Max("week_start"))["m"] or ""),
+            "note": ("Polygon = daily blended off-exchange proxy (ATS+internalizers); FINRA = official "
+                     "weekly ATS only, ~2-4wk publication lag."),
+        })
+
+
 class FundamentalsView(APIView):
     def get(self, request, ticker):
         """Return fundamental data for a ticker."""
