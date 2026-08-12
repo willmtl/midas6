@@ -5518,6 +5518,229 @@ function DarkPoolPage() {
   );
 }
 
+// Vol-normalized shock study: is a day whose move is large relative to the stock's own
+// trailing volatility (z = return ÷ trailing-20d vol) followed by continuation or reversal?
+// Reads GET /vol-shock-study; POST kicks a background recompute (poll until computed).
+function VolShockPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => { setErr(null); apiFetch('/vol-shock-study').then(setData).catch(e => setErr(e.message)); };
+  useEffect(() => { load(); }, []);
+
+  const run = () => {
+    setRunning(true);
+    apiFetch('/vol-shock-study', { method: 'POST' }).then(() => {
+      const t = setInterval(() => apiFetch('/vol-shock-study').then(d => {
+        if (d && d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(e => { setErr(e.message); setRunning(false); });
+  };
+
+  const sPct = (v) => (v == null ? '–' : `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%`);
+  const pctR = (v) => (v == null ? '–' : `${Number(v).toFixed(1)}%`);
+  const num2 = (v) => (v == null ? '–' : Number(v).toFixed(2));
+  const fmtN = (v) => (v == null ? '–' : Number(v).toLocaleString());
+  const signCls = (v) => (v == null ? 'dim' : v > 0 ? 'good' : 'bad');
+
+  if (err) return (
+    <div className="darkpool-page">
+      <h1>Vol-Shock Continuation</h1>
+      <ErrorBanner message={err} onRetry={load} onDismiss={() => setErr(null)} />
+    </div>
+  );
+  if (!data) return <div className="loading">Loading vol-shock study...</div>;
+
+  if (!data.computed) {
+    return (
+      <div className="darkpool-page">
+        <h1>Vol-Shock Continuation</h1>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.note || data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={run} disabled={running}>{running ? 'Computing…' : 'Compute now'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const params = data.params || {};
+  const baseline = data.baseline || {};
+  const cont = data.continuation || {};
+  const slices = data.slices || {};
+  const backtest = data.backtest || {};
+
+  const baseHz = ['1', '5', '20'].filter(h => baseline[h] != null);
+  const baseLine = baseHz.map(h => `${h}d ${sPct(baseline[h])}`).join(' · ');
+
+  // ── Continuation table (up or dn) ────────────────────────────────
+  const ContTable = ({ rows }) => (
+    <table className="studies-table">
+      <thead><tr>
+        <th style={{ textAlign: 'left' }}>thr σ</th>
+        <th style={{ textAlign: 'right' }}>H (d)</th>
+        <th style={{ textAlign: 'right' }}>episodes</th>
+        <th style={{ textAlign: 'right' }}>mean fwd %</th>
+        <th style={{ textAlign: 'right' }}>cont %</th>
+        <th style={{ textAlign: 'right' }}>edge %</th>
+        <th style={{ textAlign: 'right' }}>t</th>
+      </tr></thead>
+      <tbody>
+        {(rows || []).map((r, i) => (
+          <tr key={i}>
+            <td style={{ fontWeight: 600 }}>{num2(r.thr)}σ</td>
+            <td style={{ textAlign: 'right' }} className="dim">{r.H}</td>
+            <td style={{ textAlign: 'right' }} className="dim">{fmtN(r.episodes)}</td>
+            <td style={{ textAlign: 'right' }} className={signCls(r.mean_pct)}>{sPct(r.mean_pct)}</td>
+            <td style={{ textAlign: 'right' }} className="dim">{pctR(r.cont_pct)}</td>
+            <td style={{ textAlign: 'right' }} className={signCls(r.edge_pct)}>{sPct(r.edge_pct)}</td>
+            <td style={{ textAlign: 'right' }} className="dim">{num2(r.t)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+
+  // ── Slice bucket table (one horizon list) ────────────────────────
+  const SliceTable = ({ items }) => (
+    <table className="studies-table">
+      <thead><tr>
+        <th style={{ textAlign: 'left' }}>bucket</th>
+        <th style={{ textAlign: 'right' }}>n</th>
+        <th style={{ textAlign: 'right' }}>mean %</th>
+        <th style={{ textAlign: 'right' }}>cont %</th>
+        <th style={{ textAlign: 'right' }}>t</th>
+      </tr></thead>
+      <tbody>
+        {(items || []).map((r, i) => (
+          <tr key={i}>
+            <td>{r.bucket}</td>
+            <td style={{ textAlign: 'right' }} className="dim">{fmtN(r.n)}</td>
+            <td style={{ textAlign: 'right' }} className={signCls(r.mean)}>{sPct(r.mean)}</td>
+            <td style={{ textAlign: 'right' }} className="dim">{pctR(r.wr)}</td>
+            <td style={{ textAlign: 'right' }} className="dim">{num2(r.t)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+
+  // For long slice lists (e.g. sector) keep only the top+bottom 6 by mean.
+  const capList = (items) => {
+    const arr = (items || []).slice();
+    if (arr.length <= 12) return arr;
+    const sorted = arr.slice().sort((a, b) => (b.mean ?? -Infinity) - (a.mean ?? -Infinity));
+    return sorted.slice(0, 6).concat(sorted.slice(-6));
+  };
+
+  const sliceOrder = ['cap', 'vol', 'regime', 'sector'];
+  const sliceLabels = { cap: 'Market cap', vol: 'Volatility', regime: 'Market regime', sector: 'Sector' };
+
+  const DirBlock = ({ label, dir, capIt }) => {
+    if (!dir) return null;
+    return (
+      <div className="darkpool-statgrid" style={{ display: 'block', marginBottom: 8 }}>
+        <h4 style={{ margin: '6px 0' }}>{label}</h4>
+        {['5', '10'].filter(h => dir[h]).map(h => (
+          <div key={h} style={{ marginBottom: 8 }}>
+            <div className="subtitle" style={{ margin: '2px 0' }}>H = {h} days</div>
+            <SliceTable items={capIt ? capList(dir[h]) : dir[h]} />
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  const btOrder = ['vol_shock_up', 'vol_shock_dn', 'vol_shock_dn3', 'vol_shock_up_hivol', 'vol_shock_dn_hivol', 'vol_shock_dn3_hivol'];
+  const btKeys = btOrder.filter(k => backtest[k]).concat(Object.keys(backtest).filter(k => !btOrder.includes(k)));
+
+  return (
+    <div className="darkpool-page">
+      <h1>Vol-Shock Continuation <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle">{data.note || 'Vol-normalized shock study.'}</p>
+      <p className="subtitle">
+        Is a day whose move is large relative to the stock's own volatility (z = return ÷ trailing-20d vol) followed by
+        continuation or reversal? Entry at the shock close.
+        {params.universe && params.universe.names != null ? ` Universe: ${fmtN(params.universe.names)} names.` : ''}
+      </p>
+
+      {/* ── Continuation ────────────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Continuation vs reversal</h2>
+        </div>
+        {baseLine && <p className="subtitle">Baseline drift: {baseLine}</p>}
+        <div className="darkpool-statgrid" style={{ display: 'block' }}>
+          <div style={{ marginBottom: 12 }}>
+            <h4 style={{ margin: '6px 0' }}>Good day (+σ) → keeps rising?</h4>
+            <p className="subtitle darkpool-muted">For UP shocks, a positive edge % = momentum (kept rising above baseline).</p>
+            <ContTable rows={cont.up} />
+          </div>
+          <div>
+            <h4 style={{ margin: '6px 0' }}>Bad day (−σ) → keeps falling?</h4>
+            <p className="subtitle darkpool-muted">For DN shocks, a negative edge % = it reversed (bounced back up).</p>
+            <ContTable rows={cont.dn} />
+          </div>
+        </div>
+      </div>
+
+      {/* ── Slices ──────────────────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Slices — {params.slice_thr != null ? `${num2(params.slice_thr)}σ` : '2σ'} shocks</h2>
+        </div>
+        {sliceOrder.filter(s => slices[s]).map(s => (
+          <div key={s} style={{ marginBottom: 14 }}>
+            <h3 style={{ margin: '8px 0' }}>{sliceLabels[s] || s}</h3>
+            <DirBlock label="Up shocks (+σ)" dir={slices[s].up} capIt={s === 'sector'} />
+            <DirBlock label="Down shocks (−σ)" dir={slices[s].dn} capIt={s === 'sector'} />
+          </div>
+        ))}
+      </div>
+
+      {/* ── Backtest ────────────────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>vol_shock signals × exit ladder (episode-deduped, no fees — directional)</h2>
+        </div>
+        {btKeys.map(k => {
+          const b = backtest[k] || {};
+          const rows = b.rows || [];
+          return (
+            <div key={k} style={{ marginBottom: 12 }}>
+              <h4 style={{ margin: '6px 0' }}>{b.name || k}</h4>
+              <table className="studies-table">
+                <thead><tr>
+                  <th style={{ textAlign: 'left' }}>exit</th>
+                  <th style={{ textAlign: 'left' }}>name</th>
+                  <th style={{ textAlign: 'right' }}>trades</th>
+                  <th style={{ textAlign: 'right' }}>avg %</th>
+                  <th style={{ textAlign: 'right' }}>win %</th>
+                  <th style={{ textAlign: 'right' }}>t</th>
+                </tr></thead>
+                <tbody>
+                  {rows.map((r, i) => (
+                    <tr key={i} className={i === 0 ? 'darkpool-base-row' : ''}>
+                      <td style={{ fontWeight: i === 0 ? 700 : 600 }}>{r.exit}</td>
+                      <td className="dim">{r.name}</td>
+                      <td style={{ textAlign: 'right' }} className="dim">{fmtN(r.trades)}</td>
+                      <td style={{ textAlign: 'right' }} className={signCls(r.avg_pct)}>{sPct(r.avg_pct)}</td>
+                      <td style={{ textAlign: 'right' }} className="dim">{pctR(r.win_pct)}</td>
+                      <td style={{ textAlign: 'right' }} className="dim">{num2(r.t)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        })}
+      </div>
+
+      {data.note && <p className="subtitle" style={{ marginTop: 8, fontStyle: 'italic' }}>{data.note}</p>}
+    </div>
+  );
+}
+
 // Fundamentals table with a compact analyst rating-distribution column (surfaces the
 // EODHD analyst consensus now imported per ticker). Lives in the Research hub.
 function FundamentalsPage() {
@@ -5627,6 +5850,7 @@ function parseHash() {
   if (h.startsWith('/live')) return { view: 'live' };
   if (h.startsWith('/alt-data')) return { view: 'altdata' };
   if (h.startsWith('/dark-pool')) return { view: 'darkpool' };
+  if (h.startsWith('/vol-shock')) return { view: 'volshock' };
   if (h.startsWith('/backtest')) return { view: 'backtestlab' };
   if (h.startsWith('/news')) return { view: 'news' };
   if (h.startsWith('/research')) return { view: 'research' };
@@ -5715,7 +5939,7 @@ export default function App() {
       const r = parseHash();
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
-                       altdata: 'altdata', darkpool: 'darkpool' };
+                       altdata: 'altdata', darkpool: 'darkpool', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
       else if (r.view === 'sector') { setPage('dashboard'); handleSectorClick(r.sector); }
       else if (r.view === 'chart') { setPage('dashboard'); setChartTicker(r.ticker); }
@@ -5823,6 +6047,10 @@ export default function App() {
             <span className="sidebar-icon">&#9899;</span>
             Dark Pool
           </li>
+          <li className={`sidebar-item ${page === 'volshock' ? 'active' : ''}`} onClick={() => { setPage('volshock'); navigate('/vol-shock'); }}>
+            <span className="sidebar-icon">&#9889;</span>
+            Vol-Shock
+          </li>
           <li className={`sidebar-item ${page === 'journal' ? 'active' : ''}`} onClick={() => { setPage('journal'); navigate('/journal'); }}>
             <span className="sidebar-icon">&#9998;</span>
             Trade Journal
@@ -5838,7 +6066,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
