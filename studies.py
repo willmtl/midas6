@@ -561,6 +561,19 @@ def sig_big_green(df):
     ret = (df["Close"] - df["Open"]) / df["Open"] * 100
     return ret > 3
 
+# Volatility-NORMALIZED big day: today's close-to-close return in units of the stock's own
+# trailing 20d realized vol (z-score). A "shock" is a move large RELATIVE to how much this name
+# usually moves — unlike big_red/big_green which use a fixed 3% for every ticker. Vol is trailing
+# (shifted 1 bar) so the day itself doesn't deflate its own z.
+def _vol_shock_z(df, win=20):
+    ret = df["Close"].pct_change()
+    vol = ret.rolling(win).std().shift(1)
+    return ret / vol
+
+def sig_vol_shock_up(df):   return _vol_shock_z(df) >= 2.0
+def sig_vol_shock_dn(df):   return _vol_shock_z(df) <= -2.0
+def sig_vol_shock_dn3(df):  return _vol_shock_z(df) <= -3.0
+
 def sig_weekly_up_3pct(df):
     ret5 = df["Close"].pct_change(5) * 100
     return ret5 > 3
@@ -1248,6 +1261,9 @@ SIGNALS = {
     "hammer": ("Hammer Candle", sig_hammer),
     "big_red": ("Big Red Day (>3%)", sig_big_red),
     "big_green": ("Big Green Day (>3%)", sig_big_green),
+    "vol_shock_up": ("Vol-Shock Up (+2σ day)", sig_vol_shock_up),
+    "vol_shock_dn": ("Vol-Shock Down (-2σ day)", sig_vol_shock_dn),
+    "vol_shock_dn3": ("Vol-Shock Down (-3σ day)", sig_vol_shock_dn3),
     "weekly_up3": ("Weekly Up >3%", sig_weekly_up_3pct),
     "weekly_down3": ("Weekly Down >3%", sig_weekly_down_3pct),
     "high_vol": ("Above Avg Volume (1.5x)", sig_above_avg_volume),
