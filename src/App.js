@@ -4931,6 +4931,223 @@ function AltDataPage() {
   );
 }
 
+// ── Dark Pool ─────────────────────────────────────────────────────────────
+// Visualizes off-exchange / dark-pool activity. Two data cadences from the backend:
+//   • Polygon "daily" = blended off-exchange proxy (ATS + internalizers), short recent series.
+//   • FINRA  "weekly" = official ATS-only, long multi-year history but ~2-4wk publication lag.
+// Endpoint: /dark-pool (market snapshot) and /dark-pool?ticker=X (per-ticker dual series).
+function DarkPoolPage() {
+  const [snap, setSnap] = useState(null);
+  const [snapErr, setSnapErr] = useState(null);
+  const [tickerInput, setTickerInput] = useState('CLF');
+  const [detail, setDetail] = useState(null);
+  const [detailErr, setDetailErr] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  const loadSnap = () => { setSnapErr(null); apiFetch('/dark-pool').then(setSnap).catch(e => setSnapErr(e.message)); };
+
+  const loadTicker = (t) => {
+    const sym = (t || tickerInput || '').trim().toUpperCase();
+    if (!sym) return;
+    setTickerInput(sym);
+    setDetail(null);
+    setDetailErr(null);
+    setDetailLoading(true);
+    apiFetch(`/dark-pool?ticker=${encodeURIComponent(sym)}`)
+      .then(d => { setDetail(d); setDetailLoading(false); })
+      .catch(e => { setDetailErr(e.message); setDetailLoading(false); });
+  };
+
+  // On mount: market snapshot + preload the default ticker overlay.
+  useEffect(() => {
+    loadSnap();
+    loadTicker('CLF');
+    // eslint-disable-next-line
+  }, []);
+
+  const pct = (v) => (v == null ? '–' : `${(Number(v) * 100).toFixed(1)}%`);
+  const fmtVol = (v) => {
+    if (v == null) return '–';
+    const n = Number(v);
+    if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+    if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+    return String(n);
+  };
+  const fmtAr = (v) => (v == null ? '–' : `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%`);
+  const fmtWr = (v) => (v == null ? '–' : `${Number(v).toFixed(1)}%`);
+  const fmtN = (v) => (v == null ? '–' : Number(v).toLocaleString());
+
+  // Dual-cadence SVG: shared X = date span across BOTH series; Y = off_pct 0..maxY (auto-scaled
+  // because FINRA ATS-only levels sit well below the blended Polygon proxy). Weekly = polyline
+  // (long history), daily = circle markers (sparse, forward-only recent points).
+  const Chart = ({ weekly, daily }) => {
+    const W = 820, H = 340, padL = 44, padR = 16, padT = 16, padB = 34;
+    const wk = (weekly || []).map(d => ({ t: new Date(d.week_start).getTime(), v: Number(d.off_pct) })).filter(p => !isNaN(p.t) && !isNaN(p.v));
+    const dl = (daily || []).map(d => ({ t: new Date(d.date).getTime(), v: Number(d.off_pct) })).filter(p => !isNaN(p.t) && !isNaN(p.v));
+    const all = wk.concat(dl);
+    if (!all.length) return <div className="empty-state" style={{ padding: '20px 0' }}>No dark-pool series for this ticker.</div>;
+    const tMin = Math.min(...all.map(p => p.t));
+    const tMax = Math.max(...all.map(p => p.t));
+    const tSpan = tMax - tMin || 1;
+    const vMaxRaw = Math.max(...all.map(p => p.v), 0.01);
+    const vMax = Math.min(1, vMaxRaw * 1.12);
+    const x = (t) => padL + ((t - tMin) / tSpan) * (W - padL - padR);
+    const y = (v) => padT + (1 - v / vMax) * (H - padT - padB);
+    const wkPts = wk.sort((a, b) => a.t - b.t).map(p => `${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join(' ');
+
+    // Y gridlines (5) and year ticks along X.
+    const yTicks = [0, 0.25, 0.5, 0.75, 1].map(f => f * vMax);
+    const yearSet = [];
+    const yr0 = new Date(tMin).getFullYear(), yr1 = new Date(tMax).getFullYear();
+    for (let yr = yr0; yr <= yr1; yr++) yearSet.push(yr);
+
+    return (
+      <svg className="darkpool-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label="Dark-pool off-exchange share over time">
+        {yTicks.map((v, i) => (
+          <g key={i}>
+            <line className="darkpool-grid" x1={padL} y1={y(v)} x2={W - padR} y2={y(v)} />
+            <text className="darkpool-axis" x={padL - 6} y={y(v) + 3} textAnchor="end">{(v * 100).toFixed(0)}%</text>
+          </g>
+        ))}
+        {yearSet.map((yr) => {
+          const t = new Date(`${yr}-01-01`).getTime();
+          if (t < tMin || t > tMax) return null;
+          return <text key={yr} className="darkpool-axis" x={x(t)} y={H - padB + 18} textAnchor="middle">{yr}</text>;
+        })}
+        {wkPts && <polyline className="darkpool-line-weekly" points={wkPts} fill="none" />}
+        {dl.map((p, i) => <circle key={i} className="darkpool-dot-daily" cx={x(p.t)} cy={y(p.v)} r={3.5} />)}
+      </svg>
+    );
+  };
+
+  const amp = snap && snap.amplifier;
+
+  return (
+    <div className="darkpool-page">
+      <h1>&#9899; Dark Pool</h1>
+      <p className="subtitle">{(snap && snap.note) || 'Off-exchange / dark-pool activity. Polygon = daily blended off-exchange proxy (ATS + internalizers); FINRA = official weekly ATS only, ~2-4wk publication lag.'}</p>
+
+      {snapErr && <ErrorBanner message={snapErr} onRetry={loadSnap} onDismiss={() => setSnapErr(null)} />}
+
+      {/* ── Market snapshot ─────────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Market snapshot — highest off-exchange share</h2>
+          <div className="darkpool-chips">
+            {snap && snap.snapshot_date && <span className="last-updated-chip">Snapshot: {snap.snapshot_date}</span>}
+            {snap && snap.finra_last_week && <span className="last-updated-chip">FINRA wk: {snap.finra_last_week}</span>}
+          </div>
+        </div>
+        {!snap && !snapErr && <div className="loading">Loading dark-pool snapshot...</div>}
+        {snap && Array.isArray(snap.snapshot) && (
+          <table className="studies-table darkpool-snap-table">
+            <thead><tr>
+              <th style={{ textAlign: 'left' }}>Ticker</th>
+              <th>Off-exchange %</th>
+              <th style={{ textAlign: 'right' }}>Total volume</th>
+              <th style={{ textAlign: 'right' }}>Date</th>
+            </tr></thead>
+            <tbody>
+              {snap.snapshot.map((r) => {
+                const p = Number(r.off_pct);
+                const cls = p >= 0.6 ? 'bad' : p >= 0.45 ? 'good' : 'dim';
+                return (
+                  <tr key={r.ticker} className="darkpool-snap-row" onClick={() => loadTicker(r.ticker)} title={`Load ${r.ticker} overlay`}>
+                    <td style={{ fontWeight: 600 }}>{r.ticker}</td>
+                    <td>
+                      <div className="darkpool-bar-wrap">
+                        <div className={`darkpool-bar ${cls}`} style={{ width: `${Math.min(100, p * 100).toFixed(0)}%` }} />
+                        <span className={`darkpool-bar-val ${cls}`}>{pct(p)}</span>
+                      </div>
+                    </td>
+                    <td style={{ textAlign: 'right' }} className="dim">{fmtVol(r.total_vol)}</td>
+                    <td style={{ textAlign: 'right' }} className="dim">{r.date}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* ── Per-ticker overlay ──────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Per-ticker overlay</h2>
+          <div className="darkpool-loadbar">
+            <input
+              className="darkpool-input"
+              value={tickerInput}
+              onChange={(e) => setTickerInput(e.target.value.toUpperCase())}
+              onKeyDown={(e) => { if (e.key === 'Enter') loadTicker(); }}
+              placeholder="Ticker (e.g. CLF)"
+            />
+            <button className="refresh-btn" onClick={() => loadTicker()} disabled={detailLoading}>{detailLoading ? 'Loading…' : 'Load'}</button>
+          </div>
+        </div>
+        {detailErr && <ErrorBanner message={detailErr} onRetry={() => loadTicker()} onDismiss={() => setDetailErr(null)} />}
+        {detailLoading && !detail && <div className="loading">Loading {tickerInput} dark-pool series...</div>}
+        {detail && (
+          <>
+            <div className="darkpool-statgrid">
+              <div className="darkpool-stat">
+                <div className="darkpool-stat-v">{detail.daily_last ? pct(detail.daily_last.off_pct) : '–'}</div>
+                <div className="darkpool-stat-l">Polygon daily (latest{detail.daily_last ? ` · ${detail.daily_last.date}` : ''})</div>
+              </div>
+              <div className="darkpool-stat">
+                <div className="darkpool-stat-v">{detail.weekly_last ? pct(detail.weekly_last.off_pct) : '–'}</div>
+                <div className="darkpool-stat-l">FINRA ATS weekly (latest{detail.weekly_last ? ` · wk ${detail.weekly_last.week_start}` : ''})</div>
+              </div>
+            </div>
+            <div className="darkpool-legend">
+              <span className="darkpool-legend-item"><span className="darkpool-swatch darkpool-swatch-weekly" /> FINRA ATS — weekly (official, lagged)</span>
+              <span className="darkpool-legend-item"><span className="darkpool-swatch darkpool-swatch-daily" /> Polygon — daily blended proxy (recent)</span>
+            </div>
+            <Chart weekly={detail.weekly} daily={detail.daily} />
+          </>
+        )}
+      </div>
+
+      {/* ── Amplifier backtest ──────────────────────────────────────── */}
+      <div className="darkpool-card">
+        <div className="darkpool-card-head">
+          <h2>Does high dark-pool share amplify edge?{amp ? ` (${amp.signal} → ${amp.exit})` : ''}</h2>
+        </div>
+        {!amp && (
+          <p className="subtitle darkpool-muted">Amplifier backtest computing (stock-study sweep in progress) — check back after the nightly sweep.</p>
+        )}
+        {amp && (
+          <table className="studies-table">
+            <thead><tr>
+              <th style={{ textAlign: 'left' }}>Dark-pool bucket</th>
+              <th style={{ textAlign: 'right' }}>Avg return</th>
+              <th style={{ textAlign: 'right' }}>Win %</th>
+              <th style={{ textAlign: 'right' }}>Trades</th>
+            </tr></thead>
+            <tbody>
+              <tr className="darkpool-base-row">
+                <td style={{ fontWeight: 600 }}>All (base)</td>
+                <td style={{ textAlign: 'right' }} className={amp.base_avg_return > 0 ? 'good' : 'bad'}>{fmtAr(amp.base_avg_return)}</td>
+                <td style={{ textAlign: 'right' }} className="dim">{fmtWr(amp.base_win_rate)}</td>
+                <td style={{ textAlign: 'right' }} className="dim">{fmtN(amp.base_trades)}</td>
+              </tr>
+              {Object.entries(amp.buckets || {}).map(([label, b]) => (
+                <tr key={label}>
+                  <td>{label}</td>
+                  <td style={{ textAlign: 'right' }} className={b.avg_return > 0 ? 'good' : 'bad'}>{fmtAr(b.avg_return)}</td>
+                  <td style={{ textAlign: 'right' }} className="dim">{fmtWr(b.win_rate)}</td>
+                  <td style={{ textAlign: 'right' }} className="dim">{fmtN(b.total_trades)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Fundamentals table with a compact analyst rating-distribution column (surfaces the
 // EODHD analyst consensus now imported per ticker). Lives in the Research hub.
 function FundamentalsPage() {
@@ -5038,6 +5255,7 @@ function parseHash() {
   if (h.startsWith('/settings')) return { view: 'settings' };
   if (h.startsWith('/live')) return { view: 'live' };
   if (h.startsWith('/alt-data')) return { view: 'altdata' };
+  if (h.startsWith('/dark-pool')) return { view: 'darkpool' };
   if (h.startsWith('/backtest')) return { view: 'backtestlab' };
   if (h.startsWith('/news')) return { view: 'news' };
   if (h.startsWith('/research')) return { view: 'research' };
@@ -5109,7 +5327,7 @@ export default function App() {
       const r = parseHash();
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
-                       altdata: 'altdata' };
+                       altdata: 'altdata', darkpool: 'darkpool' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
       else if (r.view === 'sector') { setPage('dashboard'); handleSectorClick(r.sector); }
       else if (r.view === 'chart') { setPage('dashboard'); setChartTicker(r.ticker); }
@@ -5213,6 +5431,10 @@ export default function App() {
             <span className="sidebar-icon">&#127963;</span>
             Alt-Data
           </li>
+          <li className={`sidebar-item ${page === 'darkpool' ? 'active' : ''}`} onClick={() => { setPage('darkpool'); navigate('/dark-pool'); }}>
+            <span className="sidebar-icon">&#9899;</span>
+            Dark Pool
+          </li>
           <li className={`sidebar-item ${page === 'journal' ? 'active' : ''}`} onClick={() => { setPage('journal'); navigate('/journal'); }}>
             <span className="sidebar-icon">&#9998;</span>
             Trade Journal
@@ -5228,7 +5450,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
