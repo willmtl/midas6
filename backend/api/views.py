@@ -396,11 +396,21 @@ class DarkPoolView(APIView):
                   .order_by("-total_trades").values("signal_key", "exit_key", "avg_return",
                                                      "win_rate", "total_trades", "by_dimension")[:200]):
             bd = s.get("by_dimension") or {}
-            buckets = bd.get("Dark-pool share") or {}
-            if isinstance(buckets, dict) and buckets:
+            # by_dimension buckets are a LIST of {bucket, avg_return, win_rate, t_stat, trades, ...}
+            # per dimension. Transform each dimension to {bucket_label: {...}} for the UI.
+            def _to_map(dim):
+                lst = bd.get(dim)
+                if not isinstance(lst, list) or not lst:
+                    return None
+                return {b["bucket"]: {"avg_return": b.get("avg_return"), "win_rate": b.get("win_rate"),
+                                      "total_trades": b.get("trades"), "t_stat": b.get("t_stat")}
+                        for b in lst if isinstance(b, dict) and "bucket" in b}
+            share = _to_map("Dark-pool share")
+            if share:
                 amp = {"signal": s["signal_key"], "exit": s["exit_key"],
                        "base_avg_return": s["avg_return"], "base_win_rate": s["win_rate"],
-                       "base_trades": s["total_trades"], "buckets": buckets}
+                       "base_trades": s["total_trades"], "buckets": share,
+                       "trend_buckets": _to_map("Dark-pool trend")}
                 break
         return Response({
             "snapshot": snap, "snapshot_date": str(latest) if latest else None,
