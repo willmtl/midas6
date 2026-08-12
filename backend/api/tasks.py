@@ -1393,6 +1393,44 @@ def import_eodhd_estimates(tickers=None):
     return {"saved": saved}
 
 
+def import_etf_valuations(etfs=None):
+    """Pull the weighted valuation block for each SECTOR ETF from EODHD ETF fundamentals
+    (ETF_Data.Valuations_Growth.Valuations_Rates_Portfolio) → a Fundamental row keyed by the ETF
+    ticker, so the dashboard can show a sector-level P/E. 'Price/Prospective Earnings' is the
+    weighted FORWARD P/E; also grabs P/B, P/S and the ETF yield."""
+    from core.models import Fundamental
+    import config
+    if not os.environ.get("EODHD_API_KEY"):
+        return {"error": "EODHD_API_KEY not set"}
+    etfs = etfs or list(config.SECTOR_ETFS.values())
+    today = date.today()
+    saved = 0
+
+    def _f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+    for e in etfs:
+        d = _eodhd_get(f"fundamentals/{e}.US")
+        if not isinstance(d, dict):
+            continue
+        etf = d.get("ETF_Data") or {}
+        port = ((etf.get("Valuations_Growth") or {}).get("Valuations_Rates_Portfolio")) or {}
+        pe = _f(port.get("Price/Prospective Earnings"))
+        pb = _f(port.get("Price/Book"))
+        ps = _f(port.get("Price/Sales"))
+        yld = _f(etf.get("Yield"))
+        if pe is None and pb is None:
+            continue
+        Fundamental.objects.update_or_create(ticker=e, date=today, defaults=dict(
+            pe_ratio=pe, forward_pe=pe, pb_ratio=pb, ps_ratio=ps, dividend_yield=yld,
+            sector="ETF"))
+        saved += 1
+    logger.info("import_etf_valuations: %d sector ETFs", saved)
+    return {"saved": saved}
+
+
 def import_eodhd_analyst_ratings(tickers=None):
     """Pull the EODHD fundamentals AnalystRatings block → Fundamental analyst distribution columns
     (StrongBuy/Buy/Hold/Sell/StrongSell counts + 1–5 rating mean + target). Updates the latest

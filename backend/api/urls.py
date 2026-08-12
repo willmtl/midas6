@@ -56,6 +56,9 @@ urlpatterns = [
     path("delisted-survivorship", views.DelistedSurvivorshipView.as_view(), name="delisted-survivorship"),
     # Dark pool: daily Polygon off-% + official weekly FINRA ATS off-% (overlay) + amplifier result
     path("dark-pool", views.DarkPoolView.as_view(), name="dark-pool"),
+    # Dark-pool + alt-data equity-curve backtests (DB-first via BacktestResult)
+    path("darkpool-backtest", views.DarkPoolBacktestView.as_view(), name="darkpool-backtest"),
+    path("congress-backtest", views.CongressBacktestView.as_view(), name="congress-backtest"),
     # Forward paper-trade track record of Playbook picks
     path("paper-trades", views.PaperTradesView.as_view(), name="paper-trades"),
     # Research/Lab: trigger×exit / timeframe / regime / cap-band / MPT comparisons

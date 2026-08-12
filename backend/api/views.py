@@ -1674,3 +1674,17 @@ class DelistedSurvivorshipView(_StudyResultView):
     kind = "delisted_survivorship"
     script = "delisted_survivorship.py"
     json_path = "/app/.data/studies/delisted_survivorship.json"
+
+
+class DarkPoolBacktestView(_StudyResultView):
+    """Historical dark-pool backtest: monthly PIT high-share / accumulation strategies vs SPY."""
+    kind = "darkpool_backtest"
+    script = "darkpool_backtest.py"
+    json_path = "/app/.data/studies/darkpool_backtest.json"
+
+
+class CongressBacktestView(_StudyResultView):
+    """Equity-curve backtest of following legislator buys (all / Senate / large) vs SPY."""
+    kind = "congress_backtest"
+    script = "congress_backtest.py"
+    json_path = "/app/.data/studies/congress_backtest.json"

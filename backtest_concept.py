@@ -48,6 +48,22 @@ def _bullish_monthend(df):
     return bull.resample("ME").last()
 
 
+def _rotate_in_monthend(df, window=3):
+    """Month-end ROTATE IN state (the dashboard's fresh-turn signal): still BULLISH now, AND RSI(10)
+    crossed above its SMA within the last `window` trading days, with RSI<50 & Omega>1 AT the cross
+    (a fresh oversold turn up). This is the timing signal the dashboard flags — distinct from the
+    'hold everything already bullish' rule."""
+    close = df["Close"]
+    rsi = ta.momentum.rsi(close, window=10)
+    sma = rsi.rolling(10).mean()
+    omega = _rolling_omega(df)
+    cross = (rsi > sma) & (rsi.shift(1) <= sma.shift(1))          # RSI crosses above its SMA
+    fresh = (cross & (rsi < 50) & (omega > 1))                    # oversold turn + positive omega
+    recent = fresh.rolling(window).max().fillna(0).astype(bool)   # a fresh cross in the last `window` bars
+    bull = (rsi > sma) & (omega > 1)
+    return (bull & recent).fillna(False).resample("ME").last()
+
+
 def _stats(rets, spy_rets):
     r = np.array(rets, dtype=float)
     n = len(r)
@@ -110,6 +126,11 @@ def rotation_lab(dfs, spy_df):
     sma200 = pd.DataFrame({
         e: (df["Close"] / df["Close"].rolling(200).mean() - 1).resample("ME").last()
         for e, df in dfs.items() if len(df) >= 200}).reindex(mclose.index)
+    # ROTATE IN (fresh RSI-cross turn) month-end state, at two freshness windows.
+    rotate_in3 = pd.DataFrame({e: _rotate_in_monthend(df, 3) for e, df in dfs.items() if len(df) >= 60}) \
+        .reindex(mclose.index).fillna(False)
+    rotate_in10 = pd.DataFrame({e: _rotate_in_monthend(df, 10) for e, df in dfs.items() if len(df) >= 60}) \
+        .reindex(mclose.index).fillna(False)
     cols = list(mclose.columns)
 
     def _run(selector, hold=1, start_i=12):
@@ -146,6 +167,12 @@ def rotation_lab(dfs, spy_df):
     # (label, selector, hold_months)
     specs = [
         ("RSI+Omega, all BULLISH (dashboard rule)", lambda i: [e for e in cols if bool(bull.iloc[i].get(e, False))], 1),
+        ("ROTATE IN (fresh RSI cross ≤3d)", lambda i: [e for e in cols if bool(rotate_in3.iloc[i].get(e, False))], 1),
+        ("ROTATE IN (fresh RSI cross ≤10d)", lambda i: [e for e in cols if bool(rotate_in10.iloc[i].get(e, False))], 1),
+        ("ROTATE IN ≤10d, top 10 by strength", lambda i: [
+            e for e in sorted([e for e in cols if bool(rotate_in10.iloc[i].get(e, False))],
+                              key=lambda e: (spread.iloc[i].get(e) if pd.notna(spread.iloc[i].get(e)) else -9),
+                              reverse=True)[:10]], 1),
         ("RSI+Omega, capped top 10 by strength", lambda i: rsi_capN(i, 10), 1),
         ("RSI+Omega, capped top 5 by strength", lambda i: rsi_capN(i, 5), 1),
         ("Momentum 12mo, top 20", lambda i: topn(trail[12].iloc[i], 20), 1),

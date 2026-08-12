@@ -208,4 +208,12 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_delisted_survivorship",
         "schedule": crontab(hour=21, minute=20, day_of_week=0),
     },
+    "darkpool-backtest-nightly": {      # historical dark-pool equity-curve backtest
+        "task": "api.celery_tasks.run_darkpool_backtest",
+        "schedule": crontab(hour=23, minute=30),
+    },
+    "congress-backtest-nightly": {      # legislator-trade equity-curve backtest
+        "task": "api.celery_tasks.run_congress_backtest",
+        "schedule": crontab(hour=23, minute=35),
+    },
 }

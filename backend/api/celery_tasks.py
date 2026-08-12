@@ -437,6 +437,32 @@ def run_delisted_survivorship():
 
 
 @shared_task
+def run_darkpool_backtest():
+    """Nightly: historical dark-pool equity-curve backtest → BacktestResult[darkpool_backtest]."""
+    import subprocess, os
+    if not os.path.exists("/app/darkpool_backtest.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/darkpool_backtest.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("darkpool_backtest failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
+def run_congress_backtest():
+    """Nightly: legislator-trade equity-curve backtest → BacktestResult[congress_backtest]."""
+    import subprocess, os
+    if not os.path.exists("/app/congress_backtest.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/congress_backtest.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("congress_backtest failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_backtest_decomp():
     """Nightly: rotation-edge decomposition (pick vs rotation vs both, 200MA both-numbers,
     value×technical) → BacktestResult[decomposition]. Runs AFTER candles/fundamentals refresh."""

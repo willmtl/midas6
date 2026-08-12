@@ -59,6 +59,8 @@ x-backend-volumes: &backend-volumes
   - ./fetch_congress.py:/app/fetch_congress.py
   - ./congress_study.py:/app/congress_study.py
   - ./delisted_survivorship.py:/app/delisted_survivorship.py
+  - ./darkpool_backtest.py:/app/darkpool_backtest.py
+  - ./congress_backtest.py:/app/congress_backtest.py
   - ./.data:/app/.data
 
 services:
