@@ -6895,6 +6895,110 @@ function RotationPicksPage() {
   );
 }
 
+// RS-trend method sweep. Reads GET /rs-methods (BacktestResult[rs_methods]); POST recomputes (poll
+// every 8s until `computed`). ~20 ways to read the ETF/SPY relative-strength bar, each feeding the
+// SAME cheapest-P/B large-cap pick — so only the sector-SELECTION rule varies. The banner carries the
+// multiple-comparisons caveat: rank by t-stat / Sharpe / drawdown, not by the single highest vs-SPY.
+function RsMethodsPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const methods = (data && data.methods) || [];
+  const sort = useSortedRows(methods, 'vs_spy', 'desc');
+
+  const load = () => apiFetch('/rs-methods').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/rs-methods`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/rs-methods`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading RS methods...</div>;
+  if (data.computed === false) {
+    return (
+      <div className="studies-page">
+        <h1>RS Methods</h1>
+        <p className="subtitle">~20 ways to read the ETF/SPY relative-strength bar, backtested side-by-side.</p>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing (~2-3 min)...' : 'Compute now'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const params = data.params || {};
+  const pct = v => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(1)}`;
+  const num = (v, d = 2) => v == null || isNaN(Number(v)) ? '–' : Number(v).toFixed(d);
+  const signCls = v => v == null ? 'dim' : v > 0 ? 'good' : v < 0 ? 'bad' : 'dim';
+  const tCls = v => v == null ? 'dim' : v >= 2 ? 'good' : v >= 1.5 ? '' : 'dim';       // t>=2 is the bar
+  const shCls = v => v == null ? 'dim' : v >= 1 ? 'good' : v >= 0.5 ? '' : 'dim';
+  const FAM = { absolute: '#8892b0', 'rs-mom': '#64ffda', 'rs-trend': '#57cbff',
+                'rs-osc': '#c792ea', breakout: '#ffcb6b', slope: '#f78c6c', 'risk-adj': '#82aaff',
+                combo: '#addb67', weekly: '#ff5370', 'ma-cross': '#7fdbca', indicator: '#f07178',
+                engine: '#ffd54f', reference: '#546e7a' };
+
+  return (
+    <div className="studies-page">
+      <h1>RS Methods <LastUpdatedChip value={data.last_updated} /></h1>
+
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '4px 0 16px' }}>
+        <p style={{ margin: 0 }}>
+          Every row uses the <b>same value pick</b> ({params.pick || 'cheapest positive-P/B large-cap'}) — only the
+          sector-<b>selection</b> rule on the ETF/SPY bar changes. Benchmark: {params.benchmark || 'SPY buy-and-hold'}.
+        </p>
+        {data.caveat && (
+          <p style={{ margin: '8px 0 0', fontSize: 12 }} className="bad">
+            ⚠ {data.caveat}
+          </p>
+        )}
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Recomputing (~2-3 min)...' : 'Recompute'}</button>
+        </p>
+      </div>
+
+      <table className="studies-table">
+        <thead><tr>
+          <SortTh label="Method" colKey="method" sort={sort} />
+          <SortTh label="Family" colKey="family" sort={sort} />
+          <SortTh label="Total %" colKey="total_return" sort={sort} align="right" />
+          <SortTh label="vs SPY %" colKey="vs_spy" sort={sort} align="right" title="Excess return over SPY buy-and-hold" />
+          <SortTh label="t-stat" colKey="t_stat" sort={sort} align="right" title="t>=2 = the significance bar; below that, treat as noise" />
+          <SortTh label="Sharpe" colKey="sharpe" sort={sort} align="right" />
+          <SortTh label="Max DD %" colKey="max_drawdown" sort={sort} align="right" title="Worst peak-to-trough" />
+          <SortTh label="Avg sectors" colKey="avg_sectors" sort={sort} align="right" title="Avg # sectors selected/month — low = selective, ~10 = barely filtering" />
+        </tr></thead>
+        <tbody>
+          {sort.rows.map((r, i) => (
+            <tr key={r.method || i} className="study-row" style={r.family === 'reference' ? { opacity: 0.8 } : null}>
+              <td title={r.description}>{r.method}</td>
+              <td><span style={{ color: FAM[r.family] || '#8892b0', fontSize: 12 }}>{r.family}</span></td>
+              <td style={{ textAlign: 'right' }} className={signCls(r.total_return)}>{pct(r.total_return)}</td>
+              <td style={{ textAlign: 'right', fontWeight: 600 }} className={signCls(r.vs_spy)}>{pct(r.vs_spy)}</td>
+              <td style={{ textAlign: 'right' }} className={tCls(r.t_stat)}>{num(r.t_stat, 2)}</td>
+              <td style={{ textAlign: 'right' }} className={shCls(r.sharpe)}>{num(r.sharpe, 2)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pct(r.max_drawdown)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.avg_sectors == null ? '–' : num(r.avg_sectors, 1)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <p className="subtitle" style={{ marginTop: 12 }}>
+        {params.periods ? `${params.periods} monthly periods. ` : ''}
+        Sorted by vs-SPY by default — but read the whole column: a rule is only trustworthy when its family agrees.
+      </p>
+    </div>
+  );
+}
+
 // NOTE: name kept as parseHash for minimal churn; it now reads window.location.pathname (pretty URLs).
 function parseHash() {
   const h = window.location.pathname;
@@ -6902,6 +7006,7 @@ function parseHash() {
   if (h.startsWith('/live')) return { view: 'live' };
   if (h.startsWith('/alt-data')) return { view: 'altdata' };
   if (h.startsWith('/dark-pool')) return { view: 'darkpool' };
+  if (h.startsWith('/rs-methods')) return { view: 'rsmethods' };
   if (h.startsWith('/rotation')) return { view: 'rotationpick' };
   if (h.startsWith('/vol-shock')) return { view: 'volshock' };
   if (h.startsWith('/backtest')) return { view: 'backtestlab' };
@@ -6992,7 +7097,8 @@ export default function App() {
       const r = parseHash();
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
-                       altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick', volshock: 'volshock' };
+                       altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
+                       rsmethods: 'rsmethods', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
       else if (r.view === 'sector') { setPage('dashboard'); handleSectorClick(r.sector); }
       else if (r.view === 'chart') { setPage('dashboard'); setChartTicker(r.ticker); }
@@ -7104,6 +7210,10 @@ export default function App() {
             <span className="sidebar-icon">&#128260;</span>
             Rotation Pick
           </li>
+          <li className={`sidebar-item ${page === 'rsmethods' ? 'active' : ''}`} onClick={() => { setPage('rsmethods'); navigate('/rs-methods'); }}>
+            <span className="sidebar-icon">&#128202;</span>
+            RS Methods
+          </li>
           <li className={`sidebar-item ${page === 'volshock' ? 'active' : ''}`} onClick={() => { setPage('volshock'); navigate('/vol-shock'); }}>
             <span className="sidebar-icon">&#9889;</span>
             Vol-Shock
@@ -7123,7 +7233,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
