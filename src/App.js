@@ -171,6 +171,92 @@ function TailStrip({ buckets, unit = '%' }) {
   );
 }
 
+// ---- "Firing now" indicator (shared by both signal-listing pages) -----------
+// FiringCell: a compact count badge for a signal's live fires over the last ~3 bars. When
+// count>0 it's a clickable green sm-badge (🔥 N) that opens the FiringPane; stopPropagation
+// keeps a table-row's own onClick (expand/toggle) from firing. count 0/falsy -> a dim, inert –.
+function FiringCell({ count, signalKey, onOpen }) {
+  if (!count) return <span className="dim">–</span>;
+  return (
+    <span
+      className="sm-badge good"
+      style={{ cursor: 'pointer' }}
+      title={`${count} names fired this signal in the last 3 bars — click for the list`}
+      onClick={(e) => { e.stopPropagation(); onOpen && onOpen(signalKey); }}
+    >
+      🔥 {count}
+    </span>
+  );
+}
+
+// FiringPane: shared overlay listing the names currently firing a given signal. Reuses the
+// existing .addiv-chart-overlay backdrop (closes on click) + .addiv-chart-box panel. Hooks run
+// unconditionally (fetch on signalKey change; sortable table) and it early-returns null when no
+// signalKey is set, so it's rendered once per page and only paints when opened.
+function FiringPane({ signalKey, onClose }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (!signalKey) return;
+    let live = true;
+    setLoading(true); setError(null); setData(null);
+    apiFetch('/signal-firing?signal=' + encodeURIComponent(signalKey))
+      .then(d => { if (live) { setData(d); setLoading(false); } })
+      .catch(e => { if (live) { setError(e.message || 'Failed to load firing list.'); setLoading(false); } });
+    return () => { live = false; };
+  }, [signalKey]);
+
+  const firing = (data && data.firing) || [];
+  const sort = useSortedRows(firing, 'days_ago', 'asc', {
+    sectors: r => (r.sectors || []).slice(0, 2).join(', '),
+  });
+
+  if (!signalKey) return null;
+
+  const recentBars = (data && data.recent_bars) || 3;
+  return (
+    <div className="addiv-chart-overlay" onClick={onClose}>
+      <div className="addiv-chart-box" style={{ width: 'min(560px, 94vw)', maxHeight: '80vh' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 10 }}>
+          <div>
+            <div style={{ fontWeight: 700 }}>{(data && data.signal_name) || signalKey}</div>
+            <div className="dim" style={{ fontSize: 11 }}>
+              {(data && data.n_firing) || 0} firing (last {recentBars}d)
+            </div>
+          </div>
+          <button className="error-banner-x" onClick={onClose} aria-label="Close" title="Close">&times;</button>
+        </div>
+        {loading ? <div className="dim" style={{ padding: 8 }}>Loading…</div> :
+         error ? <ErrorBanner message={error} /> :
+         firing.length ? (
+          <table className="studies-table">
+            <thead>
+              <tr>
+                <SortTh label="Ticker" colKey="ticker" sort={sort} />
+                <SortTh label="Days ago" colKey="days_ago" sort={sort} align="right" />
+                <SortTh label="Last close" colKey="last_close" sort={sort} align="right" />
+                <SortTh label="Sector(s)" colKey="sectors" sort={sort} />
+              </tr>
+            </thead>
+            <tbody>
+              {sort.rows.map(r => (
+                <tr key={r.ticker} className="study-row">
+                  <td>{r.ticker}</td>
+                  <td style={{ textAlign: 'right' }}>{r.days_ago === 0 ? 'today' : `${r.days_ago}d`}</td>
+                  <td style={{ textAlign: 'right' }}>{r.last_close != null ? r.last_close : '–'}</td>
+                  <td className="dim">{(r.sectors || []).slice(0, 2).join(', ')}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+         ) : <div className="dim" style={{ padding: 8 }}>Not scanned yet or none firing.</div>}
+      </div>
+    </div>
+  );
+}
+
 // ---- Server-side pagination + infinite scroll --------------------------------
 // usePagedList(path, params): fetches page 1 of `path?paginate=1&<params>` and appends further pages
 // (by offset) via loadMore(). Any change to `params` (ordering / dir / search / category / regime / …)
@@ -1649,6 +1735,7 @@ function StudiesPage() {
   const [error, setError] = useState(null);
 
   const [expandedSignal, setExpandedSignal] = useState(null);
+  const [firingSignal, setFiringSignal] = useState(null);   // open FiringPane for this signal key
   const [exitRows, setExitRows] = useState({});        // {signal: [exit rows]}
   const [exitLoading, setExitLoading] = useState(null);
   const [exitErr, setExitErr] = useState({});          // {signal: message}
@@ -1730,7 +1817,7 @@ function StudiesPage() {
 
   const categories = meta.categories || [];
   const totalSignals = meta.total_signals ?? grouped.length;
-  const GROUP_COLS = 10;
+  const GROUP_COLS = 11;
 
   return (
     <div className="studies-page">
@@ -1789,6 +1876,7 @@ function StudiesPage() {
             <SortTh label="Win%" colKey="best_wr" sort={sort}><Term k="winrate">Win%</Term></SortTh>
             <SortTh label="Sig t" colKey="best_t" sort={sort}><Term k="sig">Sig t</Term></SortTh>
             <SortTh label="Range" colKey="range" sort={sort} title="Min..max average return across this signal's exits">Range</SortTh>
+            <SortTh label="Firing 3d" colKey="n_firing" sort={sort} title="Names firing this signal in the last 3 bars">Firing 3d</SortTh>
           </tr>
         </thead>
         <tbody>
@@ -1808,6 +1896,7 @@ function StudiesPage() {
                 <td className={best.win_rate > 55 ? 'good' : best.win_rate < 45 ? 'bad' : ''}>{best.win_rate != null ? `${best.win_rate.toFixed(1)}%` : '-'}</td>
                 <td className={best.t_stat == null ? 'dim' : Math.abs(best.t_stat) >= 2 ? 'good' : Math.abs(best.t_stat) < 1 ? 'bad' : ''}>{best.t_stat != null ? best.t_stat.toFixed(1) : '-'}</td>
                 <td className="dim">{g.min_ret != null && g.max_ret != null ? `${g.min_ret > 0 ? '+' : ''}${g.min_ret.toFixed(1)}..${g.max_ret > 0 ? '+' : ''}${g.max_ret.toFixed(1)}%` : '-'}</td>
+                <td><FiringCell count={g.n_firing} signalKey={g.signal} onOpen={setFiringSignal} /></td>
               </tr>
               {isOpen && (
                 <tr className="study-detail-row">
@@ -1828,6 +1917,7 @@ function StudiesPage() {
         </tbody>
       </table>
       {!grouped.length && <div className="dim" style={{ padding: 12, textAlign: 'center' }}>No studies match.</div>}
+      <FiringPane signalKey={firingSignal} onClose={() => setFiringSignal(null)} />
     </div>
   );
 }
@@ -2547,6 +2637,7 @@ function StockStudiesPage() {
   const [drillSector, setDrillSector] = useState({});   // rowKey -> sector name
   const [drillData, setDrillData] = useState({});        // rowKey -> result
   const [drillLoading, setDrillLoading] = useState(null); // rowKey currently loading
+  const [firingSignal, setFiringSignal] = useState(null);  // open FiringPane for this signal key
 
   // Debounce search so a keystroke doesn't re-query the 24k-row table on every character.
   useEffect(() => { const t = setTimeout(() => setDsearch(search), 300); return () => clearTimeout(t); }, [search]);
@@ -2713,6 +2804,7 @@ function StockStudiesPage() {
             <th onClick={() => setSort('avg_mae')} style={{cursor:'pointer', textAlign:'right'}}><Term k="avgdip">Avg Dip</Term>{arrow('avg_mae')}</th>
             <th onClick={() => setSort('clean_pct')} style={{cursor:'pointer', textAlign:'right'}}><Term k="cleanpct">Clean%</Term>{arrow('clean_pct')}</th>
             <th><Term k="bestfund">Best fundamental bucket</Term></th>
+            <th onClick={() => setSort('n_firing')} style={{cursor:'pointer', textAlign:'right'}} title="Names firing this signal in the last 3 bars">Firing 3d{arrow('n_firing')}</th>
           </tr>
         </thead>
         <tbody>
@@ -2735,10 +2827,11 @@ function StockStudiesPage() {
                   <td style={{textAlign:'right'}} className={m.avg_mae == null ? 'dim' : m.avg_mae >= -3 ? 'good' : m.avg_mae >= -8 ? '' : 'bad'}>{m.avg_mae != null ? `${m.avg_mae.toFixed(1)}%` : '–'}</td>
                   <td style={{textAlign:'right'}} className={m.clean_pct == null ? 'dim' : m.clean_pct >= 40 ? 'good' : m.clean_pct < 20 ? 'bad' : ''}>{m.clean_pct != null ? `${m.clean_pct.toFixed(0)}%` : '–'}</td>
                   <td>{(() => { const b = bestBucket(r); return b ? <span className="drill-chip">{b.bucket} <span className="good">+{b.avg_return}%</span> <span className="dim">({b.trades}tr)</span>{isSnapshot(b.dim) && <span className="dim-badge" title="Uses today's snapshot — carries lookahead bias, not point-in-time">snapshot</span>}</span> : <span className="dim">–</span>; })()}</td>
+                  <td style={{textAlign:'right'}}><FiringCell count={r.n_firing} signalKey={r.signal_key} onOpen={setFiringSignal} /></td>
                 </tr>
                 {isOpen && (
                   <tr className="study-detail-row">
-                    <td colSpan={12}>
+                    <td colSpan={13}>
                       {(() => {
                         const capEntry = Object.entries(r.by_dimension || {}).find(([dim]) => /cap/i.test(dim));
                         if (!capEntry) return null;
@@ -2832,6 +2925,7 @@ function StockStudiesPage() {
       {loading && pageRows.length > 0 && <div className="loading dim" style={{padding:12}}>Loading more…</div>}
       {slicing && <p className="dim" style={{marginTop:8}}>Slice view reframes the {pageRows.length} currently-loaded rows; scroll with the slice cleared to load more.</p>}
       {!slicing && !hasMore && pageRows.length > 0 && <div className="dim" style={{padding:12,textAlign:'center'}}>All {(meta.total ?? pageRows.length).toLocaleString()} loaded.</div>}
+      <FiringPane signalKey={firingSignal} onClose={() => setFiringSignal(null)} />
     </div>
   );
 }
