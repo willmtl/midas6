@@ -1899,6 +1899,15 @@ class RsMethodsView(_StudyResultView):
     json_path = "/app/.data/studies/rs_methods.json"
 
 
+class SyntheticMaCrossView(_StudyResultView):
+    """MA crossover run on all 93 synthetic relative-strength candles (etf/spy). Pooled forward RELATIVE
+    return after each golden/death cross + the golden-vs-death state drift + a live golden/death snapshot.
+    Key result: a golden cross ON the RS bar is mean-reverting (lags SPY) — only the state carries info."""
+    kind = "synthetic_ma_cross"
+    script = "synthetic_ma_cross.py"
+    json_path = "/app/.data/studies/synthetic_ma_cross.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""

@@ -70,6 +70,8 @@ urlpatterns = [
     path("rotation-picks", views.RotationPicksView.as_view(), name="rotation-picks"),
     # RS-trend method sweep (~20 selection rules on the ETF/SPY bar, one value pick)
     path("rs-methods", views.RsMethodsView.as_view(), name="rs-methods"),
+    # MA crossover run on every synthetic RS candle (mean-reversion diagnostic)
+    path("synthetic-ma-cross", views.SyntheticMaCrossView.as_view(), name="synthetic-ma-cross"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),
