@@ -78,6 +78,10 @@ urlpatterns = [
     path("diversifier", views.DiversifierView.as_view(), name="diversifier"),
     # Macro regime -> sector leadership (rates / inflation / market)
     path("regime", views.RegimeView.as_view(), name="regime"),
+    # Right ENTRY signal for the value-pick basket (dip adds, strength subtracts)
+    path("entry-signal", views.EntrySignalView.as_view(), name="entry-signal"),
+    # THE headline rotation call: regime-leaders ∩ value-pick ∩ oversold entry
+    path("rotation-call", views.RotationCallView.as_view(), name="rotation-call"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),

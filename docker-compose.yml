@@ -73,6 +73,8 @@ x-backend-volumes: &backend-volumes
   - ./oversold_bounce.py:/app/oversold_bounce.py
   - ./diversifier_scan.py:/app/diversifier_scan.py
   - ./regime_scan.py:/app/regime_scan.py
+  - ./entry_signal_study.py:/app/entry_signal_study.py
+  - ./rotation_call_scan.py:/app/rotation_call_scan.py
   - ./.data:/app/.data
 
 services:

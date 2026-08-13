@@ -1935,6 +1935,25 @@ class RegimeView(_StudyResultView):
     json_path = "/app/.data/studies/regime.json"
 
 
+class EntrySignalView(_StudyResultView):
+    """Which ENTRY signal is right for the value-pick basket? Holds selection fixed (arm3_lowpb: top-momentum
+    sectors -> cheapest-P/B pick) and varies only the entry gate on the pick's ABSOLUTE price. Result: buying
+    the value name into an oversold DIP (RSI(10)<45/<35) adds forward return; buying strength/confirmation
+    (above-MA, RSI cross-up, MACD-up) subtracts. GET reads BacktestResult[entry_signal]; POST recomputes."""
+    kind = "entry_signal"
+    script = "entry_signal_study.py"
+    json_path = "/app/.data/studies/entry_signal.json"
+
+
+class RotationCallView(_StudyResultView):
+    """THE headline rotation call: regime-leader sectors (Regime) -> cheapest positive-P/B value pick
+    (arm3_lowpb) -> entered on an oversold dip (entry_signal winner). The flagship that reflects what beats
+    SPY — explicitly NOT the sector TREND TURN alert. GET reads BacktestResult[rotation_call]; POST recomputes."""
+    kind = "rotation_call"
+    script = "rotation_call_scan.py"
+    json_path = "/app/.data/studies/rotation_call.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""

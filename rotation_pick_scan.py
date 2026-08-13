@@ -51,7 +51,7 @@ def build():
               .values("ticker", "pb_ratio", "market_cap", "pe_ratio", "forward_pe",
                       "profit_margin", "revenue_growth")):
         funds.setdefault(r["ticker"], r)
-    px = load_candles(univ)
+    px = load_candles(univ + [e for e, _ in ranked])
 
     picks = []
     for rank, (etf, m) in enumerate(ranked, 1):
@@ -65,24 +65,35 @@ def build():
             f = funds.get(t, {})
             dfp = px.get(t)
             row.update({
-                "pick": t, "pb_ratio": round(pb, 2),
+                "pick": t, "is_etf_proxy": False, "pb_ratio": round(pb, 2),
                 "last_close": round(float(dfp["Close"].iloc[-1]), 2) if dfp is not None and len(dfp) else None,
                 "market_cap": f.get("market_cap"), "pe_ratio": f.get("pe_ratio"),
                 "forward_pe": f.get("forward_pe"), "profit_margin": f.get("profit_margin"),
                 "revenue_growth": f.get("revenue_growth"),
                 "pick_sectors": sector_holdings.get_sectors_for_ticker(t)})
         else:
-            row["pick"] = None
+            # No positive-P/B stock (pure commodity ETF, or a market whose holdings lack P/B like
+            # foreign listings) -> HOLD THE ETF ITSELF, treated as the position. This is a trend/
+            # momentum sleeve, not a value pick -- flagged is_etf_proxy so the app can badge it.
+            dfe = px.get(etf)
+            row.update({
+                "pick": etf, "is_etf_proxy": True, "pb_ratio": None,
+                "last_close": round(float(dfe["Close"].iloc[-1]), 2) if dfe is not None and len(dfe) else None,
+                "market_cap": None, "pe_ratio": None, "forward_pe": None,
+                "profit_margin": None, "revenue_growth": None, "pick_sectors": [name]})
         picks.append(row)
 
     payload = {
         "computed_at": pd.Timestamp.utcnow().isoformat(),
         "params": {"lookback_days": LOOKBACK_D, "top_n_sectors": TOP_N_SECTORS,
-                   "rule": "top trailing-6mo-momentum sectors -> cheapest positive-P/B holding",
-                   "backtest": "arm3_lowpb: +237% total / +154% vs SPY / t=2.09 (55 monthly periods)"},
+                   "rule": ("top trailing-6mo-momentum sectors -> cheapest positive-P/B holding; if a "
+                            "sector has no positive-P/B stock (pure commodity ETF, or foreign market "
+                            "whose holdings lack P/B) HOLD THE ETF itself, treated as the position"),
+                   "backtest": ("value picks: arm3_lowpb +237%/+154% vs SPY t2.09; with commodity/market "
+                                "ETFs held as positions (fallback) ~+156% vs SPY — see Entry Signal tab")},
         "picks": picks,
-        "note": ("The rotation is a SELECTION FILTER, not an ETF trade (ETF rotation loses to SPY). "
-                 "Monthly-rebalance value basket; directional, no fees; stock-universe survivorship."),
+        "note": ("Value picks are the alpha; commodity/market sleeves with no P/B stock are held via their "
+                 "ETF (trend sleeve, not value — badged in the app). Monthly-rebalance; directional, no fees."),
     }
     return payload
 
@@ -106,11 +117,10 @@ def main():
         print("DB save failed:", e, flush=True)
     print("\n=== ROTATION PICKS (cheapest-P/B in each strengthening sector) ===", flush=True)
     for p in payload["picks"]:
-        if p.get("pick"):
-            print(f"  #{p['rank']:>2} {p['sector']:22} mom6 {p['momentum_6m']:>+6.1f}%  ->  "
-                  f"{p['pick']:6} P/B {p['pb_ratio']:>5}  ${p['last_close']}", flush=True)
-        else:
-            print(f"  #{p['rank']:>2} {p['sector']:22} mom6 {p['momentum_6m']:>+6.1f}%  ->  (no positive-P/B holding)", flush=True)
+        pb = f"{p['pb_ratio']:>5}" if p.get("pb_ratio") is not None else "  ETF"
+        tag = "  [ETF held as position]" if p.get("is_etf_proxy") else ""
+        print(f"  #{p['rank']:>2} {p['sector']:22} mom6 {p['momentum_6m']:>+6.1f}%  ->  "
+              f"{p['pick']:8} P/B {pb}  ${p['last_close']}{tag}", flush=True)
 
 
 if __name__ == "__main__":

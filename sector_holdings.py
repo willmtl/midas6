@@ -434,11 +434,20 @@ HOLDINGS = {
 
     "Gold": {
         "etf": "GLD",
-        "holdings": [],  # Holds physical gold
+        # Physical gold has no equity; use gold MINERS so the sleeve picks a cheap producer (value)
+        # instead of bullion. Pick logic filters to those with candles + positive P/B.
+        "holdings": [
+            "NEM", "GOLD", "AEM", "KGC", "FNV", "WPM", "RGLD", "AU", "GFI",
+            "BTG", "EGO", "IAG", "NGD", "SSRM", "HMY", "OR", "HL", "PAAS",
+        ],
     },
     "Silver": {
         "etf": "SLV",
-        "holdings": [],  # Holds physical silver
+        # Physical silver -> silver MINERS.
+        "holdings": [
+            "CDE", "HL", "PAAS", "AG", "MAG", "EXK", "SSRM", "FSM", "SVM",
+            "GATO", "SILV", "GORO", "USAS", "MUX",
+        ],
     },
     "Platinum": {
         "etf": "PPLT",
@@ -446,7 +455,11 @@ HOLDINGS = {
     },
     "Oil": {
         "etf": "USO",
-        "holdings": [],  # Holds oil futures
+        # Oil futures -> oil & gas PRODUCERS / E&P so the sleeve picks a cheap producer.
+        "holdings": [
+            "EOG", "DVN", "FANG", "OXY", "CTRA", "AR", "COP", "XOM", "CVX",
+            "HES", "APA", "MRO", "OVV", "MTDR", "PR", "CHRD", "SM", "CIVI",
+        ],
     },
     "Natural Gas": {
         "etf": "UNG",

@@ -236,4 +236,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_rotation_picks",
         "schedule": crontab(hour=22, minute=5),
     },
+    "rotation-call-nightly": {          # flagship Rotation Call (regime-leaders ∩ value ∩ oversold entry)
+        "task": "api.celery_tasks.run_rotation_call",
+        "schedule": crontab(hour=22, minute=7),
+    },
 }

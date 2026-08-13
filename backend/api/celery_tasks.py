@@ -489,6 +489,20 @@ def run_rotation_picks():
 
 
 @shared_task
+def run_rotation_call():
+    """Nightly: the flagship Rotation Call (regime-leader sectors ∩ cheapest-P/B value pick ∩ oversold
+    entry; commodity/foreign sleeves pick a producer/foreign name, else the ETF) → BacktestResult."""
+    import subprocess, os
+    if not os.path.exists("/app/rotation_call_scan.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/rotation_call_scan.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=1200)
+    if proc.returncode != 0:
+        logger.error("rotation_call_scan failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_signal_firing():
     """Nightly: per-signal firing scan (all signals × full universe, last 3 bars) → SignalFiring.
     After candles refresh; powers the grouped Studies 'firing now' column."""
