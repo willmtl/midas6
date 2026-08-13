@@ -224,4 +224,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_burst_scan",
         "schedule": crontab(hour=22, minute=55),
     },
+    "ground-earnings-nightly": {        # grounded earnings verdict (EPS+guidance), after financials
+        "task": "api.celery_tasks.run_ground_earnings",
+        "schedule": crontab(hour=21, minute=55),
+    },
 }

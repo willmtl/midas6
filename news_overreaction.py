@@ -80,6 +80,19 @@ def build(thr, min_impact):
     print(f"{len(ev)} material news events (impact>={min_impact}) across "
           f"{len({k[0] for k in ev})} tickers", flush=True)
 
+    # GROUNDED earnings verdict (ground_earnings.py): for earnings-driven events, use the hard-data
+    # verdict (EPS surprise + forward guidance) instead of headline sentiment — so a beat-that-guided-
+    # down (PODD) is NOT counted as good news. Keyed to the reaction date (report_date and +1 session).
+    from core.models import EarningsEvent
+    gv = {}
+    for etk, erd, gs in (EarningsEvent.objects.filter(grounded_score__isnull=False)
+                         .values_list("ticker", "report_date", "grounded_score")):
+        ts = pd.Timestamp(erd)
+        gv[(etk, ts)] = gs
+        gv[(etk, ts + pd.Timedelta(days=1))] = gs
+    n_grounded = sum(1 for k in ev if k in gv)
+    print(f"{n_grounded} events have a grounded earnings verdict (headline overridden)", flush=True)
+
     tickers = sorted({k[0] for k in ev})
     qs = (Candle.objects.filter(ticker__in=tickers, interval="1d")
           .values_list("ticker", "date", "open", "close"))
@@ -112,7 +125,10 @@ def build(thr, min_impact):
         for H in HZ:
             j = idx + H
             fwd[H] = (float(s.iloc[j]) / base - 1.0) if j < len(s) else None
-        abn = e["abn"]; rating = e["rating"]
+        abn = e["abn"]
+        # Prefer the grounded earnings verdict where we have it; else the summed headline sentiment.
+        grounded = gv.get((tk, rd))
+        rating = grounded if grounded is not None else e["rating"]
         if abs(abn) < thr:
             continue
         n_events += 1

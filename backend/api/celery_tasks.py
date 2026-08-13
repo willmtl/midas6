@@ -476,6 +476,20 @@ def run_vol_shock_study():
 
 
 @shared_task
+def run_ground_earnings():
+    """Nightly: ground the earnings categorization (EPS surprise + forward guidance) on EarningsEvent.
+    After the earnings (21:05) + financials (21:30) imports so the inputs are fresh."""
+    import subprocess, os
+    if not os.path.exists("/app/ground_earnings.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/ground_earnings.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("ground_earnings failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_burst_scan():
     """Nightly: short-term burst scan + global confluence → ShortTermSignal + GlobalSignal.
     Runs after the stock sweep (needs StockStudy short-horizon edges) + dark-pool/A-D jobs."""

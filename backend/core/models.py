@@ -902,6 +902,14 @@ class EarningsEvent(models.Model):
     before_after = models.CharField(max_length=16, blank=True)   # BeforeMarket / AfterMarket
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # GROUNDED categorization (ground_earnings.py): the multi-dimensional reality behind a "beat",
+    # so a beat-that-guided-down (PODD/Aug-5) is not mislabeled as unambiguously good news.
+    revenue_surprise_pct = models.FloatField(null=True, blank=True)   # actual vs consensus estimate
+    revenue_yoy_pct = models.FloatField(null=True, blank=True)        # revenue growth vs year-ago quarter
+    guidance_eps_pct = models.FloatField(null=True, blank=True)       # fwd EPS est: current vs ~30d pre-report (guided up/down)
+    grounded_label = models.CharField(max_length=32, blank=True, db_index=True)  # e.g. beat_guided_down
+    grounded_score = models.FloatField(null=True, blank=True, db_index=True)     # signed -3..+3 grounded verdict
+
     class Meta:
         unique_together = ["ticker", "report_date"]
         indexes = [models.Index(fields=["ticker", "report_date"])]
