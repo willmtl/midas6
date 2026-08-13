@@ -1867,7 +1867,7 @@ class ShortTermView(APIView):
     FIELDS = ["ticker", "signal_key", "signal_name", "burst_type", "days_ago", "last_close",
               "day1_move", "z_shock", "best_exit_key", "hist_avg_return", "hist_win_rate",
               "hist_trades", "market_cap", "pe_ratio", "forward_pe", "fund_buckets", "sectors",
-              "insider_buy_90d", "recent_13d", "recent_13g"]
+              "insider_buy_90d", "recent_13d", "recent_13g", "intraday_signal", "intraday_rsi"]
 
     def get(self, request):
         from core.models import ShortTermSignal
@@ -1900,7 +1900,8 @@ class GlobalView(APIView):
               "burst_type", "burst_days_ago", "last_close", "best_signal_key", "hist_avg_return",
               "hist_win_rate", "hist_trades", "ad_state", "darkpool_off_pct", "darkpool_rising",
               "market_cap", "pe_ratio", "forward_pe", "fund_buckets", "sectors", "insider_buy_90d",
-              "recent_13d", "recent_13g", "regime_bull", "sector_state"]
+              "recent_13d", "recent_13g", "regime_bull", "sector_state",
+              "intraday_signal", "intraday_rsi"]
 
     def get(self, request):
         from core.models import GlobalSignal
@@ -1912,8 +1913,8 @@ class GlobalView(APIView):
         last = GlobalSignal.objects.aggregate(m=Max("computed_at"))["m"]
         return Response({
             "computed": True, "n_global": len(rows), "results": rows,
-            "weights": {"burst": 15, "edge": 15, "ad": 15, "darkpool": 10,
-                        "smart_money": 10, "fundamentals": 10, "regime": 10, "news": 15},
+            "weights": {"burst": 12, "edge": 12, "ad": 12, "darkpool": 10, "smart_money": 8,
+                        "fundamentals": 8, "regime": 8, "news": 15, "intraday": 15},
             "regime_bull": bool(rows and rows[0].get("regime_bull")),
             "last_updated": last.isoformat() if last else None,
         })

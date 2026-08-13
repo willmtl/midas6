@@ -42,10 +42,67 @@ SHORT_EXITS = {"1d", "3d", "1w", "2w", "4w"}   # short-horizon edge for the shor
 AD_STATE_NAME = {2: "accum divergence", 1: "accum trend-up", 0: "neutral", -1: "distribution"}
 
 # Confluence component weights (sum = 100). global_score = Σ w_k · component_k(0..1).
-# `news` = a recent GROUNDED good-news crash the burst is bouncing off (overreaction reversal, PODD-type
-# — grounded so a beat-that-guided-down does NOT count as good news).
-W = {"burst": 15, "edge": 15, "ad": 15, "darkpool": 10, "smart_money": 10,
-     "fundamentals": 10, "regime": 10, "news": 15}
+# `news`     = a recent GROUNDED good-news crash the burst is bouncing off (overreaction reversal).
+# `intraday` = an OVERSOLD intraday RSI cross-up (EODHD 1h -> 8h/12h) timing the entry — the study's
+#              edge lives in oversold (<35) crossovers, so this rewards well-timed reversal entries.
+W = {"burst": 12, "edge": 12, "ad": 12, "darkpool": 10, "smart_money": 8,
+     "fundamentals": 8, "regime": 8, "news": 15, "intraday": 15}
+
+
+def _fetch_recent_1h(sym, days=60):
+    """Recent EODHD 1h bars for a live candidate (one request; ~60d is enough for 8h/12h RSI(14))."""
+    import time
+    import requests
+    import pandas as pd
+    eod = os.environ.get("EODHD_API_KEY", "")
+    if not eod:
+        return None
+    end = int(time.time()); frm = end - days * 86400
+    try:
+        r = requests.get(f"https://eodhd.com/api/intraday/{sym}.US?interval=1h&from={frm}&to={end}"
+                         f"&api_token={eod}&fmt=json", timeout=25)
+        j = r.json()
+    except Exception:
+        return None
+    if not isinstance(j, list) or not j:
+        return None
+    df = pd.DataFrame(j)
+    df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    return (df.set_index("dt").sort_index()[["open", "high", "low", "close", "volume"]]
+            .apply(pd.to_numeric, errors="coerce").dropna())
+
+
+def _tf_signal(df1h, hours):
+    import ta
+    d = df1h.resample(f"{hours}h").agg({"open": "first", "high": "max", "low": "min",
+                                        "close": "last", "volume": "sum"}).dropna()
+    if len(d) < 30:
+        return None
+    rsi = ta.momentum.rsi(d["close"], window=14)
+    sma = rsi.rolling(14).mean()
+    up = (rsi > sma) & (rsi.shift(1) <= sma.shift(1))
+    cur = float(rsi.iloc[-1]) if np.isfinite(rsi.iloc[-1]) else None
+    for k in (1, 2):                          # crossed up in the last 1-2 bars?
+        if len(up) > k and bool(up.iloc[-k]):
+            rc = float(rsi.iloc[-k])
+            comp = 1.0 if rc < 25 else 0.7 if rc < 35 else 0.4 if rc < 45 else 0.2
+            return comp, f"{hours}h RSI↑ from {rc:.0f}", cur
+    if cur is not None and cur < 30:          # oversold, primed (no cross yet)
+        return 0.3, f"{hours}h oversold RSI {cur:.0f}", cur
+    return 0.1, "", cur
+
+
+def intraday_timing(sym):
+    """Best oversold intraday RSI-cross signal across 8h & 12h. Returns (component, signal_str, rsi)."""
+    df1h = _fetch_recent_1h(sym)
+    if df1h is None or len(df1h) < 60:
+        return 0.1, "", None
+    best = (0.1, "", None)
+    for h in (8, 12):
+        r = _tf_signal(df1h, h)
+        if r and r[0] > best[0]:
+            best = r
+    return best
 
 
 def _worker(payload):
@@ -176,6 +233,18 @@ def run(jobs, recent=2, save_db=True):
     regime_bull = bool(spy is not None and len(spy) > 200
                        and spy["Close"].iloc[-1] > spy["Close"].rolling(200).mean().iloc[-1])
 
+    # ---- intraday entry timing for the live candidates (EODHD 1h -> 8h/12h oversold RSI cross) ----
+    # Sequential + gentle sleep (rate-limit friendly); ~firing tickers once/night. Failures -> 0.1.
+    import time as _t
+    intraday = {}
+    for _i, _tk in enumerate(firing):
+        intraday[_tk] = intraday_timing(_tk)
+        _t.sleep(0.1)
+        if (_i + 1) % 100 == 0:
+            print(f"  intraday {_i + 1}/{len(firing)}", flush=True)
+    n_itim = sum(1 for v in intraday.values() if v[0] >= 0.7)
+    print(f"intraday timing: {len(firing)} candidates, {n_itim} with an oversold cross", flush=True)
+
     # ---- ShortTermSignal rows (one per ticker×signal) ----
     st_rows = []
     for tk, sk, btype, days_ago, last_close, d1, zz, adc in hits:
@@ -191,6 +260,8 @@ def run(jobs, recent=2, save_db=True):
             "sectors": sector_holdings.get_sectors_for_ticker(tk),
             "insider_buy_90d": ins.get(tk),
             "recent_13d": sec.get(tk, {}).get("13D", 0), "recent_13g": sec.get(tk, {}).get("13G", 0),
+            "intraday_signal": intraday.get(tk, (0.1, "", None))[1],
+            "intraday_rsi": intraday.get(tk, (0.1, "", None))[2],
         })
     st_rows.sort(key=lambda r: (r["days_ago"], -(r["hist_avg_return"] or 0)))
 
@@ -252,7 +323,9 @@ def run(jobs, recent=2, save_db=True):
             "fundamentals": _fav_fund_score(f),
             "regime": 1.0 if regime_bull else 0.3,
             "news": news_sig.get(tk, 0.3),
+            "intraday": intraday.get(tk, (0.1, "", None))[0],
         }
+        itim = intraday.get(tk, (0.1, "", None))
         score = round(sum(W[k] * comps[k] for k in W), 1)
         g_rows.append({
             "ticker": tk, "global_score": score,
@@ -268,6 +341,7 @@ def run(jobs, recent=2, save_db=True):
             "sectors": sector_holdings.get_sectors_for_ticker(tk),
             "insider_buy_90d": ins_v, "recent_13d": s13d, "recent_13g": s13g,
             "regime_bull": regime_bull, "sector_state": "",
+            "intraday_signal": itim[1], "intraday_rsi": itim[2],
         })
     g_rows.sort(key=lambda r: -r["global_score"])
 
@@ -304,7 +378,8 @@ def _save_short_term(rows):
                     "signal_name", "burst_type", "days_ago", "last_close", "day1_move", "z_shock",
                     "best_exit_key", "hist_avg_return", "hist_win_rate", "hist_trades",
                     "market_cap", "pe_ratio", "forward_pe", "fund_buckets", "sectors",
-                    "insider_buy_90d", "recent_13d", "recent_13g")} | {"computed_at": now})
+                    "insider_buy_90d", "recent_13d", "recent_13g",
+                    "intraday_signal", "intraday_rsi")} | {"computed_at": now})
     ShortTermSignal.objects.exclude(computed_at=now).delete()
     print(f"DB: upserted {len(rows)} ShortTermSignal rows, cleared stale.", flush=True)
 
@@ -324,7 +399,8 @@ def _save_global(rows):
                     "hist_avg_return", "hist_win_rate", "hist_trades", "ad_state",
                     "darkpool_off_pct", "darkpool_rising", "market_cap", "pe_ratio", "forward_pe",
                     "fund_buckets", "sectors", "insider_buy_90d", "recent_13d", "recent_13g",
-                    "regime_bull", "sector_state")} | {"computed_at": now})
+                    "regime_bull", "sector_state",
+                    "intraday_signal", "intraday_rsi")} | {"computed_at": now})
     GlobalSignal.objects.exclude(computed_at=now).delete()
     print(f"DB: upserted {len(rows)} GlobalSignal rows, cleared stale.", flush=True)
 

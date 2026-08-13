@@ -537,6 +537,9 @@ class ShortTermSignal(models.Model):
     insider_buy_90d = models.BigIntegerField(null=True, blank=True)
     recent_13d = models.IntegerField(default=0)
     recent_13g = models.IntegerField(default=0)
+    # Intraday entry timing (EODHD 1h -> 8h/12h): the oversold RSI cross-up that times the reversal.
+    intraday_signal = models.CharField(max_length=40, blank=True)   # e.g. "8h RSI↑ from 24"
+    intraday_rsi = models.FloatField(null=True, blank=True)         # latest intraday RSI(14)
 
     computed_at = models.DateTimeField(null=True, blank=True)
 
@@ -586,6 +589,9 @@ class GlobalSignal(models.Model):
     recent_13g = models.IntegerField(default=0)
     regime_bull = models.BooleanField(default=False)               # SPY > 200dMA at scan
     sector_state = models.CharField(max_length=12, blank=True)     # IN/STRONG/LEADER/TURNING/OUT
+    # Intraday entry timing (EODHD 1h -> 8h/12h): oversold RSI cross-up timing the reversal entry.
+    intraday_signal = models.CharField(max_length=40, blank=True)
+    intraday_rsi = models.FloatField(null=True, blank=True)
 
     computed_at = models.DateTimeField(null=True, blank=True)
 
