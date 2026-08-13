@@ -7066,12 +7066,21 @@ function SyntheticMaCrossPage() {
         return (
           <div key={row.pair} style={{ margin: '0 0 22px' }}>
             <h3 style={{ margin: '0 0 6px' }}>SMA {row.pair} on the RS bar</h3>
-            <p className="subtitle" style={{ margin: '0 0 8px' }}>
+            <p className="subtitle" style={{ margin: '0 0 4px' }}>
               State drift: while <span className="good">golden</span> the sector out-drifts {params.benchmark || 'SPY'}{' '}
               <span className={sgn(st.golden_ann_rs_pct)}>{p1(st.golden_ann_rs_pct)}/yr</span>; while{' '}
-              <span className="bad">death</span> <span className={sgn(st.death_ann_rs_pct)}>{p1(st.death_ann_rs_pct)}/yr</span>{' '}
-              — the gap is the only real edge.
+              <span className="bad">death</span> <span className={sgn(st.death_ann_rs_pct)}>{p1(st.death_ann_rs_pct)}/yr</span>.
             </p>
+            {row.pre_cross && (
+              <p className="subtitle" style={{ margin: '0 0 8px' }}>
+                <b>Run-up INTO the cross</b> (relative, the move that already happened):{' '}
+                {(params.pre_windows_days || [5, 10, 20]).map((w, i) => {
+                  const a = row.pre_cross[`${w}d`] || {};
+                  return <span key={w} className={sgn(a.mean_pct)}>{i ? ' · ' : ''}{w}d {p1(a.mean_pct)}</span>;
+                })}
+                {' '}<span className="dim">— the golden cross is a lagging confirmation; forward returns are already reverting.</span>
+              </p>
+            )}
             <table className="studies-table">
               <thead><tr>
                 <th style={{ textAlign: 'left' }}>Horizon</th>
