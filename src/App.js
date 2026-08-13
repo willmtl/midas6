@@ -6999,6 +6999,126 @@ function RsMethodsPage() {
   );
 }
 
+// MA crossover run on all 93 synthetic RS candles. Reads GET /synthetic-ma-cross; POST recomputes.
+// The finding it shows: a golden cross ON the relative-strength bar is MEAN-REVERTING (forward relative
+// return is negative, t hugely negative) even though the ETF still rises in absolute terms — so it is
+// NOT a buy signal. Only the coarse golden-vs-death state carries a thin edge.
+function SyntheticMaCrossPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => apiFetch('/synthetic-ma-cross').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/synthetic-ma-cross`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/synthetic-ma-cross`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading synthetic MA-cross...</div>;
+  if (data.computed === false) {
+    return (
+      <div className="studies-page">
+        <h1>Synthetic MA-Cross</h1>
+        <p className="subtitle">Moving-average crossover run on every synthetic ETF/SPY relative-strength candle.</p>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Compute now'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const params = data.params || {};
+  const pairs = data.pairs || [];
+  const horizons = params.horizons_days || [21, 63, 126];
+  const sgn = v => v == null ? 'dim' : v > 0 ? 'good' : v < 0 ? 'bad' : 'dim';
+  const p1 = v => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
+
+  return (
+    <div className="studies-page">
+      <h1>Synthetic MA-Cross <LastUpdatedChip value={data.last_updated} /></h1>
+
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '4px 0 16px' }}>
+        <p style={{ margin: 0 }}>
+          Golden/death crossovers run on all <b>{params.n_synthetic_candles || 93} synthetic {params.benchmark || 'SPY'}-relative candles</b> (Close = etf/spy).
+          Forward <b>relative</b> return = ETF return minus {params.benchmark || 'SPY'} over the window (&gt;0 = beat the index).
+        </p>
+        <p style={{ margin: '8px 0 0' }} className="bad">
+          ⚠ A golden cross <b>on the RS bar is mean-reverting, not a buy signal</b>: forward <b>relative</b> return is
+          negative at every horizon (t hugely negative). The ETF still rises in <b>absolute</b> terms (beta) — it just
+          lags {params.benchmark || 'SPY'}. Only the coarse golden-vs-death <b>state</b> carries a thin edge.
+        </p>
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Recomputing...' : 'Recompute'}</button>
+        </p>
+      </div>
+
+      {pairs.map(row => {
+        const st = row.state_test || {};
+        const gc = row.now_golden || [];
+        return (
+          <div key={row.pair} style={{ margin: '0 0 22px' }}>
+            <h3 style={{ margin: '0 0 6px' }}>SMA {row.pair} on the RS bar</h3>
+            <p className="subtitle" style={{ margin: '0 0 8px' }}>
+              State drift: while <span className="good">golden</span> the sector out-drifts {params.benchmark || 'SPY'}{' '}
+              <span className={sgn(st.golden_ann_rs_pct)}>{p1(st.golden_ann_rs_pct)}/yr</span>; while{' '}
+              <span className="bad">death</span> <span className={sgn(st.death_ann_rs_pct)}>{p1(st.death_ann_rs_pct)}/yr</span>{' '}
+              — the gap is the only real edge.
+            </p>
+            <table className="studies-table">
+              <thead><tr>
+                <th style={{ textAlign: 'left' }}>Horizon</th>
+                <th style={{ textAlign: 'right' }} title="Forward relative return after a golden cross">Golden: rel</th>
+                <th style={{ textAlign: 'right' }}>% pos</th>
+                <th style={{ textAlign: 'right' }}>t</th>
+                <th style={{ textAlign: 'right' }} title="Forward absolute ETF return after a golden cross (beta)">Golden: abs ETF</th>
+                <th style={{ textAlign: 'right' }} title="Forward relative return after a death cross">Death: rel</th>
+                <th style={{ textAlign: 'right' }}>t</th>
+                <th style={{ textAlign: 'right' }}>n</th>
+              </tr></thead>
+              <tbody>
+                {horizons.map(h => {
+                  const u = (row.cross_up || {})[`${h}d`] || {};
+                  const a = (row.abs_after_golden || {})[`${h}d`] || {};
+                  const d = (row.cross_dn || {})[`${h}d`] || {};
+                  return (
+                    <tr key={h} className="study-row">
+                      <td>+{h}d</td>
+                      <td style={{ textAlign: 'right' }} className={sgn(u.mean_pct)}>{p1(u.mean_pct)}</td>
+                      <td style={{ textAlign: 'right' }} className="dim">{u.pos_pct == null ? '–' : `${u.pos_pct}%`}</td>
+                      <td style={{ textAlign: 'right' }} className="dim">{u.t == null ? '–' : u.t}</td>
+                      <td style={{ textAlign: 'right' }} className={sgn(a.mean_pct)}>{p1(a.mean_pct)}</td>
+                      <td style={{ textAlign: 'right' }} className={sgn(d.mean_pct)}>{p1(d.mean_pct)}</td>
+                      <td style={{ textAlign: 'right' }} className="dim">{d.t == null ? '–' : d.t}</td>
+                      <td style={{ textAlign: 'right' }} className="dim">{u.n == null ? '–' : u.n.toLocaleString()}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <p className="subtitle" style={{ margin: '8px 0 0' }}>
+              <b>Now:</b> {gc.length} sectors in a golden cross, {row.now_death_n} in a death cross.
+              {gc.length ? ' Freshest: ' : ''}
+              {gc.slice(0, 10).map((g, i) => (
+                <span key={g.etf} className="good">{i ? ', ' : ''}{g.sector} ({g.days_since_cross}d)</span>
+              ))}
+              {' '}<span className="dim">— not a buy list on its own (see above).</span>
+            </p>
+          </div>
+        );
+      })}
+      <p className="subtitle">{data.note}</p>
+    </div>
+  );
+}
+
 // NOTE: name kept as parseHash for minimal churn; it now reads window.location.pathname (pretty URLs).
 function parseHash() {
   const h = window.location.pathname;
@@ -7006,6 +7126,7 @@ function parseHash() {
   if (h.startsWith('/live')) return { view: 'live' };
   if (h.startsWith('/alt-data')) return { view: 'altdata' };
   if (h.startsWith('/dark-pool')) return { view: 'darkpool' };
+  if (h.startsWith('/synthetic-ma-cross')) return { view: 'synthmacross' };
   if (h.startsWith('/rs-methods')) return { view: 'rsmethods' };
   if (h.startsWith('/rotation')) return { view: 'rotationpick' };
   if (h.startsWith('/vol-shock')) return { view: 'volshock' };
@@ -7098,7 +7219,7 @@ export default function App() {
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
                        altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
-                       rsmethods: 'rsmethods', volshock: 'volshock' };
+                       rsmethods: 'rsmethods', synthmacross: 'synthmacross', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
       else if (r.view === 'sector') { setPage('dashboard'); handleSectorClick(r.sector); }
       else if (r.view === 'chart') { setPage('dashboard'); setChartTicker(r.ticker); }
@@ -7214,6 +7335,10 @@ export default function App() {
             <span className="sidebar-icon">&#128202;</span>
             RS Methods
           </li>
+          <li className={`sidebar-item ${page === 'synthmacross' ? 'active' : ''}`} onClick={() => { setPage('synthmacross'); navigate('/synthetic-ma-cross'); }}>
+            <span className="sidebar-icon">&#10005;</span>
+            Synthetic MA-Cross
+          </li>
           <li className={`sidebar-item ${page === 'volshock' ? 'active' : ''}`} onClick={() => { setPage('volshock'); navigate('/vol-shock'); }}>
             <span className="sidebar-icon">&#9889;</span>
             Vol-Shock
@@ -7233,7 +7358,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
