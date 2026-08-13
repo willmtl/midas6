@@ -70,6 +70,8 @@ x-backend-volumes: &backend-volumes
   - ./rotation_pick_scan.py:/app/rotation_pick_scan.py
   - ./rs_methods_backtest.py:/app/rs_methods_backtest.py
   - ./synthetic_ma_cross.py:/app/synthetic_ma_cross.py
+  - ./oversold_bounce.py:/app/oversold_bounce.py
+  - ./diversifier_scan.py:/app/diversifier_scan.py
   - ./.data:/app/.data
 
 services:

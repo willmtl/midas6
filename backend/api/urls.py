@@ -72,6 +72,10 @@ urlpatterns = [
     path("rs-methods", views.RsMethodsView.as_view(), name="rs-methods"),
     # MA crossover run on every synthetic RS candle (mean-reversion diagnostic)
     path("synthetic-ma-cross", views.SyntheticMaCrossView.as_view(), name="synthetic-ma-cross"),
+    # Short-term absolute single-stock oversold-reversal entry + live firing list
+    path("oversold-bounce", views.OversoldBounceView.as_view(), name="oversold-bounce"),
+    # Diversifiers: rank sleeves by correlation to SPY (commodities/Gold)
+    path("diversifier", views.DiversifierView.as_view(), name="diversifier"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),

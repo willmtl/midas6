@@ -1908,6 +1908,24 @@ class SyntheticMaCrossView(_StudyResultView):
     json_path = "/app/.data/studies/synthetic_ma_cross.json"
 
 
+class OversoldBounceView(_StudyResultView):
+    """Short-term ABSOLUTE single-stock oversold-reversal entry (the edge the RS bar lacks). Entry backtest
+    by RSI threshold + by oversold depth (deeper = bigger bounce), plus a live firing list of stocks that
+    just crossed up out of oversold, most-oversold first. GET reads it; POST recomputes."""
+    kind = "oversold_bounce"
+    script = "oversold_bounce.py"
+    json_path = "/app/.data/studies/oversold_bounce.json"
+
+
+class DiversifierView(_StudyResultView):
+    """Rank all 93 sector sleeves by how much they diversify SPY (low correlation) rather than by return.
+    Commodities don't reliably beat SPY but pure ones are uncorrelated (Gold the standout) — drawdown value,
+    not outperformance. GET reads BacktestResult[diversifier]; POST recomputes."""
+    kind = "diversifier"
+    script = "diversifier_scan.py"
+    json_path = "/app/.data/studies/diversifier.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""
