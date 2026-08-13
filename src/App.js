@@ -496,7 +496,12 @@ function Signal({ signal }) {
     'OMEGA ONLY': 'signal-partial',
     'BEARISH': 'signal-bearish',
   }[signal] || 'signal-bearish';
-  return <span className={`signal ${cls}`}>{signal}</span>;
+  // "ROTATE IN" is a fresh up-turn in the sector's OWN price — an absolute-trend alert, NOT a
+  // beat-SPY rotation call (backtested worst beat-SPY signal). Display it as TREND TURN; the real
+  // rotation call lives on the Rotation Call tab (regime-leaders ∩ value-pick ∩ oversold entry).
+  const label = signal === 'ROTATE IN' ? 'TREND TURN' : signal;
+  return <span className={`signal ${cls}`} title={signal === 'ROTATE IN'
+    ? 'Absolute trend alert: the sector’s own price just turned up. NOT a beat-SPY signal — see the Rotation Call tab.' : undefined}>{label}</span>;
 }
 
 function Val({ val, spyVal, fmt = 3, higherBetter = true }) {
@@ -532,8 +537,8 @@ function SectorTable({ data, onSectorClick, onEtfClick, sortCol, sortDir, onSort
       </div>
       <div className="signal-legend">
         <span className="signal-legend-title">Signal states:</span>
-        <span className="signal signal-rotate">ROTATE IN</span>
-        <span className="signal-legend-def">BULLISH <b>+</b> RSI(10) just crossed above its SMA in the last 3 days (RSI &lt; 50 &amp; Omega &gt; 1 at the cross) — a <b>fresh turn up</b></span>
+        <span className="signal signal-rotate">TREND TURN</span>
+        <span className="signal-legend-def">BULLISH <b>+</b> RSI(10) just crossed above its SMA in the last 3 days — a <b>fresh up-turn in the sector's own price</b>. An <b>absolute-trend alert, not a beat-SPY rotation call</b> (backtests worst on beating SPY); for the real rotation call see the <b>Rotation Call</b> tab.</span>
         <span className="signal signal-bullish">BULLISH</span>
         <span className="signal-legend-def">RSI(10) &gt; SMA(10) <b>and</b> Omega(10) &gt; 1 — already trending up</span>
         <span className="signal signal-partial">RSI / OMEGA ONLY</span>
@@ -562,7 +567,7 @@ function SectorTable({ data, onSectorClick, onEtfClick, sortCol, sortDir, onSort
                 corr_qqq: 'Correlation to QQQ (10d): How closely this ETF moves with the Nasdaq-100. Near 1 = tracks tech/growth.',
                 beta_qqq: 'Beta vs QQQ (10d): Sensitivity to QQQ moves. Above 1 = amplifies Nasdaq-100 moves.',
                 rsi_sort: 'RSI of Sortino (10d): RSI(10) computed on the Sortino ratio. Shows momentum of risk-adjusted returns. Cross above SMA = improving.',
-                signal: 'Signal ladder. BULLISH = RSI(10) > its SMA(10) AND Omega(10) > 1 (already trending up). ROTATE IN = BULLISH AND RSI crossed above its SMA within the last 3 days, with RSI < 50 and Omega > 1 at the moment of the cross (a fresh turn up from below). RSI ONLY / OMEGA ONLY = just one of the two BULLISH conditions met. BEARISH = neither.',
+                signal: 'Signal ladder. BULLISH = RSI(10) > its SMA(10) AND Omega(10) > 1 (already trending up). TREND TURN (internally "ROTATE IN") = BULLISH AND RSI crossed above its SMA within the last 3 days, with RSI < 50 and Omega > 1 at the cross — a fresh up-turn in the sector\'s OWN price. It is an absolute-trend alert, NOT a beat-SPY rotation signal (it backtests as the WORST beat-SPY signal); the real rotation call is on the Rotation Call tab. RSI ONLY / OMEGA ONLY = just one of the two BULLISH conditions met. BEARISH = neither.',
                 crossover_days_ago: 'Crossover: RSI crossed above its SMA within last 3 days, while RSI was below 50 and Omega > 1.',
                 gap_pct: 'Gap Up: Open price was above previous day\'s High by at least 0.5%, within last 3 days.',
               };
@@ -2547,7 +2552,7 @@ function DocsPage() {
         <h2>Signals &amp; studies</h2>
         <div className="settings-grid">
           <Card label="BULLISH" color="good">RSI(10) &gt; its SMA(10) <b>and</b> Omega(10) &gt; 1 — momentum is up and the gain/loss odds favor gains.</Card>
-          <Card label="ROTATE IN" color="good">BULLISH <b>and</b> RSI just crossed above its SMA within the last 3 days — a fresh turn, not a stale trend.</Card>
+          <Card label="TREND TURN" color="neutral">BULLISH <b>and</b> RSI just crossed above its SMA within the last 3 days — a fresh up-turn in the sector's <b>own price</b>. An absolute-trend alert, <b>not</b> a beat-SPY rotation call (it backtests as the worst beat-SPY signal). The real rotation call — regime-leader sectors ∩ cheapest-P/B value pick, entered on an oversold dip — is on the <b>Rotation Call</b> tab.</Card>
           <Card label="FRESH composite" color="neutral">Weekly Sortino &gt; 0 + an RSI crossover + an RSI-of-Sortino crossover, all within the last 14 trading days. 3/3 = FRESH, 2/3 = POTENTIAL.</Card>
           <Card label="The studies engine" color="neutral">Every signal is paired with every exit (hundreds × ~70) and backtested across 5 years. Each trade is tagged with the market regime at entry, so you can filter for what works in <i>today's</i> conditions.</Card>
           <Card label="Robustness gate" color="bad">A signal is only trusted after it survives disaster-rate, forward-return, and time+size checks. Crypto was removed for inflating results; survivorship bias makes backtests an optimistic ceiling. Directional, not guaranteed.</Card>
@@ -6870,8 +6875,8 @@ function RotationPicksPage() {
               <td style={{ textAlign: 'right' }} className={signCls(r.momentum_6m)}>{pct(r.momentum_6m)}</td>
               {r.pick ? (
                 <>
-                  <td><b>{r.pick}</b></td>
-                  <td style={{ textAlign: 'right' }} className={r.pb_ratio != null && r.pb_ratio < 2 ? 'good' : ''}>{num(r.pb_ratio)}</td>
+                  <td><b>{r.pick}</b>{r.is_etf_proxy && <span title="Commodity/market ETF held as the position (trend sleeve, not a value pick)" style={{ marginLeft: 5, fontSize: 10, padding: '1px 5px', borderRadius: 4, background: 'rgba(210,153,34,0.16)', color: '#d29922' }}>ETF</span>}</td>
+                  <td style={{ textAlign: 'right' }} className={r.pb_ratio != null && r.pb_ratio < 2 ? 'good' : ''}>{r.is_etf_proxy ? <span className="dim" title="no P/B — commodity/market sleeve">n/a</span> : num(r.pb_ratio)}</td>
                   <td style={{ textAlign: 'right' }} className="dim">{num(r.last_close)}</td>
                   <td style={{ textAlign: 'right' }} className="dim">{capFmt(r.market_cap)}</td>
                   <td style={{ textAlign: 'right' }} className="dim">{num(r.pe_ratio, 1)}</td>
@@ -6880,7 +6885,7 @@ function RotationPicksPage() {
               ) : (
                 <>
                   <td className="dim">—</td>
-                  <td className="dim" colSpan={METRIC_COLS} style={{ fontStyle: 'italic' }}>— no positive-P/B holding</td>
+                  <td className="dim" colSpan={METRIC_COLS} style={{ fontStyle: 'italic' }}>— no data</td>
                 </>
               )}
             </tr>
@@ -6890,6 +6895,222 @@ function RotationPicksPage() {
 
       <p className="subtitle" style={{ marginTop: 12 }}>
         {data.note || 'Directional, no fees; monthly-rebalance value basket; stock-universe survivorship applies.'}
+      </p>
+    </div>
+  );
+}
+
+// ---- Rotation Call (flagship) -----------------------------------------------
+// THE headline signal. Reads GET /rotation-call (BacktestResult[rotation_call]); POST recomputes.
+// Assembled from the three things that survived the whole rotation research: regime-leader sectors
+// (the only prospective sector angle with lift) ∩ cheapest-P/B value pick (the only t>2 equity alpha)
+// ∩ an oversold-dip ENTRY on the pick's own price (dip adds, strength subtracts). Explicitly NOT the
+// sector TREND TURN alert, which backtests as the worst beat-SPY signal.
+function RegimePill({ label, value }) {
+  const good = value === 'risk-on' || value === 'rising';
+  return <span className="badge" style={{
+    background: good ? 'rgba(63,185,80,0.14)' : 'rgba(210,153,34,0.12)',
+    color: good ? '#3fb950' : '#d29922', padding: '2px 8px', borderRadius: 6, marginRight: 6, fontSize: 12,
+  }}>{label}: <b>{value}</b></span>;
+}
+
+function EntryBadge({ txt, k }) {
+  const map = {
+    deep: ['#238636', '#fff'], enter: ['rgba(63,185,80,0.18)', '#3fb950'],
+    wait: ['rgba(139,148,158,0.14)', '#8b949e'], extended: ['rgba(210,153,34,0.14)', '#d29922'],
+  };
+  const [bg, fg] = map[k] || map.wait;
+  return <span style={{ background: bg, color: fg, padding: '2px 8px', borderRadius: 6, fontSize: 12, whiteSpace: 'nowrap' }}>{txt}</span>;
+}
+
+function RotationCallPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const picks = (data && data.picks) || [];
+  const sort = useSortedRows(picks, 'regime_score_pct', 'desc');
+
+  const load = () => apiFetch('/rotation-call').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/rotation-call`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/rotation-call`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading rotation call...</div>;
+
+  const rg = data.regime || {};
+  const comp = data.components || {};
+  const num = (v, d = 2) => v == null || isNaN(Number(v)) ? '–' : Number(v).toFixed(d);
+  const capFmt = v => v == null ? '–' : v >= 1e9 ? `$${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `$${(v / 1e6).toFixed(0)}M` : `$${(v / 1e3).toFixed(0)}K`;
+  const pctS = v => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
+  const rsiCls = v => v == null ? 'dim' : v < 35 ? 'good' : v < 45 ? 'good' : v > 60 ? 'bad' : '';
+
+  return (
+    <div className="studies-page">
+      <h1>🎯 Rotation Call <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle" style={{ marginTop: 2 }}>
+        The flagship call — what actually beats SPY. Not the sector <b>TREND TURN</b> alert (that backtests worst).
+      </p>
+
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '8px 0 16px' }}>
+        <div style={{ marginBottom: 8 }}>
+          <b>Regime now ({rg.date}):</b>{' '}
+          <RegimePill label="rates" value={rg.rates} />
+          <RegimePill label="inflation" value={rg.inflation} />
+          <RegimePill label="market" value={rg.market} />
+        </div>
+        <p style={{ margin: '4px 0 0', fontSize: 13 }}>
+          <b>1. Sectors</b> — {comp.sectors || 'macro-regime leadership'}.{' '}
+          <b>2. Stock</b> — {comp.stock || 'cheapest positive-P/B value pick'}.{' '}
+          <b>3. Entry</b> — {comp.entry || 'oversold dip on the pick’s absolute price'}.
+        </p>
+        <p style={{ margin: '8px 0 0' }} className={data.ready_to_enter > 0 ? 'good' : 'dim'}>
+          <b>{data.ready_to_enter || 0}</b> pick(s) at an oversold-dip entry now (RSI(10) &lt; 45).{' '}
+          {data.ready_to_enter === 0 && 'The book is extended — the entry rule says wait for a pullback rather than chase.'}
+        </p>
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Recompute'}</button>
+        </p>
+      </div>
+
+      <table className="studies-table">
+        <thead><tr>
+          <SortTh label="Sector (regime leader)" colKey="sector" sort={sort} />
+          <SortTh label="Regime score" colKey="regime_score_pct" sort={sort} align="right" title="Avg forward-rel lift in the current regime (in-sample)" />
+          <SortTh label="Combo hit%" colKey="combo_hit_pct" sort={sort} align="right" title="Historical hit rate in this exact regime combo" />
+          <SortTh label="Value pick" colKey="pick" sort={sort} />
+          <SortTh label="P/B" colKey="pb_ratio" sort={sort} align="right" title="Lower = cheaper" />
+          <SortTh label="Price" colKey="last_close" sort={sort} align="right" />
+          <SortTh label="RSI(10)" colKey="rsi10" sort={sort} align="right" title="Entry timing — <45 = dip/enter, >60 = extended" />
+          <SortTh label="Entry" colKey="entry_key" sort={sort} />
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(r => (
+            <tr key={r.etf} className="study-row">
+              <td>{r.sector} <span className="dim">{r.etf}</span></td>
+              <td style={{ textAlign: 'right' }} className={r.regime_score_pct > 0 ? 'good' : 'bad'}>{pctS(r.regime_score_pct)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.combo_hit_pct == null ? '–' : `${r.combo_hit_pct}%`}</td>
+              {r.pick ? (
+                <>
+                  <td><b>{r.pick}</b>{r.is_etf_proxy && <span title="Commodity/market ETF held as the position (trend sleeve, not a value pick)" style={{ marginLeft: 5, fontSize: 10, padding: '1px 5px', borderRadius: 4, background: 'rgba(210,153,34,0.16)', color: '#d29922' }}>ETF</span>}</td>
+                  <td style={{ textAlign: 'right' }} className={r.pb_ratio != null && r.pb_ratio < 2 ? 'good' : ''}>{r.is_etf_proxy ? <span className="dim" title="no P/B — commodity/market sleeve">n/a</span> : num(r.pb_ratio)}</td>
+                  <td style={{ textAlign: 'right' }} className="dim">{num(r.last_close)}</td>
+                  <td style={{ textAlign: 'right' }} className={rsiCls(r.rsi10)}>{r.rsi10 == null ? '–' : r.rsi10}</td>
+                  <td><EntryBadge txt={r.entry_state} k={r.entry_key} /></td>
+                </>
+              ) : (
+                <><td className="dim">—</td><td className="dim" colSpan={4} style={{ fontStyle: 'italic' }}>— no data</td></>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <p className="subtitle" style={{ marginTop: 12, fontSize: 12 }}>{data.caveat}</p>
+    </div>
+  );
+}
+
+// ---- Entry Signal study -----------------------------------------------------
+// Reads GET /entry-signal (BacktestResult[entry_signal]); POST recomputes. Holds the sector+stock
+// selection fixed (arm3_lowpb) and varies ONLY the entry gate on the pick's absolute price, isolating
+// entry timing. The conditional-lift column is the money read: dip entries add, strength entries subtract.
+function EntrySignalPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => apiFetch('/entry-signal').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/entry-signal`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/entry-signal`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading entry-signal study...</div>;
+
+  const entries = data.entries || {};
+  const order = ['unconditional', ...(data.ranking || [])];
+  const rec = data.recommendation || {};
+  const rows = order.filter(k => entries[k]).map(k => {
+    const e = entries[k], p = e.portfolio || {}, pf = e.portfolio_fallback || {};
+    const lbh = e.cond_lift_by_hold || {};
+    return { entry: k, lift1: lbh['1'] != null ? lbh['1'] : e.cond_lift_pct, lift2: lbh['2'],
+      vs_spy: p.vs_spy, vs_spy_fb: pf.vs_spy, sharpe: p.sharpe, dd: p.max_drawdown, skip: e.skipped_frac,
+      isBase: k === 'unconditional', isWinner: k === rec.winner };
+  });
+  const num = (v, d = 2) => v == null || isNaN(Number(v)) ? '–' : Number(v).toFixed(d);
+  const pctS = (v, d = 1) => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(d)}%`;
+  const liftCls = v => v == null ? 'dim' : v > 0 ? 'good' : 'bad';
+
+  return (
+    <div className="studies-page">
+      <h1>⏳ Entry Signal <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle" style={{ marginTop: 2 }}>
+        What is the right ENTRY for the value-pick basket? Selection is held fixed (arm3_lowpb); only the entry gate varies.
+      </p>
+
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '8px 0 16px' }}>
+        <p style={{ margin: 0, fontSize: 13 }}>{rec.headline}</p>
+        <p style={{ margin: '10px 0 0', fontSize: 13 }}>
+          <span className="good">✓ Enter: <b>{rec.winner}</b></span> (best deployable dip entry) ·{' '}
+          <span className="good">best risk-adj: <b>{rec.best_risk_adjusted}</b></span> ·{' '}
+          <span className="bad">✗ Avoid: <b>{rec.worst}</b></span> (buying strength)
+        </p>
+        {rec.fallback_note && (
+          <p style={{ margin: '10px 0 0', fontSize: 12 }} className="dim"><b>ETF fallback:</b> {rec.fallback_note}</p>
+        )}
+        {rec.hold_note && (
+          <p style={{ margin: '8px 0 0', fontSize: 12 }} className="dim"><b>2-month hold:</b> {rec.hold_note}</p>
+        )}
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Recompute'}</button>
+        </p>
+      </div>
+
+      <table className="studies-table">
+        <thead><tr>
+          <th>Entry gate</th>
+          <th style={{ textAlign: 'right' }} title="Fwd-1mo mean of picks with entry ON minus OFF — the per-pick lift (not confounded by selectivity). THE money column.">Lift @1mo</th>
+          <th style={{ textAlign: 'right' }} title="Same per-pick lift at a 2-month hold. Deeper dips improve here — the reversal takes longer to mature.">Lift @2mo</th>
+          <th style={{ textAlign: 'right' }} title="Pure value-pick basket (empty sectors dropped)">vs SPY</th>
+          <th style={{ textAlign: 'right' }} title="With ETF fallback for empty/gate-failing sectors — the arm3_lowpb / +154% headline construction">vs SPY (fallback)</th>
+          <th style={{ textAlign: 'right' }}>Sharpe</th>
+          <th style={{ textAlign: 'right' }}>Max DD</th>
+          <th style={{ textAlign: 'right' }} title="Fraction of months with zero passing picks (higher = less deployable; a 2-month hold offsets this)">Skip</th>
+        </tr></thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.entry} className="study-row" style={r.isWinner ? { background: 'rgba(63,185,80,0.08)' } : r.isBase ? { background: 'rgba(139,148,158,0.06)' } : undefined}>
+              <td>{r.isWinner && '✓ '}<b>{r.entry}</b>{r.isBase && <span className="dim"> (baseline)</span>}</td>
+              <td style={{ textAlign: 'right' }} className={r.isBase ? 'dim' : liftCls(r.lift1)}>{r.isBase ? '—' : pctS(r.lift1, 2)}</td>
+              <td style={{ textAlign: 'right' }} className={r.isBase ? 'dim' : liftCls(r.lift2)}>{r.isBase ? '—' : pctS(r.lift2, 2)}</td>
+              <td style={{ textAlign: 'right' }} className={r.vs_spy > 0 ? 'good' : 'bad'}>{pctS(r.vs_spy)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pctS(r.vs_spy_fb)}</td>
+              <td style={{ textAlign: 'right' }}>{num(r.sharpe)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pctS(r.dd)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.skip == null ? '–' : `${(r.skip * 100).toFixed(0)}%`}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <p className="subtitle" style={{ marginTop: 12, fontSize: 12 }}>
+        Baseline (unconditional) shown two ways: <b>vs SPY</b> = pure value picks; <b>vs SPY (fallback)</b> = all-10-slots with ETF fallback = the conservative +154% headline. {data.caveat}
       </p>
     </div>
   );
@@ -7482,6 +7703,8 @@ function parseHash() {
   if (h.startsWith('/oversold-bounce')) return { view: 'oversoldbounce' };
   if (h.startsWith('/diversifier')) return { view: 'diversifier' };
   if (h.startsWith('/synthetic-ma-cross')) return { view: 'synthmacross' };
+  if (h.startsWith('/rotation-call')) return { view: 'rotationcall' };
+  if (h.startsWith('/entry-signal')) return { view: 'entrysignal' };
   if (h.startsWith('/rs-methods')) return { view: 'rsmethods' };
   if (h.startsWith('/rotation')) return { view: 'rotationpick' };
   if (h.startsWith('/vol-shock')) return { view: 'volshock' };
@@ -7574,6 +7797,7 @@ export default function App() {
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
                        altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
+                       rotationcall: 'rotationcall', entrysignal: 'entrysignal',
                        rsmethods: 'rsmethods', synthmacross: 'synthmacross', oversoldbounce: 'oversoldbounce',
                        diversifier: 'diversifier', regime: 'regime', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
@@ -7683,9 +7907,17 @@ export default function App() {
             <span className="sidebar-icon">&#9899;</span>
             Dark Pool
           </li>
+          <li className={`sidebar-item ${page === 'rotationcall' ? 'active' : ''}`} onClick={() => { setPage('rotationcall'); navigate('/rotation-call'); }}>
+            <span className="sidebar-icon">&#127919;</span>
+            Rotation Call
+          </li>
           <li className={`sidebar-item ${page === 'rotationpick' ? 'active' : ''}`} onClick={() => { setPage('rotationpick'); navigate('/rotation'); }}>
             <span className="sidebar-icon">&#128260;</span>
             Rotation Pick
+          </li>
+          <li className={`sidebar-item ${page === 'entrysignal' ? 'active' : ''}`} onClick={() => { setPage('entrysignal'); navigate('/entry-signal'); }}>
+            <span className="sidebar-icon">&#9203;</span>
+            Entry Signal
           </li>
           <li className={`sidebar-item ${page === 'rsmethods' ? 'active' : ''}`} onClick={() => { setPage('rsmethods'); navigate('/rs-methods'); }}>
             <span className="sidebar-icon">&#128202;</span>
@@ -7726,7 +7958,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
@@ -7749,7 +7981,7 @@ export default function App() {
             <div className="filters">
               <button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>All ({scanData?.total || 0})</button>
               <button className={filter === 'bullish' ? 'active' : ''} onClick={() => setFilter('bullish')}>Bullish ({scanData?.bullish || 0})</button>
-              <button className={filter === 'rotate' ? 'active' : ''} onClick={() => setFilter('rotate')}>Rotate In ({scanData?.sectors?.filter(s => s.rsi_crossover && s.bullish).length || 0})</button>
+              <button className={filter === 'rotate' ? 'active' : ''} onClick={() => setFilter('rotate')}>Trend Turn ({scanData?.sectors?.filter(s => s.rsi_crossover && s.bullish).length || 0})</button>
               <button className={filter === 'bearish' ? 'active' : ''} onClick={() => setFilter('bearish')}>Bearish ({scanData?.sectors?.filter(s => s.signal === 'BEARISH').length || 0})</button>
               <span className="filter-sep">|</span>
               <button className={dashInterval === '1d' ? 'active' : ''} onClick={() => handleIntervalChange('1d')}>Daily</button>
