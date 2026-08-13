@@ -64,6 +64,8 @@ urlpatterns = [
     # News overreaction detector + reversion backtest (size-bucketed); intraday RSI crossover study
     path("news-overreaction", views.NewsOverreactionView.as_view(), name="news-overreaction"),
     path("rsi-intraday", views.RsiIntradayView.as_view(), name="rsi-intraday"),
+    # Per-signal live firing (names firing each study signal in the last N bars)
+    path("signal-firing", views.SignalFiringView.as_view(), name="signal-firing"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),

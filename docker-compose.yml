@@ -66,6 +66,7 @@ x-backend-volumes: &backend-volumes
   - ./rsi_4h_study.py:/app/rsi_4h_study.py
   - ./news_overreaction.py:/app/news_overreaction.py
   - ./ground_earnings.py:/app/ground_earnings.py
+  - ./signal_firing_scan.py:/app/signal_firing_scan.py
   - ./.data:/app/.data
 
 services:

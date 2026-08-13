@@ -128,6 +128,11 @@ class StudyListView(APIView):
                                  "t_stat": r["t_stat"], "avg_hold": r["avg_hold"],
                                  "avg_mae": r["avg_mae"], "clean_pct": r["clean_pct"]}
             grouped = sorted(groups.values(), key=lambda x: -((x["best"] or {}).get("avg_return") or -1e9))
+            # Live 'firing now' count per signal (signal_firing_scan.py) for the firing column.
+            from core.models import SignalFiring
+            fmap = dict(SignalFiring.objects.values_list("signal_key", "n_firing"))
+            for g in grouped:
+                g["n_firing"] = fmap.get(g["signal"], 0)
             categories = sorted(c for c in Study.objects.filter(is_computed=True).order_by()
                                 .values_list("category", flat=True).distinct() if c)
             return Response({"grouped": grouped, "total_signals": len(grouped),
@@ -1844,6 +1849,32 @@ class VolShockStudyView(_StudyResultView):
     kind = "vol_shock_study"
     script = "vol_shock_study.py"
     json_path = "/app/.data/studies/vol_shock_study.json"
+
+
+class SignalFiringView(APIView):
+    """Names (stock/ETF/commodity) currently firing a given study signal (last N bars).
+    GET ?signal=<key> -> the firing list for the Studies 'firing now' pane."""
+    def get(self, request):
+        from core.models import SignalFiring
+        sk = request.query_params.get("signal")
+        row = SignalFiring.objects.filter(signal_key=sk).first() if sk else None
+        if not row:
+            return Response({"signal": sk, "n_firing": 0, "firing": [], "computed": False})
+        return Response({"signal": sk, "signal_name": row.signal_name, "recent_bars": row.recent_bars,
+                         "n_firing": row.n_firing, "firing": row.firing or [], "computed": True,
+                         "last_updated": row.computed_at.isoformat() if row.computed_at else None})
+
+    def post(self, request):
+        import threading, subprocess
+
+        def _run():
+            try:
+                subprocess.run(["python", "-u", "/app/signal_firing_scan.py", "--db", "--jobs", "4"],
+                               cwd="/app", timeout=3600)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+        return Response({"status": "signal firing scan started"})
 
 
 class NewsOverreactionView(_StudyResultView):

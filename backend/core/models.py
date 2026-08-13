@@ -603,6 +603,24 @@ class GlobalSignal(models.Model):
         return f"{self.ticker} global {self.global_score:.0f}"
 
 
+class SignalFiring(models.Model):
+    """Per-SIGNAL live firing summary: which names (stock / ETF / commodity) fired this signal within
+    the last N bars, so the grouped Studies table can show a 'firing now' count per study and open a
+    pane with the list. Refreshed by signal_firing_scan.py (all signals × full candle universe)."""
+    signal_key = models.CharField(max_length=60, unique=True)
+    signal_name = models.CharField(max_length=120, blank=True)
+    recent_bars = models.IntegerField(default=3)
+    n_firing = models.IntegerField(default=0, db_index=True)
+    firing = models.JSONField(default=list, blank=True)   # [{ticker, days_ago, last_close, sectors}]
+    computed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-n_firing"]
+
+    def __str__(self):
+        return f"{self.signal_key}: {self.n_firing} firing"
+
+
 class NewsHorizonSignal(models.Model):
     """A recent, material, LLM-classified news event joined with the horizon-conditioned drift we
     measured for its TYPE (news_drift_horizon.py / news_horizon_robust.py). Answers: 'this stock

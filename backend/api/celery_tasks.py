@@ -476,6 +476,20 @@ def run_vol_shock_study():
 
 
 @shared_task
+def run_signal_firing():
+    """Nightly: per-signal firing scan (all signals × full universe, last 3 bars) → SignalFiring.
+    After candles refresh; powers the grouped Studies 'firing now' column."""
+    import subprocess, os
+    if not os.path.exists("/app/signal_firing_scan.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/signal_firing_scan.py", "--db", "--jobs", "2"],
+                          cwd="/app", capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("signal_firing_scan failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_ground_earnings():
     """Nightly: ground the earnings categorization (EPS surprise + forward guidance) on EarningsEvent.
     After the earnings (21:05) + financials (21:30) imports so the inputs are fresh."""

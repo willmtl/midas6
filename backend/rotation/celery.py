@@ -228,4 +228,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_ground_earnings",
         "schedule": crontab(hour=21, minute=55),
     },
+    "signal-firing-nightly": {          # per-signal firing scan (all signals × universe) for Studies
+        "task": "api.celery_tasks.run_signal_firing",
+        "schedule": crontab(hour=22, minute=10),
+    },
 }
