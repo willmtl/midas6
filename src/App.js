@@ -1579,6 +1579,13 @@ function StudiesPage() {
                               : {s.by_regime[r].avg_return > 0 ? '+' : ''}{s.by_regime[r].avg_return.toFixed(3)}% ({s.by_regime[r].trades} trades, {s.by_regime[r].win_rate}% wr)
                             </div>
                           ))}
+                          {(() => {
+                            const b = ['LOW','MEDIUM','HIGH'].filter(r => s.by_regime[r]).map(r => ({ label: r, value: s.by_regime[r].avg_return, n: s.by_regime[r].trades }));
+                            return b.length >= 2 ? (<div style={{maxWidth:260,marginTop:4}}>
+                              <div className="subtitle darkpool-muted" style={{margin:'2px 0'}}>By rate regime</div>
+                              <TailStrip buckets={b} />
+                            </div>) : null;
+                          })()}
                         </div>
                       )}
                       {s.by_curve && Object.keys(s.by_curve).length > 0 && (
@@ -1612,6 +1619,13 @@ function StudiesPage() {
                               : {s.by_spy_trend[t].avg_return > 0 ? '+' : ''}{s.by_spy_trend[t].avg_return.toFixed(3)}% ({s.by_spy_trend[t].trades} trades, {s.by_spy_trend[t].win_rate}% wr)
                             </div>
                           ))}
+                          {(() => {
+                            const b = ['BULL','BEAR'].filter(t => s.by_spy_trend[t]).map(t => ({ label: t, value: s.by_spy_trend[t].avg_return, n: s.by_spy_trend[t].trades }));
+                            return b.length >= 2 ? (<div style={{maxWidth:200,marginTop:4}}>
+                              <div className="subtitle darkpool-muted" style={{margin:'2px 0'}}>By SPY trend</div>
+                              <TailStrip buckets={b} />
+                            </div>) : null;
+                          })()}
                         </div>
                       )}
                       {s.by_season && Object.keys(s.by_season).length > 0 && (
@@ -2644,6 +2658,20 @@ function StockStudiesPage() {
                 {isOpen && (
                   <tr className="study-detail-row">
                     <td colSpan={12}>
+                      {(() => {
+                        const capEntry = Object.entries(r.by_dimension || {}).find(([dim]) => /cap/i.test(dim));
+                        if (!capEntry) return null;
+                        const capBuckets = (capEntry[1] || [])
+                          .filter(b => b.bucket !== 'NA')
+                          .map(b => ({ label: b.bucket, value: b.avg_return, n: b.trades }));
+                        if (!capBuckets.length) return null;
+                        return (
+                          <div style={{maxWidth:420, marginBottom:10}}>
+                            <div className="subtitle darkpool-muted" style={{margin:'2px 0'}}>Return by market-cap bucket (tail)</div>
+                            <TailStrip buckets={capBuckets} />
+                          </div>
+                        );
+                      })()}
                       <div className="fund-dim-title" style={{marginBottom:8}}>Fundamental buckets</div>
                       <div className="fund-buckets">
                         {Object.keys(r.by_dimension || {}).length === 0 && <span className="dim">No fundamental buckets cleared the trade floor.</span>}
@@ -3141,7 +3169,13 @@ function NewsEffectPage() {
                         title={r.cat_llm ? 'local-LLM classified' : 'title heuristic'}>
                 {CAT_LABELS[r.cat_llm || r.cat_auto] || r.cat_llm || r.cat_auto || 'other'}
                 {r.cat_llm && <span style={{fontSize:9, opacity:0.6}}> ✦</span>}</span></td>
-              <td className="dim">{dirTag(r.llm_dir)} {r.llm_cat || 'other'}<span className="dim"> ({r.llm_impact === 3 ? 'major' : r.llm_impact === 2 ? 'mod' : 'minor'})</span></td>
+              <td className="dim">{dirTag(r.llm_dir)} {r.llm_cat || 'other'}<span className="dim"> ({r.llm_impact === 3 ? 'major' : r.llm_impact === 2 ? 'mod' : 'minor'})</span>
+                {r.grounded_label && (() => {
+                  const sc = r.grounded_score;
+                  const cls = sc == null || sc === 0 ? 'dim' : sc > 0 ? 'good' : 'bad';
+                  return <span className={`sm-badge ${cls}`} style={{marginLeft:4, fontSize:9, display:'inline-block'}}
+                    title="Grounded earnings verdict (EPS surprise + forward guidance)">{r.grounded_label.replace(/_/g, ' ')}</span>;
+                })()}</td>
               <td style={{textAlign:'right'}} className={abnCls(r.day_abn)}><b>{abnFmt(r.day_abn)}</b></td>
               <td>{r.junk
                 ? <span className="sm-badge" style={{background:'#5a4a1e'}} title="opinion / clickbait / PR — not a real event">junk</span>
@@ -4855,14 +4889,14 @@ function GlobalPage() {
   const burstChip = t => t === 'reversal'
     ? <span className="sm-badge sm-13g" title="Reversal">reversal</span>
     : <span className="sm-badge sm-insider" title="Momentum">momentum</span>;
-  // 7 component pills: B(urst) E(dge) A/D D(arkpool) S(mart money) F(undamentals) R(egime), shaded by 0..1.
-  const COMP = [['burst', 'B'], ['edge', 'E'], ['ad', 'A'], ['darkpool', 'D'], ['smart_money', 'S'], ['fundamentals', 'F'], ['regime', 'R']];
+  // 8 component pills: B(urst) E(dge) A/D D(arkpool) S(mart money) F(undamentals) R(egime) N(ews), shaded by 0..1.
+  const COMP = [['burst', 'B'], ['edge', 'E'], ['ad', 'A'], ['darkpool', 'D'], ['smart_money', 'S'], ['fundamentals', 'F'], ['regime', 'R'], ['news', 'N', 'high = the burst is bouncing off a recent grounded news-overreaction (PODD-type)']];
   const compPills = c => (
     <span style={{ whiteSpace: 'nowrap' }}>
-      {COMP.map(([k, lbl]) => {
+      {COMP.map(([k, lbl, note]) => {
         const v = c && typeof c[k] === 'number' ? c[k] : 0;
         return (
-          <span key={k} title={`${k} ${v.toFixed(2)}`}
+          <span key={k} title={`${k} ${v.toFixed(2)}${note ? ' — ' + note : ''}`}
             style={{ display: 'inline-block', width: 15, textAlign: 'center', fontSize: 10, fontWeight: 600, marginRight: 2, borderRadius: 3, color: v >= 0.45 ? '#fff' : '#8b949e', background: `rgba(63,185,80,${(0.12 + 0.78 * v).toFixed(3)})` }}>
             {lbl}
           </span>
