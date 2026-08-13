@@ -7219,6 +7219,91 @@ function ProfitabilityGuardPage() {
   );
 }
 
+// ---- Factor Lab -------------------------------------------------------------
+// Reads GET /factor-lab. Sweeps many filters/tilts/combos on the value-pick baseline, ranked to find
+// the best return (and best risk-adjusted). Multiple-comparisons caveat travels in the payload.
+function FactorLabPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => apiFetch('/factor-lab').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/factor-lab`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/factor-lab`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading factor lab...</div>;
+
+  const V = data.variants || {};
+  const leg = data.factor_legend || {};
+  const order = ['baseline', ...(data.ranking || [])];
+  const rows = order.filter(k => V[k]).map(k => {
+    const nf = V[k].no_fallback || {}, fb = V[k].fallback || {};
+    return { key: k, vs_spy: nf.vs_spy, t: nf.t_stat, sharpe: nf.sharpe, dd: nf.max_drawdown,
+      names: nf.avg_names, fb: fb.vs_spy, dbase: V[k].vs_baseline,
+      isBase: k === 'baseline', isBest: k === data.best_return, isRA: k === data.best_risk_adjusted };
+  });
+  const pctS = (v, d = 1) => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(d)}%`;
+  const num = (v, d = 2) => v == null || isNaN(Number(v)) ? '–' : Number(v).toFixed(d);
+
+  return (
+    <div className="studies-page">
+      <h1>🧪 Factor Lab <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle" style={{ marginTop: 2 }}>
+        Every filter / tilt / combo on the value pick, ranked to find the best return. Baseline = cheapest-P/B pick.
+      </p>
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '8px 0 16px' }}>
+        <p style={{ margin: 0, fontSize: 13 }}>
+          <span className="good">🥇 Best return: <b>{data.best_return}</b></span> ·{' '}
+          <span className="good">⚖️ Best risk-adjusted: <b>{data.best_risk_adjusted}</b></span> ·{' '}
+          baseline <b>{pctS(V.baseline?.no_fallback?.vs_spy)}</b> vs SPY.
+        </p>
+        <p style={{ margin: '8px 0 0', fontSize: 12 }} className="dim">{data.caveat}</p>
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Recompute'}</button>
+        </p>
+      </div>
+      <table className="studies-table">
+        <thead><tr>
+          <th>Variant</th>
+          <th style={{ textAlign: 'right' }} title="Pure value picks (empty sectors dropped)">vs SPY</th>
+          <th style={{ textAlign: 'right' }}>Δ base</th>
+          <th style={{ textAlign: 'right' }}>t</th>
+          <th style={{ textAlign: 'right' }}>Sharpe</th>
+          <th style={{ textAlign: 'right' }}>Max DD</th>
+          <th style={{ textAlign: 'right' }} title="Avg names held/month (low = over-selective)">Names</th>
+          <th style={{ textAlign: 'right' }} title="With ETF fallback (realistic)">vs SPY (fb)</th>
+        </tr></thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.key} className="study-row" title={leg[r.key] || ''}
+              style={r.isBest ? { background: 'rgba(63,185,80,0.12)' } : r.isBase ? { background: 'rgba(139,148,158,0.06)' } : undefined}>
+              <td>{r.isBest && '🥇 '}{r.isRA && !r.isBest && '⚖️ '}<b>{r.key}</b></td>
+              <td style={{ textAlign: 'right' }} className={r.vs_spy > 0 ? 'good' : 'bad'}>{pctS(r.vs_spy)}</td>
+              <td style={{ textAlign: 'right' }} className={r.isBase ? 'dim' : (r.dbase > 0 ? 'good' : 'bad')}>{r.isBase ? '—' : pctS(r.dbase)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.t == null ? '–' : r.t}</td>
+              <td style={{ textAlign: 'right' }}>{num(r.sharpe)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pctS(r.dd)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.names == null ? '–' : r.names}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pctS(r.fb)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="empty-state" style={{ textAlign: 'left', padding: '10px 14px', marginTop: 12, fontSize: 12 }}>
+        <b>Factor legend:</b> {Object.entries(leg).map(([k, v]) => <div key={k} className="dim" style={{ marginTop: 3 }}><b>{k}</b> — {v}</div>)}
+      </div>
+    </div>
+  );
+}
+
 // RS-trend method sweep. Reads GET /rs-methods (BacktestResult[rs_methods]); POST recomputes (poll
 // every 8s until `computed`). ~20 ways to read the ETF/SPY relative-strength bar, each feeding the
 // SAME cheapest-P/B large-cap pick — so only the sector-SELECTION rule varies. The banner carries the
@@ -7809,6 +7894,7 @@ function parseHash() {
   if (h.startsWith('/rotation-call')) return { view: 'rotationcall' };
   if (h.startsWith('/entry-signal')) return { view: 'entrysignal' };
   if (h.startsWith('/profitability-guard')) return { view: 'profitguard' };
+  if (h.startsWith('/factor-lab')) return { view: 'factorlab' };
   if (h.startsWith('/rs-methods')) return { view: 'rsmethods' };
   if (h.startsWith('/rotation')) return { view: 'rotationpick' };
   if (h.startsWith('/vol-shock')) return { view: 'volshock' };
@@ -7901,7 +7987,7 @@ export default function App() {
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
                        altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
-                       rotationcall: 'rotationcall', entrysignal: 'entrysignal', profitguard: 'profitguard',
+                       rotationcall: 'rotationcall', entrysignal: 'entrysignal', profitguard: 'profitguard', factorlab: 'factorlab',
                        rsmethods: 'rsmethods', synthmacross: 'synthmacross', oversoldbounce: 'oversoldbounce',
                        diversifier: 'diversifier', regime: 'regime', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
@@ -8027,6 +8113,10 @@ export default function App() {
             <span className="sidebar-icon">&#128737;</span>
             Profit Guard
           </li>
+          <li className={`sidebar-item ${page === 'factorlab' ? 'active' : ''}`} onClick={() => { setPage('factorlab'); navigate('/factor-lab'); }}>
+            <span className="sidebar-icon">&#129514;</span>
+            Factor Lab
+          </li>
           <li className={`sidebar-item ${page === 'rsmethods' ? 'active' : ''}`} onClick={() => { setPage('rsmethods'); navigate('/rs-methods'); }}>
             <span className="sidebar-icon">&#128202;</span>
             RS Methods
@@ -8066,7 +8156,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'profitguard' ? <ProfitabilityGuardPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'profitguard' ? <ProfitabilityGuardPage /> : page === 'factorlab' ? <FactorLabPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
