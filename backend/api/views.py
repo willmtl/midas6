@@ -1085,10 +1085,27 @@ class NewsEffectView(APIView):
             "local_rating", "day_abn", "day_effect", "day_suspect", "junk", "sentiment", "url",
             "ret_1m", "ret_3m", "ret_1y", "cat_auto", "cat_llm", "off_ticker")[offset:offset + limit])
 
+        # GROUNDED earnings verdict (ground_earnings.py): where a news day maps to an earnings report,
+        # show the hard-data verdict (beat_guided_down etc.) so headline sentiment isn't the last word.
+        from core.models import EarningsEvent
+        from datetime import timedelta as _td
+        _ge = {}
+        for etk, erd, glab, gsc in (EarningsEvent.objects.filter(
+                ticker__in={r["ticker"] for r in rows}).exclude(grounded_label="")
+                .values_list("ticker", "report_date", "grounded_label", "grounded_score")):
+            _ge.setdefault(etk, []).append((erd, glab, gsc))
+
         def _f(v):
             return None if (isinstance(v, float) and not math.isfinite(v)) else v
         clean = []
         for r in rows:
+            nd = r["dt"].date() if r["dt"] else None
+            r["grounded_label"], r["grounded_score"] = None, None
+            if nd and r["ticker"] in _ge:
+                for erd, glab, gsc in _ge[r["ticker"]]:
+                    if abs((erd - nd).days) <= 2:      # this news day is at/near the earnings report
+                        r["grounded_label"], r["grounded_score"] = glab, gsc
+                        break
             r["dt"] = r["dt"].isoformat() if r["dt"] else None
             for k in ("day_abn", "ret_1m", "ret_3m", "ret_1y"):
                 r[k] = round(r[k], 2) if r[k] is not None else None
@@ -1895,8 +1912,8 @@ class GlobalView(APIView):
         last = GlobalSignal.objects.aggregate(m=Max("computed_at"))["m"]
         return Response({
             "computed": True, "n_global": len(rows), "results": rows,
-            "weights": {"burst": 15, "edge": 15, "ad": 15, "darkpool": 15,
-                        "smart_money": 15, "fundamentals": 15, "regime": 10},
+            "weights": {"burst": 15, "edge": 15, "ad": 15, "darkpool": 10,
+                        "smart_money": 10, "fundamentals": 10, "regime": 10, "news": 15},
             "regime_bull": bool(rows and rows[0].get("regime_bull")),
             "last_updated": last.isoformat() if last else None,
         })

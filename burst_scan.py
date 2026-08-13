@@ -42,7 +42,10 @@ SHORT_EXITS = {"1d", "3d", "1w", "2w", "4w"}   # short-horizon edge for the shor
 AD_STATE_NAME = {2: "accum divergence", 1: "accum trend-up", 0: "neutral", -1: "distribution"}
 
 # Confluence component weights (sum = 100). global_score = Σ w_k · component_k(0..1).
-W = {"burst": 15, "edge": 15, "ad": 15, "darkpool": 15, "smart_money": 15, "fundamentals": 15, "regime": 10}
+# `news` = a recent GROUNDED good-news crash the burst is bouncing off (overreaction reversal, PODD-type
+# — grounded so a beat-that-guided-down does NOT count as good news).
+W = {"burst": 15, "edge": 15, "ad": 15, "darkpool": 10, "smart_money": 10,
+     "fundamentals": 10, "regime": 10, "news": 15}
 
 
 def _worker(payload):
@@ -191,6 +194,36 @@ def run(jobs, recent=2, save_db=True):
         })
     st_rows.sort(key=lambda r: (r["days_ago"], -(r["hist_avg_return"] or 0)))
 
+    # ---- news-overreaction signal per firing ticker (grounded verdict where available) ----
+    # A recent good-news crash the burst is now bouncing off = the PODD-type reversal. Grounded so a
+    # beat-that-guided-down is NOT treated as good news.
+    from core.models import NewsItem, EarningsEvent
+    import datetime as _dt
+    recent_cut = _dt.date.today() - _dt.timedelta(days=20)
+    gvmap = {}
+    for etk, erd, gs in (EarningsEvent.objects.filter(ticker__in=firing, grounded_score__isnull=False,
+                                                      report_date__gte=recent_cut)
+                         .values_list("ticker", "report_date", "grounded_score")):
+        gvmap[(etk, erd)] = gs
+    news_by_tk = {}
+    for tk_, dt_, abn_, rat_ in (NewsItem.objects.filter(
+            ticker__in=firing, local_impact__gte=2, day_abn__isnull=False, dt__date__gte=recent_cut)
+            .exclude(junk=True).values_list("ticker", "dt", "day_abn", "local_rating")):
+        news_by_tk.setdefault(tk_, []).append((dt_.date(), abn_, rat_ or 0))
+    news_sig = {}
+    for tk_, items in news_by_tk.items():
+        val = 0.3
+        for d_, abn_, rat_ in items:
+            g = gvmap.get((tk_, d_)) or gvmap.get((tk_, d_ - _dt.timedelta(days=1)))
+            sent = g if g is not None else rat_
+            if sent > 0 and abn_ is not None and abn_ <= -8:   # good news that crashed -> bounce setup
+                val = max(val, 1.0)
+            elif sent > 0:
+                val = max(val, 0.5)
+            elif sent < 0:
+                val = min(val, 0.2)                            # bad grounded news -> burst suspect
+        news_sig[tk_] = round(val, 2)
+
     # ---- GlobalSignal rows (one per ticker; best burst; confluence score) ----
     by_tk = {}
     for h in hits:
@@ -218,6 +251,7 @@ def run(jobs, recent=2, save_db=True):
             "smart_money": min(1.0, (0.5 if (ins_v or 0) > 0 else 0) + (0.3 if s13d else 0) + (0.2 if s13g else 0)),
             "fundamentals": _fav_fund_score(f),
             "regime": 1.0 if regime_bull else 0.3,
+            "news": news_sig.get(tk, 0.3),
         }
         score = round(sum(W[k] * comps[k] for k in W), 1)
         g_rows.append({
