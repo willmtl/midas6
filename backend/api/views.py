@@ -761,6 +761,10 @@ class StockStudiesView(APIView):
             computed_at = meta["computed_at"] if meta else None
             _last_iso = computed_at.isoformat() if computed_at else None
 
+            # Live 'firing now' count per signal (signal_firing_scan.py) — the 3d firing indicator.
+            from core.models import SignalFiring
+            _firemap = dict(SignalFiring.objects.values_list("signal_key", "n_firing"))
+
             def _shape(r):
                 return {
                     "signal_key": r["signal_key"], "signal_name": r["signal_name"],
@@ -770,6 +774,7 @@ class StockStudiesView(APIView):
                     "avg_return": r["avg_return"], "win_rate": r["win_rate"],
                     "avg_hold": r["avg_hold"], "avg_mae": r["avg_mae"], "clean_pct": r["clean_pct"],
                     "by_dimension": r["by_dimension"] or {},
+                    "n_firing": _firemap.get(r["signal_key"], 0),
                 }
             _STOCK_VALS = ("id", "signal_key", "signal_name", "exit_key", "exit_name", "category",
                            "total_trades", "eff_trades", "t_stat", "avg_return", "win_rate",
