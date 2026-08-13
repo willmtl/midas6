@@ -82,6 +82,8 @@ urlpatterns = [
     path("entry-signal", views.EntrySignalView.as_view(), name="entry-signal"),
     # THE headline rotation call: regime-leaders ∩ value-pick ∩ oversold entry
     path("rotation-call", views.RotationCallView.as_view(), name="rotation-call"),
+    # Profitability guard: does excluding cheap-P/B value traps (unprofitable+eroding book) help?
+    path("profitability-guard", views.ProfitabilityGuardView.as_view(), name="profitability-guard"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),

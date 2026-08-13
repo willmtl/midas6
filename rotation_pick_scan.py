@@ -52,20 +52,30 @@ def build():
                       "profit_margin", "revenue_growth")):
         funds.setdefault(r["ticker"], r)
     px = load_candles(univ + [e for e, _ in ranked])
+    # Profitability guard (ex_trap_turn): exclude cheap-P/B value traps (unprofitable + eroding book +
+    # not improving); keep turnarounds. Backtested +231.7% vs +214.7% baseline, better t/Sharpe/DD.
+    from profitability_guard import guard_flags
+    gflags = guard_flags(univ)
 
     picks = []
     for rank, (etf, m) in enumerate(ranked, 1):
         name = name_by_etf.get(etf, etf)
         cands = [(t, funds.get(t, {}).get("pb_ratio")) for t in holds_by_etf[etf]]
         cands = [(t, pb) for t, pb in cands if pb is not None and pb > 0]
+        # drop traps; if that empties the sector, fall back to the unguarded set (don't lose the sector)
+        guarded = [(t, pb) for t, pb in cands if not gflags.get(t, {}).get("trap")]
+        use = guarded if guarded else cands
         row = {"rank": rank, "sector": name, "etf": etf, "momentum_6m": round(m, 1),
-               "n_candidates": len(cands)}
-        if cands:
-            t, pb = min(cands, key=lambda x: x[1])
+               "n_candidates": len(cands), "n_after_guard": len(guarded)}
+        if use:
+            t, pb = min(use, key=lambda x: x[1])
             f = funds.get(t, {})
+            g = gflags.get(t, {})
             dfp = px.get(t)
             row.update({
                 "pick": t, "is_etf_proxy": False, "pb_ratio": round(pb, 2),
+                "guard_status": g.get("status"), "margin_pct": g.get("margin"),
+                "net_income": g.get("net_income"), "improving": g.get("improving"),
                 "last_close": round(float(dfp["Close"].iloc[-1]), 2) if dfp is not None and len(dfp) else None,
                 "market_cap": f.get("market_cap"), "pe_ratio": f.get("pe_ratio"),
                 "forward_pe": f.get("forward_pe"), "profit_margin": f.get("profit_margin"),

@@ -1954,6 +1954,16 @@ class RotationCallView(_StudyResultView):
     json_path = "/app/.data/studies/rotation_call.json"
 
 
+class ProfitabilityGuardView(_StudyResultView):
+    """Does a PROFITABILITY guard improve the cheapest-P/B value pick? Tests the value-trap thesis (cheap +
+    unprofitable + eroding book = melting ice cube). Result: blanket 'profitable-only' HURTS (kills negative-
+    EPS turnarounds); the nuanced 'ex_trap_turn' (drop only unprofitable+book-shrinking+not-improving, keep
+    turnarounds) beats the unguarded baseline. GET reads BacktestResult[profitability_guard]; POST recomputes."""
+    kind = "profitability_guard"
+    script = "profitability_guard_study.py"
+    json_path = "/app/.data/studies/profitability_guard.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""

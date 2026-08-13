@@ -503,6 +503,20 @@ def run_rotation_call():
 
 
 @shared_task
+def run_profitability_guard():
+    """Weekly: profitability-guard study (does excluding cheap-P/B value traps improve the pick?).
+    Heavy (loads all candles) + slow-moving → weekly. → BacktestResult[profitability_guard]."""
+    import subprocess, os
+    if not os.path.exists("/app/profitability_guard_study.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/profitability_guard_study.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("profitability_guard_study failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_signal_firing():
     """Nightly: per-signal firing scan (all signals × full universe, last 3 bars) → SignalFiring.
     After candles refresh; powers the grouped Studies 'firing now' column."""

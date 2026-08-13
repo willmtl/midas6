@@ -64,6 +64,9 @@ def build():
                       "profit_margin", "revenue_growth")):
         funds.setdefault(r["ticker"], r)
     px = load_candles(univ + [r["etf"] for r in leaders])
+    # Profitability guard (ex_trap_turn): drop cheap-P/B value traps, keep turnarounds (backtested win).
+    from profitability_guard import guard_flags
+    gflags = guard_flags(univ)
 
     def _rsi_state(dfp):
         rsi, last = None, None
@@ -79,19 +82,24 @@ def build():
         etf, name = r["etf"], r["sector"]
         cands = [(t, funds.get(t, {}).get("pb_ratio")) for t in holds_by_etf.get(etf, [])]
         cands = [(t, pb) for t, pb in cands if pb is not None and pb > 0]
+        guarded = [(t, pb) for t, pb in cands if not gflags.get(t, {}).get("trap")]
+        use = guarded if guarded else cands
         row = {"sector": name, "etf": etf,
                "regime_score_pct": r.get("regime_score_pct"),
                "combo_hit_pct": r.get("combo_hit_pct"), "combo_mean_pct": r.get("combo_mean_pct"),
-               "combo_n": r.get("combo_n"), "n_candidates": len(cands)}
-        if cands:
-            t, pb = min(cands, key=lambda x: x[1])
+               "combo_n": r.get("combo_n"), "n_candidates": len(cands), "n_after_guard": len(guarded)}
+        if use:
+            t, pb = min(use, key=lambda x: x[1])
             f = funds.get(t, {})
+            g = gflags.get(t, {})
             rsi, last = _rsi_state(px.get(t))
             state_txt, state_key = _entry_state(rsi)
             if state_key in ("enter", "deep"):
                 ready += 1
             row.update({
                 "pick": t, "is_etf_proxy": False, "pb_ratio": round(pb, 2),
+                "guard_status": g.get("status"), "margin_pct": g.get("margin"),
+                "net_income": g.get("net_income"), "improving": g.get("improving"),
                 "last_close": round(last, 2) if last else None,
                 "rsi10": rsi, "entry_state": state_txt, "entry_key": state_key,
                 "market_cap": f.get("market_cap"), "pe_ratio": f.get("pe_ratio"),

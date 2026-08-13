@@ -240,4 +240,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_rotation_call",
         "schedule": crontab(hour=22, minute=7),
     },
+    "profitability-guard-weekly": {     # value-trap guard study (slow-moving) — Sundays 23:55 UTC
+        "task": "api.celery_tasks.run_profitability_guard",
+        "schedule": crontab(hour=23, minute=55, day_of_week=0),
+    },
 }

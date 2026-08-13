@@ -75,6 +75,8 @@ x-backend-volumes: &backend-volumes
   - ./regime_scan.py:/app/regime_scan.py
   - ./entry_signal_study.py:/app/entry_signal_study.py
   - ./rotation_call_scan.py:/app/rotation_call_scan.py
+  - ./profitability_guard_study.py:/app/profitability_guard_study.py
+  - ./profitability_guard.py:/app/profitability_guard.py
   - ./.data:/app/.data
 
 services:
