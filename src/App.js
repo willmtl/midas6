@@ -7339,6 +7339,138 @@ function DiversifierPage() {
   );
 }
 
+// Macro regime -> sector leadership. Reads GET /regime. Classifies the month by rates/inflation/market and
+// shows which sectors historically led in the CURRENT regime (the honest angle on "which sectors beat SPY
+// at the right time" — momentum had ~0 lift; regime conditioning has real, if in-sample, lift).
+function RegimePage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => apiFetch('/regime').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/regime`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/regime`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading regime...</div>;
+  if (data.computed === false) {
+    return (
+      <div className="studies-page">
+        <h1>Regime</h1>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Compute now'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const nl = data.now_labels || {};
+  const base = data.base_rate || {};
+  const pc = v => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
+  const hitCls = v => v == null ? 'dim' : v >= 55 ? 'good' : v >= 45 ? '' : 'bad';
+  const Pill = ({ label, on, onColor }) => (
+    <span style={{ display: 'inline-block', padding: '4px 12px', borderRadius: 14, margin: '0 8px 0 0',
+      fontWeight: 600, fontSize: 13, background: on ? onColor : 'rgba(120,120,120,0.15)',
+      color: on ? '#0b1220' : '#8892b0' }}>{label}</span>
+  );
+
+  const miniTable = (rows, activeCol) => (
+    <table className="studies-table" style={{ fontSize: 13 }}>
+      <tbody>
+        {(rows || []).slice(0, 6).map(r => (
+          <tr key={r.etf} className="study-row">
+            <td>{r.sector}</td>
+            <td className="dim">{r.etf}</td>
+            <td style={{ textAlign: 'right' }} className={r.mean_pct > 0 ? 'good' : 'bad'}>{pc(r.mean_pct)}</td>
+            <td style={{ textAlign: 'right' }} className={hitCls(r.hit_pct)}>{r.hit_pct}%</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+
+  const axisBlock = (axisKey, states) => {
+    const ax = (data.by_axis || {})[axisKey] || {};
+    const cur = nl[axisKey];
+    return (
+      <div style={{ margin: '0 0 18px' }}>
+        <h3 style={{ margin: '0 0 6px', textTransform: 'capitalize' }}>{axisKey}</h3>
+        <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
+          {states.map(st => (
+            <div key={st} style={{ flex: '1 1 320px', border: cur === st ? '1px solid #64ffda' : '1px solid rgba(120,120,120,0.2)',
+              borderRadius: 6, padding: '8px 10px' }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                {axisKey} {st} {cur === st && <span className="good" style={{ fontSize: 12 }}>· now</span>}
+                <span className="dim" style={{ fontWeight: 400, fontSize: 11 }}> — top leaders (fwd 3mo rel / hit)</span>
+              </div>
+              {miniTable(ax[st])}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="studies-page">
+      <h1>Regime <LastUpdatedChip value={data.last_updated} /></h1>
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '4px 0 16px' }}>
+        <div style={{ marginBottom: 8 }}>
+          <b style={{ marginRight: 10 }}>Now ({data.now?.date}):</b>
+          <Pill label={`Rates ${nl.rates}`} on={true} onColor={nl.rates === 'rising' ? '#ffcb6b' : '#82aaff'} />
+          <Pill label={`Inflation ${nl.inflation}`} on={true} onColor={nl.inflation === 'rising' ? '#ff5370' : '#addb67'} />
+          <Pill label={nl.market} on={true} onColor={nl.market === 'risk-on' ? '#64ffda' : '#ff5370'} />
+        </div>
+        <p style={{ margin: 0 }}>
+          The honest angle on <b>which sectors beat SPY at the right time</b>: price-momentum has ~0 lift, but
+          conditioning on <b>macro regime</b> does. Base rate (all sectors, fwd 3mo vs SPY):{' '}
+          <span className="bad">hit {base.hit_pct}% / mean {pc(base.mean_pct)}</span> — most sectors lag SPY.
+        </p>
+        {data.caveat && <p style={{ margin: '8px 0 0', fontSize: 12 }} className="bad">⚠ {data.caveat}</p>}
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Recomputing...' : 'Recompute'}</button>
+        </p>
+      </div>
+
+      <h3 style={{ margin: '0 0 6px' }}>Leaders in the CURRENT regime combo</h3>
+      <table className="studies-table">
+        <thead><tr>
+          <th style={{ textAlign: 'left' }}>Sector</th><th style={{ textAlign: 'left' }}>ETF</th>
+          <th style={{ textAlign: 'right' }} title="Avg of the 3 conditional means">Regime score</th>
+          <th style={{ textAlign: 'right' }} title="Fwd 3mo relative return in the exact current combo">Combo mean</th>
+          <th style={{ textAlign: 'right' }}>Combo hit%</th>
+          <th style={{ textAlign: 'right' }}>n</th>
+        </tr></thead>
+        <tbody>
+          {(data.leaders_now || []).map(r => (
+            <tr key={r.etf} className="study-row">
+              <td><b>{r.sector}</b></td>
+              <td className="dim">{r.etf}</td>
+              <td style={{ textAlign: 'right' }} className={r.regime_score_pct > 0 ? 'good' : 'bad'}>{pc(r.regime_score_pct)}</td>
+              <td style={{ textAlign: 'right' }} className={r.combo_mean_pct > 0 ? 'good' : 'bad'}>{pc(r.combo_mean_pct)}</td>
+              <td style={{ textAlign: 'right' }} className={hitCls(r.combo_hit_pct)}>{r.combo_hit_pct}%</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.combo_n}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <h3 style={{ margin: '18px 0 8px' }}>Leadership by regime axis</h3>
+      {axisBlock('rates', ['rising', 'falling'])}
+      {axisBlock('inflation', ['rising', 'falling'])}
+      {axisBlock('market', ['risk-on', 'risk-off'])}
+    </div>
+  );
+}
+
 // NOTE: name kept as parseHash for minimal churn; it now reads window.location.pathname (pretty URLs).
 function parseHash() {
   const h = window.location.pathname;
@@ -7346,6 +7478,7 @@ function parseHash() {
   if (h.startsWith('/live')) return { view: 'live' };
   if (h.startsWith('/alt-data')) return { view: 'altdata' };
   if (h.startsWith('/dark-pool')) return { view: 'darkpool' };
+  if (h.startsWith('/regime')) return { view: 'regime' };
   if (h.startsWith('/oversold-bounce')) return { view: 'oversoldbounce' };
   if (h.startsWith('/diversifier')) return { view: 'diversifier' };
   if (h.startsWith('/synthetic-ma-cross')) return { view: 'synthmacross' };
@@ -7442,7 +7575,7 @@ export default function App() {
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
                        altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
                        rsmethods: 'rsmethods', synthmacross: 'synthmacross', oversoldbounce: 'oversoldbounce',
-                       diversifier: 'diversifier', volshock: 'volshock' };
+                       diversifier: 'diversifier', regime: 'regime', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
       else if (r.view === 'sector') { setPage('dashboard'); handleSectorClick(r.sector); }
       else if (r.view === 'chart') { setPage('dashboard'); setChartTicker(r.ticker); }
@@ -7570,6 +7703,10 @@ export default function App() {
             <span className="sidebar-icon">&#9878;</span>
             Diversifiers
           </li>
+          <li className={`sidebar-item ${page === 'regime' ? 'active' : ''}`} onClick={() => { setPage('regime'); navigate('/regime'); }}>
+            <span className="sidebar-icon">&#127760;</span>
+            Regime
+          </li>
           <li className={`sidebar-item ${page === 'volshock' ? 'active' : ''}`} onClick={() => { setPage('volshock'); navigate('/vol-shock'); }}>
             <span className="sidebar-icon">&#9889;</span>
             Vol-Shock
@@ -7589,7 +7726,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
