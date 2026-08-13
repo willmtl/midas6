@@ -6775,6 +6775,126 @@ function navigate(to) {
   if (window.location.pathname !== path) window.history.pushState({}, '', path);
 }
 
+// ---- Rotation Pick -----------------------------------------------------------
+// Live version of the winning sector-rotation strategy. Reads GET /rotation-picks (a
+// _StudyResultView-style endpoint); POST kicks a background recompute (poll every 8s until
+// `computed`). The KEY insight is the explainer: rotating ETFs LOSES to SPY — the edge is
+// using momentum rotation as a FILTER, then buying the cheapest positive-P/B (value) stock
+// inside each top-momentum sector.
+function RotationPicksPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const picks = (data && data.picks) || [];
+  const sort = useSortedRows(picks, 'rank', 'asc');
+
+  const load = () => apiFetch('/rotation-picks').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/rotation-picks`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/rotation-picks`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading rotation pick...</div>;
+  if (data.computed === false) {
+    return (
+      <div className="studies-page">
+        <h1>Rotation Pick</h1>
+        <p className="subtitle">The live version of the winning sector-rotation strategy.</p>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.note || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Compute now'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const params = data.params || {};
+  const signCls = v => v == null ? 'dim' : v > 0 ? 'good' : v < 0 ? 'bad' : 'dim';
+  const capFmt = v => v == null ? '–' : v >= 1e9 ? `$${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `$${(v / 1e6).toFixed(0)}M` : `$${(v / 1e3).toFixed(0)}K`;
+  const num = (v, d = 2) => v == null || isNaN(Number(v)) ? '–' : Number(v).toFixed(d);
+  const pct = v => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+  // How many metric cells the "no pick" placeholder should span (P/B, Price, Mkt cap, P/E, Fwd P/E).
+  const METRIC_COLS = 5;
+
+  return (
+    <div className="studies-page">
+      <h1>Rotation Pick <LastUpdatedChip value={data.last_updated} /></h1>
+
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '4px 0 16px' }}>
+        <p style={{ margin: 0 }}>
+          <b>Rotating sector ETFs LOSES to SPY.</b> The edge is using rotation as a <b>FILTER</b>: rank sectors
+          by 6-month momentum, take the top {params.top_n_sectors || 10}, and in each buy the <b>CHEAPEST positive-P/B (value) stock</b>.
+        </p>
+        <p style={{ margin: '8px 0 0' }} className="good">
+          Backtest: <b>+154% vs SPY, t=2.09</b> — the only rotation arm with real alpha.
+        </p>
+        {params.backtest && (
+          <p style={{ margin: '8px 0 0', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12 }} className="dim">
+            {params.backtest}
+          </p>
+        )}
+        {params.rule && <p style={{ margin: '6px 0 0', fontSize: 12 }} className="dim">Rule: {params.rule}</p>}
+        {data.note && <p style={{ margin: '6px 0 0', fontSize: 12 }} className="dim">{data.note}</p>}
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Recompute'}</button>
+        </p>
+      </div>
+
+      <table className="studies-table">
+        <thead><tr>
+          <SortTh label="Rank" colKey="rank" sort={sort} align="right" />
+          <SortTh label="Sector" colKey="sector" sort={sort} />
+          <SortTh label="ETF" colKey="etf" sort={sort} />
+          <SortTh label="6mo Mom %" colKey="momentum_6m" sort={sort} align="right" />
+          <SortTh label="Pick" colKey="pick" sort={sort} />
+          <SortTh label="P/B" colKey="pb_ratio" sort={sort} align="right" title="Value metric — lower is cheaper" />
+          <SortTh label="Price" colKey="last_close" sort={sort} align="right" />
+          <SortTh label="Mkt cap" colKey="market_cap" sort={sort} align="right" />
+          <SortTh label="P/E" colKey="pe_ratio" sort={sort} align="right" />
+          <SortTh label="Fwd P/E" colKey="forward_pe" sort={sort} align="right" />
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(r => (
+            <tr key={r.etf || r.rank} className="study-row">
+              <td style={{ textAlign: 'right' }} className="dim">{r.rank}</td>
+              <td>{r.sector}</td>
+              <td className="dim">{r.etf}</td>
+              <td style={{ textAlign: 'right' }} className={signCls(r.momentum_6m)}>{pct(r.momentum_6m)}</td>
+              {r.pick ? (
+                <>
+                  <td><b>{r.pick}</b></td>
+                  <td style={{ textAlign: 'right' }} className={r.pb_ratio != null && r.pb_ratio < 2 ? 'good' : ''}>{num(r.pb_ratio)}</td>
+                  <td style={{ textAlign: 'right' }} className="dim">{num(r.last_close)}</td>
+                  <td style={{ textAlign: 'right' }} className="dim">{capFmt(r.market_cap)}</td>
+                  <td style={{ textAlign: 'right' }} className="dim">{num(r.pe_ratio, 1)}</td>
+                  <td style={{ textAlign: 'right' }} className="dim">{num(r.forward_pe, 1)}</td>
+                </>
+              ) : (
+                <>
+                  <td className="dim">—</td>
+                  <td className="dim" colSpan={METRIC_COLS} style={{ fontStyle: 'italic' }}>— no positive-P/B holding</td>
+                </>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <p className="subtitle" style={{ marginTop: 12 }}>
+        {data.note || 'Directional, no fees; monthly-rebalance value basket; stock-universe survivorship applies.'}
+      </p>
+    </div>
+  );
+}
+
 // NOTE: name kept as parseHash for minimal churn; it now reads window.location.pathname (pretty URLs).
 function parseHash() {
   const h = window.location.pathname;
@@ -6782,6 +6902,7 @@ function parseHash() {
   if (h.startsWith('/live')) return { view: 'live' };
   if (h.startsWith('/alt-data')) return { view: 'altdata' };
   if (h.startsWith('/dark-pool')) return { view: 'darkpool' };
+  if (h.startsWith('/rotation')) return { view: 'rotationpick' };
   if (h.startsWith('/vol-shock')) return { view: 'volshock' };
   if (h.startsWith('/backtest')) return { view: 'backtestlab' };
   if (h.startsWith('/news')) return { view: 'news' };
@@ -6871,7 +6992,7 @@ export default function App() {
       const r = parseHash();
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
-                       altdata: 'altdata', darkpool: 'darkpool', volshock: 'volshock' };
+                       altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
       else if (r.view === 'sector') { setPage('dashboard'); handleSectorClick(r.sector); }
       else if (r.view === 'chart') { setPage('dashboard'); setChartTicker(r.ticker); }
@@ -6979,6 +7100,10 @@ export default function App() {
             <span className="sidebar-icon">&#9899;</span>
             Dark Pool
           </li>
+          <li className={`sidebar-item ${page === 'rotationpick' ? 'active' : ''}`} onClick={() => { setPage('rotationpick'); navigate('/rotation'); }}>
+            <span className="sidebar-icon">&#128260;</span>
+            Rotation Pick
+          </li>
           <li className={`sidebar-item ${page === 'volshock' ? 'active' : ''}`} onClick={() => { setPage('volshock'); navigate('/vol-shock'); }}>
             <span className="sidebar-icon">&#9889;</span>
             Vol-Shock
@@ -6998,7 +7123,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
