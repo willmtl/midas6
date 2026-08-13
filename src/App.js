@@ -7304,6 +7304,98 @@ function FactorLabPage() {
   );
 }
 
+// ---- Portfolio Blender ------------------------------------------------------
+// Reads GET /portfolio-blender. Mix CORE value engine + CAPITULATION sleeve; measure correlation +
+// crisis-alpha, sweep allocations, find the mix that maximizes return. (Honest result travels in the verdict.)
+function PortfolioBlenderPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => apiFetch('/portfolio-blender').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/portfolio-blender`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/portfolio-blender`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading portfolio blender...</div>;
+
+  const s = data.sleeves || {}, ca = data.crisis_alpha || {};
+  const sweep = data.allocation_sweep || [];
+  const bestRet = data.best_return_blend || {}, bestSh = data.best_sharpe_blend || {};
+  const pctS = (v, d = 1) => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(d)}%`;
+  const raw = (v, d = 1) => v == null || isNaN(Number(v)) ? '–' : `${Number(v).toFixed(d)}%`;
+  const crisisBad = ca.cap_mean_when_core_down_pct != null && ca.cap_mean_when_core_down_pct < 0;
+
+  return (
+    <div className="studies-page">
+      <h1>🔀 Portfolio Blender <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle" style={{ marginTop: 2 }}>
+        Mix the CORE value engine with a CAPITULATION sleeve — does blending raise return-for-risk?
+      </p>
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '8px 0 16px' }}>
+        <p style={{ margin: 0, fontSize: 13 }}>{data.verdict}</p>
+        <p style={{ margin: '8px 0 0', fontSize: 12 }} className={crisisBad ? 'bad' : 'good'}>
+          <b>Crisis-alpha check:</b> CAP returns <b>{raw(ca.cap_mean_when_core_down_pct, 2)}</b>/mo when CORE is
+          DOWN ({ca.core_down_months} months) vs <b>{raw(ca.cap_mean_when_core_up_pct, 2)}</b>/mo when up —
+          correlation <b>{data.correlation_core_cap}</b>. {crisisBad
+            ? 'CAP LOSES when CORE loses → pro-cyclical, NOT a hedge → blending only dilutes.'
+            : 'CAP pays when CORE bleeds → genuine crisis alpha.'}
+        </p>
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Recompute'}</button>
+        </p>
+      </div>
+
+      <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginBottom: 16 }}>
+        {[['CORE (value engine)', s.core], ['CAP (capitulation)', s.cap]].map(([lab, sl]) => sl && (
+          <div key={lab} className="empty-state" style={{ padding: '10px 14px', minWidth: 220 }}>
+            <b>{lab}</b>
+            <div className="dim" style={{ fontSize: 12, marginTop: 4 }}>
+              total {raw(sl.total_return)} · vs SPY {pctS(sl.vs_spy)} · Sharpe {sl.sharpe} · DD {raw(sl.max_drawdown)} · vol {raw(sl.vol)}
+              {sl.avg_names != null && ` · ${sl.avg_names} names/mo`}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <table className="studies-table">
+        <thead><tr>
+          <th>Capitulation weight (wA)</th>
+          <th style={{ textAlign: 'right' }}>Total</th>
+          <th style={{ textAlign: 'right' }}>vs SPY</th>
+          <th style={{ textAlign: 'right' }}>Sharpe</th>
+          <th style={{ textAlign: 'right' }}>Max DD</th>
+          <th style={{ textAlign: 'right' }}>Vol</th>
+        </tr></thead>
+        <tbody>
+          {sweep.map(r => (
+            <tr key={r.wA} className="study-row"
+              style={r.wA === bestSh.wA ? { background: 'rgba(63,185,80,0.10)' } : (r.wA === 0 ? { background: 'rgba(139,148,158,0.06)' } : undefined)}>
+              <td><b>{(r.wA * 100).toFixed(0)}% CAP / {(100 - r.wA * 100).toFixed(0)}% CORE</b>{r.wA === 0 && <span className="dim"> (CORE only)</span>}{r.wA === bestSh.wA && r.wA !== 0 && ' ⭐ best Sharpe'}</td>
+              <td style={{ textAlign: 'right' }} className="good">{raw(r.total_return)}</td>
+              <td style={{ textAlign: 'right' }} className={r.vs_spy > 0 ? 'good' : 'bad'}>{pctS(r.vs_spy)}</td>
+              <td style={{ textAlign: 'right' }}>{r.sharpe}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{raw(r.max_drawdown)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{raw(r.vol)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="subtitle" style={{ marginTop: 12, fontSize: 12 }}>
+        Best return: <b>{(bestRet.wA * 100).toFixed(0)}% CAP</b> ({raw(bestRet.total_return)}). Regime-switched
+        vol-matched: <b>{raw(data.regime_switched?.vol_matched?.total_return)}</b>. {data.caveat}
+      </p>
+    </div>
+  );
+}
+
 // RS-trend method sweep. Reads GET /rs-methods (BacktestResult[rs_methods]); POST recomputes (poll
 // every 8s until `computed`). ~20 ways to read the ETF/SPY relative-strength bar, each feeding the
 // SAME cheapest-P/B large-cap pick — so only the sector-SELECTION rule varies. The banner carries the
@@ -7895,6 +7987,7 @@ function parseHash() {
   if (h.startsWith('/entry-signal')) return { view: 'entrysignal' };
   if (h.startsWith('/profitability-guard')) return { view: 'profitguard' };
   if (h.startsWith('/factor-lab')) return { view: 'factorlab' };
+  if (h.startsWith('/portfolio-blender')) return { view: 'blender' };
   if (h.startsWith('/rs-methods')) return { view: 'rsmethods' };
   if (h.startsWith('/rotation')) return { view: 'rotationpick' };
   if (h.startsWith('/vol-shock')) return { view: 'volshock' };
@@ -7987,7 +8080,7 @@ export default function App() {
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
                        altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
-                       rotationcall: 'rotationcall', entrysignal: 'entrysignal', profitguard: 'profitguard', factorlab: 'factorlab',
+                       rotationcall: 'rotationcall', entrysignal: 'entrysignal', profitguard: 'profitguard', factorlab: 'factorlab', blender: 'blender',
                        rsmethods: 'rsmethods', synthmacross: 'synthmacross', oversoldbounce: 'oversoldbounce',
                        diversifier: 'diversifier', regime: 'regime', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
@@ -8117,6 +8210,10 @@ export default function App() {
             <span className="sidebar-icon">&#129514;</span>
             Factor Lab
           </li>
+          <li className={`sidebar-item ${page === 'blender' ? 'active' : ''}`} onClick={() => { setPage('blender'); navigate('/portfolio-blender'); }}>
+            <span className="sidebar-icon">&#128256;</span>
+            Blender
+          </li>
           <li className={`sidebar-item ${page === 'rsmethods' ? 'active' : ''}`} onClick={() => { setPage('rsmethods'); navigate('/rs-methods'); }}>
             <span className="sidebar-icon">&#128202;</span>
             RS Methods
@@ -8156,7 +8253,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'profitguard' ? <ProfitabilityGuardPage /> : page === 'factorlab' ? <FactorLabPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'profitguard' ? <ProfitabilityGuardPage /> : page === 'factorlab' ? <FactorLabPage /> : page === 'blender' ? <PortfolioBlenderPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
