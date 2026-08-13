@@ -1890,6 +1890,15 @@ class RotationPicksView(_StudyResultView):
     json_path = "/app/.data/studies/rotation_picks.json"
 
 
+class RsMethodsView(_StudyResultView):
+    """RS-trend method sweep: ~20 ways to read the ETF/SPY relative-strength bar, each feeding the SAME
+    cheapest-P/B large-cap pick, backtested side-by-side (t-stat / Sharpe / drawdown / coverage) so the
+    dashboard can compare selection rules. Multiple-comparisons caveat travels in the payload."""
+    kind = "rs_methods"
+    script = "rs_methods_backtest.py"
+    json_path = "/app/.data/studies/rs_methods.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""

@@ -30,7 +30,11 @@ def run(jobs, recent=RECENT, save_db=True):
 
     hits = []
     if jobs <= 1:
-        hits = _worker((signal_keys, recent, tickers))
+        # Serial but CHUNKED so peak memory stays bounded (the shared box SIGKILLs memory spikes).
+        chunks = _chunk(tickers, 24)
+        for i, c in enumerate(chunks):
+            hits.extend(_worker((signal_keys, recent, c)))
+            print(f"  chunk {i + 1}/{len(chunks)} done — {len(hits)} hits so far", flush=True)
     else:
         import concurrent.futures as cf
         import multiprocessing as mp

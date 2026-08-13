@@ -68,6 +68,8 @@ urlpatterns = [
     path("signal-firing", views.SignalFiringView.as_view(), name="signal-firing"),
     # Live rotation-pick scanner (cheapest-P/B in each strengthening sector)
     path("rotation-picks", views.RotationPicksView.as_view(), name="rotation-picks"),
+    # RS-trend method sweep (~20 selection rules on the ETF/SPY bar, one value pick)
+    path("rs-methods", views.RsMethodsView.as_view(), name="rs-methods"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),
