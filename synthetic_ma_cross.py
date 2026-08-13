@@ -24,8 +24,11 @@ import config
 from seq_fundamental_study import load_candles
 
 BENCH = getattr(config, "BENCHMARK", "SPY")
-PAIRS = [(20, 50), (50, 200), (10, 30)]        # fast/slow SMA windows (trading days)
-HORIZONS = [21, 63, 126]                        # ~1 / 3 / 6 months forward
+# Rotation is short-term, so lead with fast pairs and SHORT forward holds; keep a couple slow/long for
+# contrast. PRE_WINDOWS measure the relative run-up BEFORE the cross (did the move already happen?).
+PAIRS = [(3, 8), (5, 10), (8, 21), (10, 30), (20, 50), (50, 200)]   # fast/slow SMA windows (trading days)
+HORIZONS = [1, 3, 5, 10, 21, 63]                                     # forward holds (days)
+PRE_WINDOWS = [5, 10, 20]                                            # relative run-up before the cross
 
 
 def _tstat(a):
@@ -55,6 +58,7 @@ def build():
     # pooled event buckets: pool[pair][dir][horizon] -> list of forward RS returns
     pool = {p: {"up": {h: [] for h in HORIZONS}, "dn": {h: [] for h in HORIZONS}} for p in PAIRS}
     pool_abs = {p: {"up": {h: [] for h in HORIZONS}} for p in PAIRS}   # forward ABSOLUTE etf return after golden cross
+    pool_pre = {p: {w: [] for w in PRE_WINDOWS} for p in PAIRS}        # relative run-up BEFORE the golden cross
     state_ret = {p: {"bull": [], "bear": []} for p in PAIRS}           # daily RS log-ret split by MA state
     snapshot = {p: [] for p in PAIRS}                                  # current per-sector state
     n_candles = 0
@@ -80,6 +84,9 @@ def build():
                 pool[(fast, slow)]["up"][h] += list(fwd_rs[cross_up].dropna().values)
                 pool[(fast, slow)]["dn"][h] += list(fwd_rs[cross_dn].dropna().values)
                 pool_abs[(fast, slow)]["up"][h] += list(fwd_abs[cross_up].dropna().values)
+            for w in PRE_WINDOWS:
+                pre_rs = rs / rs.shift(w) - 1                  # relative run-up over the w days INTO the cross
+                pool_pre[(fast, slow)][w] += list(pre_rs[cross_up].dropna().values)
             state_ret[(fast, slow)]["bull"] += list(rs_logret[bull.shift(1).fillna(False)].dropna().values)
             state_ret[(fast, slow)]["bear"] += list(rs_logret[(~bull).shift(1).fillna(False)].dropna().values)
             # live snapshot
@@ -99,7 +106,8 @@ def build():
         row = {"pair": f"{fast}/{slow}",
                "cross_up": {f"{h}d": _agg(pool[(fast, slow)]["up"][h]) for h in HORIZONS},
                "cross_dn": {f"{h}d": _agg(pool[(fast, slow)]["dn"][h]) for h in HORIZONS},
-               "abs_after_golden": {f"{h}d": _agg(pool_abs[(fast, slow)]["up"][h]) for h in HORIZONS}}
+               "abs_after_golden": {f"{h}d": _agg(pool_abs[(fast, slow)]["up"][h]) for h in HORIZONS},
+               "pre_cross": {f"{w}d": _agg(pool_pre[(fast, slow)][w]) for w in PRE_WINDOWS}}
         b = np.asarray(state_ret[(fast, slow)]["bull"], float); b = b[~np.isnan(b)]
         e = np.asarray(state_ret[(fast, slow)]["bear"], float); e = e[~np.isnan(e)]
         # annualized mean relative drift while in each state (252 trading days)
@@ -117,6 +125,7 @@ def build():
         "computed_at": pd.Timestamp.utcnow().isoformat(),
         "params": {"n_synthetic_candles": n_candles, "benchmark": BENCH,
                    "ma_pairs": [f"{f}/{s}" for f, s in PAIRS], "horizons_days": HORIZONS,
+                   "pre_windows_days": PRE_WINDOWS,
                    "signal": "SMA(fast) crosses SMA(slow) on the synthetic etf/spy (relative-strength) candle"},
         "pairs": pairs_out,
         "note": ("Forward relative return r[t+h]/r[t]-1 = ETF return minus SPY over the window (>0 = beat SPY). "
@@ -146,8 +155,11 @@ def main():
     for row in payload["pairs"]:
         print(f"\n--- SMA {row['pair']} on the RS bar ---", flush=True)
         st = row["state_test"]
+        pc = row["pre_cross"]
         print(f"  state: while GOLDEN, sector out-drifts SPY {st['golden_ann_rs_pct']:+}%/yr "
               f"({st['golden_days']}d);  while DEATH {st['death_ann_rs_pct']:+}%/yr ({st['death_days']}d)", flush=True)
+        print(f"  run-up INTO cross (relative): " + "  ".join(
+            f"{w}d {pc[w].get('mean_pct'):+}%" for w in [f"{x}d" for x in PRE_WINDOWS]), flush=True)
         for h in HORIZONS:
             u = row["cross_up"][f"{h}d"]; d = row["cross_dn"][f"{h}d"]; a = row["abs_after_golden"][f"{h}d"]
             print(f"  +{h:>3}d  golden-cross: rel {u.get('mean_pct'):>+6}%  {u.get('pos_pct')}%pos  t{u.get('t')}  "
