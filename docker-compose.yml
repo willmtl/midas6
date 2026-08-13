@@ -67,6 +67,7 @@ x-backend-volumes: &backend-volumes
   - ./news_overreaction.py:/app/news_overreaction.py
   - ./ground_earnings.py:/app/ground_earnings.py
   - ./signal_firing_scan.py:/app/signal_firing_scan.py
+  - ./rotation_pick_scan.py:/app/rotation_pick_scan.py
   - ./.data:/app/.data
 
 services:

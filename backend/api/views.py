@@ -1882,6 +1882,14 @@ class SignalFiringView(APIView):
         return Response({"status": "signal firing scan started"})
 
 
+class RotationPicksView(_StudyResultView):
+    """LIVE rotation-pick scanner: cheapest positive-P/B stock in each top-momentum sector — the only
+    sector-rotation arm with real alpha (arm3_lowpb, +154% vs SPY t2.09). GET reads it; POST recomputes."""
+    kind = "rotation_picks"
+    script = "rotation_pick_scan.py"
+    json_path = "/app/.data/studies/rotation_picks.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""

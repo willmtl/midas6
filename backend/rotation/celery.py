@@ -232,4 +232,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_signal_firing",
         "schedule": crontab(hour=22, minute=10),
     },
+    "rotation-picks-nightly": {         # live rotation-pick basket (cheapest-P/B in strong sectors)
+        "task": "api.celery_tasks.run_rotation_picks",
+        "schedule": crontab(hour=22, minute=5),
+    },
 }
