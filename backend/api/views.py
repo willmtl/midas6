@@ -85,6 +85,54 @@ class StudyListView(APIView):
         qs = Study.objects.filter(is_computed=True)
         last = qs.aggregate(m=Max("computed_at"))["m"]
         last_iso = last.isoformat() if last else None
+
+        # Grouped-by-signal view: a "study" is the SIGNAL (tested across every exit), so collapse the
+        # signal×exit rows to one entry per signal — its best exit as the headline + the exit range +
+        # profitable-exit count. ~354 signals, so returned in one shot (expand fetches the exit ladder
+        # via ?signal=X). Honors the same search / category / regime filters.
+        if request.query_params.get("group") == "signal":
+            qp = request.query_params
+            search = (qp.get("search") or "").strip()
+            if search:
+                qs = qs.filter(Q(signal_name__icontains=search) | Q(name__icontains=search)
+                               | Q(exit_name__icontains=search))
+            if qp.get("category") and qp.get("category") != "all":
+                qs = qs.filter(category=qp.get("category"))
+            regime = qp.get("regime")
+            REGIME_FIELDS = {"by_regime", "by_curve", "by_vix", "by_spy_trend", "by_season"}
+            if regime and ":" in regime:
+                rtype, rkey = regime.split(":", 1)
+                if rtype in REGIME_FIELDS and rkey:
+                    qs = qs.filter(**{f"{rtype}__{rkey}__isnull": False})
+            groups = {}
+            for r in qs.values("signal_key", "signal_name", "category", "exit_key", "exit_name",
+                               "avg_return", "win_rate", "total_trades", "t_stat", "avg_hold",
+                               "avg_mae", "clean_pct"):
+                g = groups.get(r["signal_key"])
+                if g is None:
+                    g = groups[r["signal_key"]] = {
+                        "signal": r["signal_key"], "signal_name": r["signal_name"],
+                        "category": r["category"], "n_exits": 0, "profitable": 0,
+                        "min_ret": None, "max_ret": None, "best": None}
+                g["n_exits"] += 1
+                ar = r["avg_return"]
+                if ar is not None:
+                    if ar > 0:
+                        g["profitable"] += 1
+                    g["min_ret"] = ar if g["min_ret"] is None else min(g["min_ret"], ar)
+                    g["max_ret"] = ar if g["max_ret"] is None else max(g["max_ret"], ar)
+                cur = g["best"]
+                if cur is None or (ar or -1e9) > (cur["avg_return"] or -1e9):
+                    g["best"] = {"exit": r["exit_key"], "exit_name": r["exit_name"], "avg_return": ar,
+                                 "win_rate": r["win_rate"], "trades": r["total_trades"],
+                                 "t_stat": r["t_stat"], "avg_hold": r["avg_hold"],
+                                 "avg_mae": r["avg_mae"], "clean_pct": r["clean_pct"]}
+            grouped = sorted(groups.values(), key=lambda x: -((x["best"] or {}).get("avg_return") or -1e9))
+            categories = sorted(c for c in Study.objects.filter(is_computed=True).order_by()
+                                .values_list("category", flat=True).distinct() if c)
+            return Response({"grouped": grouped, "total_signals": len(grouped),
+                             "categories": categories, "last_updated": last_iso})
+
         if request.query_params.get("paginate") == "1" or request.query_params.get("offset") is not None:
             from django.db.models import F, FloatField
             from api.pagination import resolve_ordering, paginate_offset, paged_response
