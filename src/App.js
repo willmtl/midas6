@@ -6865,6 +6865,7 @@ function RotationPicksPage() {
           <SortTh label="Mkt cap" colKey="market_cap" sort={sort} align="right" />
           <SortTh label="P/E" colKey="pe_ratio" sort={sort} align="right" />
           <SortTh label="Fwd P/E" colKey="forward_pe" sort={sort} align="right" />
+          <SortTh label="Profit guard" colKey="guard_status" sort={sort} title="Profitability guard: profitable / turnaround (neg-EPS improving, kept) / ok / trap (excluded from the pick)" />
         </tr></thead>
         <tbody>
           {sort.rows.map(r => (
@@ -6881,11 +6882,12 @@ function RotationPicksPage() {
                   <td style={{ textAlign: 'right' }} className="dim">{capFmt(r.market_cap)}</td>
                   <td style={{ textAlign: 'right' }} className="dim">{num(r.pe_ratio, 1)}</td>
                   <td style={{ textAlign: 'right' }} className="dim">{num(r.forward_pe, 1)}</td>
+                  <td>{r.is_etf_proxy ? <span className="dim">–</span> : <GuardBadge status={r.guard_status} margin={r.margin_pct} />}</td>
                 </>
               ) : (
                 <>
                   <td className="dim">—</td>
-                  <td className="dim" colSpan={METRIC_COLS} style={{ fontStyle: 'italic' }}>— no data</td>
+                  <td className="dim" colSpan={METRIC_COLS + 1} style={{ fontStyle: 'italic' }}>— no data</td>
                 </>
               )}
             </tr>
@@ -6921,6 +6923,21 @@ function EntryBadge({ txt, k }) {
   };
   const [bg, fg] = map[k] || map.wait;
   return <span style={{ background: bg, color: fg, padding: '2px 8px', borderRadius: 6, fontSize: 12, whiteSpace: 'nowrap' }}>{txt}</span>;
+}
+
+// Profitability-guard badge: profitable / turnaround (neg-EPS but improving, kept) / ok / trap (excluded).
+function GuardBadge({ status, margin }) {
+  if (!status || status === 'unknown') return <span className="dim">–</span>;
+  const map = {
+    profitable: ['rgba(63,185,80,0.16)', '#3fb950', 'profitable'],
+    turnaround: ['rgba(88,166,255,0.16)', '#58a6ff', 'turnaround'],
+    ok: ['rgba(139,148,158,0.14)', '#8b949e', 'ok'],
+    trap: ['rgba(248,81,73,0.18)', '#f85149', 'TRAP'],
+  };
+  const [bg, fg, label] = map[status] || map.ok;
+  const m = margin != null ? ` ${margin > 0 ? '+' : ''}${margin}%` : '';
+  return <span title={`profit guard: ${status}${margin != null ? ` (net margin ${margin}%)` : ''}`}
+    style={{ background: bg, color: fg, padding: '1px 6px', borderRadius: 4, fontSize: 11, whiteSpace: 'nowrap' }}>{label}{m}</span>;
 }
 
 function RotationCallPage() {
@@ -7000,7 +7017,9 @@ function RotationCallPage() {
               <td style={{ textAlign: 'right' }} className="dim">{r.combo_hit_pct == null ? '–' : `${r.combo_hit_pct}%`}</td>
               {r.pick ? (
                 <>
-                  <td><b>{r.pick}</b>{r.is_etf_proxy && <span title="Commodity/market ETF held as the position (trend sleeve, not a value pick)" style={{ marginLeft: 5, fontSize: 10, padding: '1px 5px', borderRadius: 4, background: 'rgba(210,153,34,0.16)', color: '#d29922' }}>ETF</span>}</td>
+                  <td><b>{r.pick}</b>{r.is_etf_proxy
+                    ? <span title="Commodity/market ETF held as the position (trend sleeve, not a value pick)" style={{ marginLeft: 5, fontSize: 10, padding: '1px 5px', borderRadius: 4, background: 'rgba(210,153,34,0.16)', color: '#d29922' }}>ETF</span>
+                    : (r.guard_status && r.guard_status !== 'unknown' && <span style={{ marginLeft: 6 }}><GuardBadge status={r.guard_status} margin={r.margin_pct} /></span>)}</td>
                   <td style={{ textAlign: 'right' }} className={r.pb_ratio != null && r.pb_ratio < 2 ? 'good' : ''}>{r.is_etf_proxy ? <span className="dim" title="no P/B — commodity/market sleeve">n/a</span> : num(r.pb_ratio)}</td>
                   <td style={{ textAlign: 'right' }} className="dim">{num(r.last_close)}</td>
                   <td style={{ textAlign: 'right' }} className={rsiCls(r.rsi10)}>{r.rsi10 == null ? '–' : r.rsi10}</td>
@@ -7111,6 +7130,90 @@ function EntrySignalPage() {
 
       <p className="subtitle" style={{ marginTop: 12, fontSize: 12 }}>
         Baseline (unconditional) shown two ways: <b>vs SPY</b> = pure value picks; <b>vs SPY (fallback)</b> = all-10-slots with ETF fallback = the conservative +154% headline. {data.caveat}
+      </p>
+    </div>
+  );
+}
+
+// ---- Profitability Guard study --------------------------------------------
+// Reads GET /profitability-guard. Does excluding cheap-P/B value traps help? Blanket "profitable-only"
+// HURTS (kills turnarounds); the nuanced ex_trap_turn (drop unprofitable+eroding-book+not-improving,
+// keep turnarounds) beats the unguarded baseline on return, t, Sharpe AND drawdown. Now wired live.
+function ProfitabilityGuardPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => apiFetch('/profitability-guard').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/profitability-guard`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/profitability-guard`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading profitability-guard study...</div>;
+
+  const V = data.variants || {};
+  const LABEL = {
+    baseline: 'baseline (no guard)', profitable: 'profitable-only', book_stable: 'book not shrinking',
+    profitable_book: 'profitable + book', ex_trap: 'exclude trap', ex_trap_turn: 'exclude trap, keep turnarounds',
+  };
+  const order = ['baseline', 'profitable', 'book_stable', 'profitable_book', 'ex_trap', 'ex_trap_turn'];
+  const rows = order.filter(k => V[k]).map(k => {
+    const nf = V[k].no_fallback || {}, fb = V[k].fallback || {};
+    return { key: k, vs_spy: nf.vs_spy, t: nf.t_stat, sharpe: nf.sharpe, dd: nf.max_drawdown,
+      fb_vs_spy: fb.vs_spy, isBase: k === 'baseline', isWinner: k === data.best_guard };
+  });
+  const pctS = (v, d = 1) => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(d)}%`;
+  const num = (v, d = 2) => v == null || isNaN(Number(v)) ? '–' : Number(v).toFixed(d);
+
+  return (
+    <div className="studies-page">
+      <h1>🛡️ Profitability Guard <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle" style={{ marginTop: 2 }}>
+        Does excluding cheap-P/B <b>value traps</b> (unprofitable + eroding book) improve the value pick?
+      </p>
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '8px 0 16px' }}>
+        <p style={{ margin: 0, fontSize: 13 }}>{data.recommendation}</p>
+        <p style={{ margin: '8px 0 0', fontSize: 13 }}>
+          <span className="good">✓ Winner: <b>{data.best_guard}</b></span> — drop only the true trap (unprofitable
+          AND book shrinking AND not improving), <b>keep negative-EPS turnarounds</b>. Blanket "profitable-only"
+          <span className="bad"> hurts</span> (throws out the turnaround winners). <b>Now wired into the live picks.</b>
+        </p>
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Recompute'}</button>
+        </p>
+      </div>
+      <table className="studies-table">
+        <thead><tr>
+          <th>Variant</th>
+          <th style={{ textAlign: 'right' }} title="Pure value picks (empty sectors dropped)">vs SPY</th>
+          <th style={{ textAlign: 'right' }}>t</th>
+          <th style={{ textAlign: 'right' }}>Sharpe</th>
+          <th style={{ textAlign: 'right' }}>Max DD</th>
+          <th style={{ textAlign: 'right' }} title="With ETF fallback (realistic)">vs SPY (fallback)</th>
+        </tr></thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.key} className="study-row" style={r.isWinner ? { background: 'rgba(63,185,80,0.10)' } : r.isBase ? { background: 'rgba(139,148,158,0.06)' } : undefined}>
+              <td>{r.isWinner && '✓ '}<b>{LABEL[r.key] || r.key}</b></td>
+              <td style={{ textAlign: 'right' }} className={r.vs_spy > 0 ? 'good' : 'bad'}>{pctS(r.vs_spy)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.t == null ? '–' : r.t}</td>
+              <td style={{ textAlign: 'right' }}>{num(r.sharpe)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pctS(r.dd)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pctS(r.fb_vs_spy)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="subtitle" style={{ marginTop: 12, fontSize: 12 }}>
+        Guard status on the live picks: <b>profitable</b> / <b>turnaround</b> (neg-EPS but improving — kept) /
+        <b> ok</b> / <b>trap</b> (excluded). {data.caveat}
       </p>
     </div>
   );
@@ -7705,6 +7808,7 @@ function parseHash() {
   if (h.startsWith('/synthetic-ma-cross')) return { view: 'synthmacross' };
   if (h.startsWith('/rotation-call')) return { view: 'rotationcall' };
   if (h.startsWith('/entry-signal')) return { view: 'entrysignal' };
+  if (h.startsWith('/profitability-guard')) return { view: 'profitguard' };
   if (h.startsWith('/rs-methods')) return { view: 'rsmethods' };
   if (h.startsWith('/rotation')) return { view: 'rotationpick' };
   if (h.startsWith('/vol-shock')) return { view: 'volshock' };
@@ -7797,7 +7901,7 @@ export default function App() {
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
                        altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
-                       rotationcall: 'rotationcall', entrysignal: 'entrysignal',
+                       rotationcall: 'rotationcall', entrysignal: 'entrysignal', profitguard: 'profitguard',
                        rsmethods: 'rsmethods', synthmacross: 'synthmacross', oversoldbounce: 'oversoldbounce',
                        diversifier: 'diversifier', regime: 'regime', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
@@ -7919,6 +8023,10 @@ export default function App() {
             <span className="sidebar-icon">&#9203;</span>
             Entry Signal
           </li>
+          <li className={`sidebar-item ${page === 'profitguard' ? 'active' : ''}`} onClick={() => { setPage('profitguard'); navigate('/profitability-guard'); }}>
+            <span className="sidebar-icon">&#128737;</span>
+            Profit Guard
+          </li>
           <li className={`sidebar-item ${page === 'rsmethods' ? 'active' : ''}`} onClick={() => { setPage('rsmethods'); navigate('/rs-methods'); }}>
             <span className="sidebar-icon">&#128202;</span>
             RS Methods
@@ -7958,7 +8066,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'profitguard' ? <ProfitabilityGuardPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
