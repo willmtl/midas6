@@ -76,6 +76,8 @@ urlpatterns = [
     path("oversold-bounce", views.OversoldBounceView.as_view(), name="oversold-bounce"),
     # Diversifiers: rank sleeves by correlation to SPY (commodities/Gold)
     path("diversifier", views.DiversifierView.as_view(), name="diversifier"),
+    # Macro regime -> sector leadership (rates / inflation / market)
+    path("regime", views.RegimeView.as_view(), name="regime"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),

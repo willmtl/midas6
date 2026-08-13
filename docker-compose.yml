@@ -72,6 +72,7 @@ x-backend-volumes: &backend-volumes
   - ./synthetic_ma_cross.py:/app/synthetic_ma_cross.py
   - ./oversold_bounce.py:/app/oversold_bounce.py
   - ./diversifier_scan.py:/app/diversifier_scan.py
+  - ./regime_scan.py:/app/regime_scan.py
   - ./.data:/app/.data
 
 services:

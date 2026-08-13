@@ -1926,6 +1926,15 @@ class DiversifierView(_StudyResultView):
     json_path = "/app/.data/studies/diversifier.json"
 
 
+class RegimeView(_StudyResultView):
+    """Macro regime -> sector leadership. Classifies each month by rates (TLT), inflation (TIP/TLT), and
+    market (SPY vs 200d), and reports which sectors historically led in each regime + today's regime and its
+    leaders. In-sample descriptive (hypothesis generator), per the payload caveat. POST recomputes."""
+    kind = "regime"
+    script = "regime_scan.py"
+    json_path = "/app/.data/studies/regime.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""
