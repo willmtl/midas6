@@ -531,6 +531,20 @@ def run_factor_lab():
 
 
 @shared_task
+def run_portfolio_blender():
+    """Weekly: portfolio blender (mix CORE value + CAPITULATION sleeves). Heavy + slow-moving → weekly.
+    → BacktestResult[portfolio_blender]."""
+    import subprocess, os
+    if not os.path.exists("/app/portfolio_blender.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/portfolio_blender.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("portfolio_blender failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_signal_firing():
     """Nightly: per-signal firing scan (all signals × full universe, last 3 bars) → SignalFiring.
     After candles refresh; powers the grouped Studies 'firing now' column."""

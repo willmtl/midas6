@@ -1974,6 +1974,16 @@ class FactorLabView(_StudyResultView):
     json_path = "/app/.data/studies/factor_lab.json"
 
 
+class PortfolioBlenderView(_StudyResultView):
+    """Portfolio Blender: mix the CORE value engine (C+B: guard+low_debt value pick) with a CAPITULATION
+    sleeve (A: deep-oversold + A/D accumulation, ~10d bounce) as monthly return streams. Measures
+    correlation + crisis-alpha, sweeps allocations, vol-matches, and tests a regime-switched split.
+    GET reads BacktestResult[portfolio_blender]; POST recomputes."""
+    kind = "portfolio_blender"
+    script = "portfolio_blender.py"
+    json_path = "/app/.data/studies/portfolio_blender.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""

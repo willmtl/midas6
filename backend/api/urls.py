@@ -86,6 +86,8 @@ urlpatterns = [
     path("profitability-guard", views.ProfitabilityGuardView.as_view(), name="profitability-guard"),
     # Factor lab: sweep filters/tilts/combos on the value pick, ranked to find the best return
     path("factor-lab", views.FactorLabView.as_view(), name="factor-lab"),
+    # Portfolio blender: mix CORE value + CAPITULATION sleeves (correlation, crisis-alpha, allocation)
+    path("portfolio-blender", views.PortfolioBlenderView.as_view(), name="portfolio-blender"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),

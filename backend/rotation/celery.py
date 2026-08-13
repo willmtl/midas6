@@ -248,4 +248,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_factor_lab",
         "schedule": crontab(hour=23, minute=58, day_of_week=0),
     },
+    "portfolio-blender-weekly": {       # sleeve-mix study (core value + capitulation) — Sat 23:58 UTC
+        "task": "api.celery_tasks.run_portfolio_blender",
+        "schedule": crontab(hour=23, minute=58, day_of_week=6),
+    },
 }
