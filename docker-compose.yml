@@ -69,6 +69,7 @@ x-backend-volumes: &backend-volumes
   - ./signal_firing_scan.py:/app/signal_firing_scan.py
   - ./rotation_pick_scan.py:/app/rotation_pick_scan.py
   - ./rs_methods_backtest.py:/app/rs_methods_backtest.py
+  - ./synthetic_ma_cross.py:/app/synthetic_ma_cross.py
   - ./.data:/app/.data
 
 services:
