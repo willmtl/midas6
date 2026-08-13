@@ -4812,6 +4812,7 @@ function ShortTermPage() {
           <SortTh colKey="days_ago" sort={sort} align="right"><Term k="fired">Days ago</Term></SortTh>
           <SortTh colKey="day1_move" sort={sort} align="right">Day-1 move</SortTh>
           <SortTh colKey="z_shock" sort={sort} align="right">z (σ)</SortTh>
+          <SortTh colKey="intraday_rsi" sort={sort}>Intraday</SortTh>
           <SortTh colKey="hist_avg_return" sort={sort} align="right"><Term k="histedge">Short edge</Term></SortTh>
           <SortTh colKey="hist_win_rate" sort={sort} align="right"><Term k="winrate">Win%</Term></SortTh>
           <SortTh colKey="hist_trades" sort={sort} align="right">Trades</SortTh>
@@ -4829,6 +4830,7 @@ function ShortTermPage() {
               <td style={{ textAlign: 'right' }}>{r.days_ago === 0 ? <span className="good">today</span> : `${r.days_ago}d`}</td>
               <td style={{ textAlign: 'right' }} className={signCls(r.day1_move)}>{r.day1_move == null ? '–' : `${r.day1_move > 0 ? '+' : ''}${r.day1_move}%`}</td>
               <td style={{ textAlign: 'right' }} className={signCls(r.z_shock)}>{r.z_shock == null ? '–' : r.z_shock.toFixed(1)}</td>
+              <td style={{ fontSize: 11 }}>{r.intraday_signal ? <span className={`sm-badge ${/RSI↑/.test(r.intraday_signal) ? 'good' : 'dim'}`} title="Intraday entry timing">{r.intraday_signal}</span> : <span className="dim">–</span>}</td>
               <td style={{ textAlign: 'right' }} className={r.hist_avg_return == null ? 'dim' : signCls(r.hist_avg_return)}>{r.hist_avg_return == null ? '–' : `${r.hist_avg_return > 0 ? '+' : ''}${r.hist_avg_return}%`}</td>
               <td style={{ textAlign: 'right' }}>{r.hist_win_rate == null ? <span className="dim">–</span> : `${r.hist_win_rate}%`}</td>
               <td style={{ textAlign: 'right' }} className="dim">{r.hist_trades == null ? '–' : r.hist_trades}</td>
@@ -4889,8 +4891,8 @@ function GlobalPage() {
   const burstChip = t => t === 'reversal'
     ? <span className="sm-badge sm-13g" title="Reversal">reversal</span>
     : <span className="sm-badge sm-insider" title="Momentum">momentum</span>;
-  // 8 component pills: B(urst) E(dge) A/D D(arkpool) S(mart money) F(undamentals) R(egime) N(ews), shaded by 0..1.
-  const COMP = [['burst', 'B'], ['edge', 'E'], ['ad', 'A'], ['darkpool', 'D'], ['smart_money', 'S'], ['fundamentals', 'F'], ['regime', 'R'], ['news', 'N', 'high = the burst is bouncing off a recent grounded news-overreaction (PODD-type)']];
+  // 9 component pills: B(urst) E(dge) A/D D(arkpool) S(mart money) F(undamentals) R(egime) N(ews) I(ntraday), shaded by 0..1.
+  const COMP = [['burst', 'B'], ['edge', 'E'], ['ad', 'A'], ['darkpool', 'D'], ['smart_money', 'S'], ['fundamentals', 'F'], ['regime', 'R'], ['news', 'N', 'high = the burst is bouncing off a recent grounded news-overreaction (PODD-type)'], ['intraday', 'I', 'high = an oversold intraday RSI cross-up timing the reversal entry (8h/12h)']];
   const compPills = c => (
     <span style={{ whiteSpace: 'nowrap' }}>
       {COMP.map(([k, lbl, note]) => {
@@ -4959,6 +4961,7 @@ function GlobalPage() {
               <td>{compPills(r.components)}</td>
               <td>
                 <b>{r.ticker}</b> {burstChip(r.burst_type)}
+                {r.intraday_signal ? <span className={`sm-badge ${/RSI↑/.test(r.intraday_signal) ? 'good' : 'dim'}`} title="Intraday entry timing">{r.intraday_signal}</span> : null}
                 <div className="dim" style={{ fontSize: 10 }} title={r.burst_signal_key}>{r.burst_signal_name} · {r.burst_days_ago === 0 ? 'today' : `${r.burst_days_ago}d`}</div>
               </td>
               <td style={{ textAlign: 'right' }} className={r.hist_avg_return == null ? 'dim' : signCls(r.hist_avg_return)}>{r.hist_avg_return == null ? '–' : `${r.hist_avg_return > 0 ? '+' : ''}${r.hist_avg_return}%`}</td>
