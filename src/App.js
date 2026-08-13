@@ -1379,39 +1379,307 @@ function StudyChartView({ study, onBack }) {
   );
 }
 
+// Exit ladder for a single signal group: a sortable sub-table of that signal's exits.
+// Own hooks (sort + per-exit trades) so rules-of-hooks stay legal inside the parent's row map.
+// `onChart(row)` opens the StudyChartView (parent owns navigation + studyDetail state).
+function StudyExitLadder({ rows, onChart }) {
+  const sort = useSortedRows(rows, 'avg_return', 'desc');
+  const [expandedExit, setExpandedExit] = useState(null);
+  const [trades, setTrades] = useState({});
+  const [tradesLoading, setTradesLoading] = useState(null);
+
+  const LADDER_COLS = 10;
+  const toggleExit = (s) => {
+    const next = expandedExit === s.exit ? null : s.exit;
+    setExpandedExit(next);
+    if (next && s.id != null && !trades[s.id]) {
+      setTradesLoading(s.id);
+      fetch(`${API}/studies/${s.id}/trades?signal=${encodeURIComponent(s.signal)}&exit=${encodeURIComponent(s.exit)}`)
+        .then(r => r.json())
+        .then(d => { setTrades(prev => ({ ...prev, [s.id]: d })); setTradesLoading(null); })
+        .catch(() => setTradesLoading(null));
+    }
+  };
+
+  return (
+    <table className="exit-ladder">
+      <thead>
+        <tr>
+          <th style={{ width: 18 }}></th>
+          <SortTh label="Exit" colKey="exit_name" sort={sort}><Term k="exit">Exit</Term></SortTh>
+          <SortTh label="Avg Ret" colKey="avg_return" sort={sort}><Term k="avgreturn">Avg Ret</Term></SortTh>
+          <SortTh label="Win%" colKey="win_rate" sort={sort}><Term k="winrate">Win%</Term></SortTh>
+          <SortTh label="Trades" colKey="total_trades" sort={sort}><Term k="ntrades">Trades</Term></SortTh>
+          <SortTh label="Sig t" colKey="t_stat" sort={sort}><Term k="sig">Sig t</Term></SortTh>
+          <SortTh label="Hold" colKey="avg_hold" sort={sort}><Term k="avghold">Hold</Term></SortTh>
+          <SortTh label="Avg Dip" colKey="avg_mae" sort={sort}><Term k="avgdip">Avg Dip</Term></SortTh>
+          <SortTh label="Clean%" colKey="clean_pct" sort={sort}><Term k="cleanpct">Clean%</Term></SortTh>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {sort.rows.map(s => (
+          <React.Fragment key={s.exit}>
+            <tr className={s.avg_return > 0 ? 'row-bullish' : 'row-bearish'} style={{ cursor: 'pointer' }} onClick={() => toggleExit(s)}>
+              <td className="dim">{expandedExit === s.exit ? '▾' : '▸'}</td>
+              <td>{s.exit_name}</td>
+              <td className={s.avg_return > 0 ? 'good' : 'bad'}>{s.avg_return > 0 ? '+' : ''}{s.avg_return.toFixed(3)}%</td>
+              <td className={s.win_rate > 55 ? 'good' : s.win_rate < 45 ? 'bad' : ''}>{s.win_rate.toFixed(1)}%</td>
+              <td>{(s.total_trades ?? 0).toLocaleString()}</td>
+              <td className={s.t_stat == null ? 'dim' : Math.abs(s.t_stat) >= 2 ? 'good' : Math.abs(s.t_stat) < 1 ? 'bad' : ''}>{s.t_stat != null ? s.t_stat.toFixed(1) : '-'}</td>
+              <td className="dim">{s.avg_hold != null ? `${s.avg_hold.toFixed(0)}d` : '-'}</td>
+              <td className={s.avg_mae == null ? 'dim' : s.avg_mae >= -3 ? 'good' : s.avg_mae >= -8 ? '' : 'bad'}>{s.avg_mae != null ? `${s.avg_mae.toFixed(1)}%` : '-'}</td>
+              <td className={s.clean_pct == null ? 'dim' : s.clean_pct >= 40 ? 'good' : s.clean_pct < 20 ? 'bad' : ''}>{s.clean_pct != null ? `${s.clean_pct.toFixed(0)}%` : '-'}</td>
+              <td><button className="chart-link" onClick={e => { e.stopPropagation(); onChart(s); }}>chart</button></td>
+            </tr>
+            {expandedExit === s.exit && (
+              <tr className="study-detail-row">
+                <td colSpan={LADDER_COLS}>
+                  <div className="study-detail">
+                    <div className="study-detail-section">
+                      <h4>Best Sectors</h4>
+                      {s.best_sectors?.map(b => (
+                        <div key={b.sector} className="study-sector-row good">{b.sector}: {b.avg_return > 0 ? '+' : ''}{b.avg_return.toFixed(3)}% ({b.trades} trades, {b.win_rate.toFixed(0)}% wr)</div>
+                      ))}
+                    </div>
+                    <div className="study-detail-section">
+                      <h4>Worst Sectors</h4>
+                      {s.worst_sectors?.map(b => (
+                        <div key={b.sector} className="study-sector-row bad">{b.sector}: {b.avg_return > 0 ? '+' : ''}{b.avg_return.toFixed(3)}% ({b.trades} trades, {b.win_rate.toFixed(0)}% wr)</div>
+                      ))}
+                    </div>
+                    <div className="study-detail-section" style={{ minWidth: '100%' }}>
+                      <h4>Strategy</h4>
+                      <div style={{ fontSize: 13, marginBottom: 4 }}>
+                        <b>Buy</b> when <span className="good">{s.signal_name}</span> triggers on the daily chart.
+                        <b> Sell</b> when <span className="bad">{s.exit_name}</span>.
+                        {s.avg_hold ? ` Average hold: ${s.avg_hold.toFixed(0)} days.` : ''}
+                        {s.ret_90d != null ? ` If held 90 days instead: ${s.ret_90d > 0 ? '+' : ''}${s.ret_90d.toFixed(2)}%.` : ''}
+                        {s.peak_day ? ` Optimal exit: day ${s.peak_day} (${s.peak_avg > 0 ? '+' : ''}${s.peak_avg?.toFixed(2)}%).` : ''}
+                      </div>
+                      <div className="dim">{s.sector_count || '?'} sectors | {s.total_trades?.toLocaleString()} trades</div>
+                    </div>
+                    {s.by_regime && Object.keys(s.by_regime).length > 0 && (
+                      <div className="study-detail-section">
+                        <h4>By Rate Regime</h4>
+                        {['LOW','MEDIUM','HIGH'].map(r => s.by_regime[r] && (
+                          <div key={r} className="study-sector-row">
+                            <span className={r === 'LOW' ? 'good' : r === 'HIGH' ? 'bad' : 'neutral'}>{r}</span>
+                            : {s.by_regime[r].avg_return > 0 ? '+' : ''}{s.by_regime[r].avg_return.toFixed(3)}% ({s.by_regime[r].trades} trades, {s.by_regime[r].win_rate}% wr)
+                          </div>
+                        ))}
+                        {(() => {
+                          const b = ['LOW','MEDIUM','HIGH'].filter(r => s.by_regime[r]).map(r => ({ label: r, value: s.by_regime[r].avg_return, n: s.by_regime[r].trades }));
+                          return b.length >= 2 ? (<div style={{ maxWidth: 260, marginTop: 4 }}>
+                            <div className="subtitle darkpool-muted" style={{ margin: '2px 0' }}>By rate regime</div>
+                            <TailStrip buckets={b} />
+                          </div>) : null;
+                        })()}
+                      </div>
+                    )}
+                    {s.by_curve && Object.keys(s.by_curve).length > 0 && (
+                      <div className="study-detail-section">
+                        <h4>By Yield Curve</h4>
+                        {['NORMAL','INVERTED'].map(c => s.by_curve[c] && (
+                          <div key={c} className="study-sector-row">
+                            <span className={c === 'NORMAL' ? 'good' : 'bad'}>{c}</span>
+                            : {s.by_curve[c].avg_return > 0 ? '+' : ''}{s.by_curve[c].avg_return.toFixed(3)}% ({s.by_curve[c].trades} trades, {s.by_curve[c].win_rate}% wr)
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {s.by_vix && Object.keys(s.by_vix).length > 0 && (
+                      <div className="study-detail-section">
+                        <h4>By VIX Level</h4>
+                        {['LOW_VIX','MED_VIX','HIGH_VIX'].map(v => s.by_vix[v] && (
+                          <div key={v} className="study-sector-row">
+                            <span className={v === 'LOW_VIX' ? 'good' : v === 'HIGH_VIX' ? 'bad' : 'neutral'}>{v.replace('_',' ')}</span>
+                            : {s.by_vix[v].avg_return > 0 ? '+' : ''}{s.by_vix[v].avg_return.toFixed(3)}% ({s.by_vix[v].trades} trades, {s.by_vix[v].win_rate}% wr)
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {s.by_spy_trend && Object.keys(s.by_spy_trend).length > 0 && (
+                      <div className="study-detail-section">
+                        <h4>By SPY Trend</h4>
+                        {['BULL','BEAR'].map(t => s.by_spy_trend[t] && (
+                          <div key={t} className="study-sector-row">
+                            <span className={t === 'BULL' ? 'good' : 'bad'}>{t}</span>
+                            : {s.by_spy_trend[t].avg_return > 0 ? '+' : ''}{s.by_spy_trend[t].avg_return.toFixed(3)}% ({s.by_spy_trend[t].trades} trades, {s.by_spy_trend[t].win_rate}% wr)
+                          </div>
+                        ))}
+                        {(() => {
+                          const b = ['BULL','BEAR'].filter(t => s.by_spy_trend[t]).map(t => ({ label: t, value: s.by_spy_trend[t].avg_return, n: s.by_spy_trend[t].trades }));
+                          return b.length >= 2 ? (<div style={{ maxWidth: 200, marginTop: 4 }}>
+                            <div className="subtitle darkpool-muted" style={{ margin: '2px 0' }}>By SPY trend</div>
+                            <TailStrip buckets={b} />
+                          </div>) : null;
+                        })()}
+                      </div>
+                    )}
+                    {s.by_season && Object.keys(s.by_season).length > 0 && (
+                      <div className="study-detail-section">
+                        <h4>By Season</h4>
+                        {['NOV_APR','MAY_OCT'].map(t => s.by_season[t] && (
+                          <div key={t} className="study-sector-row">
+                            <span className={t === 'NOV_APR' ? 'good' : 'neutral'}>{t.replace('_','-')}</span>
+                            : {s.by_season[t].avg_return > 0 ? '+' : ''}{s.by_season[t].avg_return.toFixed(3)}% ({s.by_season[t].trades} trades, {s.by_season[t].win_rate}% wr)
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="study-trades">
+                    <h4>All Trades</h4>
+                    {tradesLoading === s.id ? <div className="dim">Loading trades...</div> :
+                     s.id != null && trades[s.id] ? (() => {
+                      const allT = trades[s.id].trades || [];
+                      const sectors = [...new Set(allT.map(t => t.sector || t.etf))].sort();
+                      const _ts = (k, d) => [trades[s.id]?.[k] ?? d, (v) => setTrades(prev => ({ ...prev, [s.id]: { ...prev[s.id], [k]: v } }))];
+                      const [tradeSectorFilter, setTradeSectorFilter] = _ts('_sectorFilter', 'all');
+                      const [tradeSort, setTradeSort] = _ts('_sort', 'entry_date');
+                      const [tradeSortDir, setTradeSortDir] = _ts('_sortDir', 'desc');
+                      const [tradeRegimeFilter, setTradeRegimeFilter] = _ts('_regimeFilter', null);
+                      let filtered = tradeSectorFilter === 'all' ? [...allT] : allT.filter(t => (t.sector || t.etf) === tradeSectorFilter);
+                      if (tradeRegimeFilter) {
+                        const [rk, rv] = tradeRegimeFilter.split(':');
+                        filtered = filtered.filter(t => t[rk] === rv);
+                      }
+                      filtered.sort((a, b) => {
+                        let av = a[tradeSort] ?? a['return_pct'] ?? 0, bv = b[tradeSort] ?? b['return_pct'] ?? 0;
+                        if (typeof av === 'string') return tradeSortDir === 'desc' ? bv.localeCompare(av) : av.localeCompare(bv);
+                        return tradeSortDir === 'desc' ? bv - av : av - bv;
+                      });
+                      const thClick = (col) => { if (tradeSort === col) setTradeSortDir(tradeSortDir === 'desc' ? 'asc' : 'desc'); else { setTradeSort(col); setTradeSortDir('desc'); } };
+                      const thArrow = (col) => tradeSort === col ? (tradeSortDir === 'desc' ? ' ▼' : ' ▲') : '';
+                      return (
+                      <div>
+                        <div className="filters" style={{ marginBottom: 8 }}>
+                          <button className={tradeSectorFilter === 'all' ? 'active' : ''} onClick={() => setTradeSectorFilter('all')}>All ({allT.length})</button>
+                          {sectors.slice(0, 15).map(sec => {
+                            const cnt = allT.filter(t => (t.sector || t.etf) === sec).length;
+                            return <button key={sec} className={tradeSectorFilter === sec ? 'active' : ''} onClick={() => setTradeSectorFilter(sec)}>{sec} ({cnt})</button>;
+                          })}
+                        </div>
+                        <div className="filters" style={{ marginBottom: 8, flexWrap: 'wrap' }}>
+                          <span className="dim" style={{ fontSize: 11 }}>Regime:</span>
+                          {[
+                            ['regime:LOW','Rates Low'],['regime:MEDIUM','Rates Med'],['regime:HIGH','Rates High'],
+                            null,
+                            ['curve:NORMAL','Normal'],['curve:INVERTED','Inverted'],
+                            null,
+                            ['vix:LOW_VIX','VIX Low'],['vix:MED_VIX','VIX Med'],['vix:HIGH_VIX','VIX High'],
+                            null,
+                            ['spy:BULL','Bull'],['spy:BEAR','Bear'],
+                            null,
+                            ['season:NOV_APR','Nov-Apr'],['season:MAY_OCT','May-Oct'],
+                          ].map((item, i) => item === null ? <span key={i} className="filter-sep">|</span> :
+                            <button key={item[0]} className={tradeRegimeFilter === item[0] ? 'active' : ''} onClick={() => setTradeRegimeFilter(tradeRegimeFilter === item[0] ? null : item[0])} style={{ fontSize: 11, padding: '3px 8px' }}>{item[1]}</button>
+                          )}
+                          {tradeRegimeFilter && <button onClick={() => setTradeRegimeFilter(null)} style={{ fontSize: 11, padding: '3px 8px', color: 'var(--red)' }}>Clear</button>}
+                        </div>
+                        <div className="trades-table-wrap">
+                        <table className="trades-table">
+                          <thead><tr>
+                            {[['entry_date','Date'],['sector','Sector'],['etf','ETF'],['entry_price','Entry'],['exit_price','Exit'],['exit_date','Exit Date'],['return_pct','Return'],['spy_ret','SPY'],['alpha','Alpha'],['hold_days','Hold'],['max_drawdown','DD'],['peak_day','Peak'],['peak_ret','Peak Ret'],['ret_90d','90d']].map(([k,l]) => (
+                              <th key={k} className="sortable" onClick={() => thClick(k)}><Term k={TH_KEY[k]}>{l}</Term>{thArrow(k)}</th>
+                            ))}
+                            <th></th>
+                          </tr></thead>
+                          <tbody>
+                            {filtered.map((t, ti) => {
+                              const ret = t.return ?? t.return_pct ?? 0;
+                              return (
+                              <tr key={ti} className={ret > 0 ? 'row-bullish' : 'row-bearish'}>
+                                <td>{t.entry_date}</td>
+                                <td>{t.sector}</td>
+                                <td className="etf">{t.etf}</td>
+                                <td>${t.entry_price?.toFixed(2)}</td>
+                                <td>${t.exit_price?.toFixed(2)}</td>
+                                <td>{t.exit_date}</td>
+                                <td className={t.ongoing ? 'neutral' : ret > 0 ? 'good' : 'bad'}>{t.ongoing ? 'OPEN ' : ''}{ret > 0 ? '+' : ''}{ret.toFixed(2)}%</td>
+                                <td className={t.spy_ret > 0 ? 'good' : t.spy_ret < 0 ? 'bad' : 'dim'}>{t.spy_ret != null ? `${t.spy_ret > 0 ? '+' : ''}${t.spy_ret.toFixed(1)}%` : '-'}</td>
+                                <td className={t.alpha > 0 ? 'good' : t.alpha < 0 ? 'bad' : 'dim'} style={{ fontWeight: 600 }}>{t.alpha != null ? `${t.alpha > 0 ? '+' : ''}${t.alpha.toFixed(1)}%` : '-'}</td>
+                                <td className="dim">{t.hold_days}d</td>
+                                <td className="bad">{t.max_drawdown != null ? `${t.max_drawdown.toFixed(1)}%` : '-'}</td>
+                                <td className="dim">{t.peak_day != null ? `d${t.peak_day}` : '-'}</td>
+                                <td className={t.peak_ret > 0 ? 'good' : 'dim'}>{t.peak_ret != null ? `+${t.peak_ret.toFixed(1)}%` : '-'}</td>
+                                <td className={t.ret_90d > 0 ? 'good' : t.ret_90d < 0 ? 'bad' : 'dim'}>{t.ret_90d != null ? `${t.ret_90d > 0 ? '+' : ''}${t.ret_90d.toFixed(1)}%` : '-'}</td>
+                                <td><button className="chart-link" onClick={() => { const sec = t.etf || t.sector; onChart(s, sec); }}>chart</button></td>
+                              </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                        {(() => {
+                          const closed = filtered.filter(t => !t.ongoing);
+                          const open = filtered.length - closed.length;
+                          const wins = closed.filter(t => (t.return_pct ?? t.return ?? 0) > 0).length;
+                          const avgRet = closed.length > 0 ? closed.reduce((s2, t) => s2 + (t.return_pct ?? t.return ?? 0), 0) / closed.length : 0;
+                          return <div className="dim" style={{ padding: 8 }}>
+                            {closed.length} closed trades | {wins} wins ({closed.length > 0 ? (wins/closed.length*100).toFixed(1) : 0}% WR) | Avg: {avgRet > 0 ? '+' : ''}{avgRet.toFixed(2)}%
+                            {open > 0 && <span className="neutral"> | {open} ongoing</span>}
+                          </div>;
+                        })()}
+                        </div>
+                      </div>
+                      );
+                    })() : <div className="dim">Expand to load trades.</div>}
+                  </div>
+                </td>
+              </tr>
+            )}
+          </React.Fragment>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function StudiesPage() {
-  const [regime, setRegime] = useState(null);
   const [search, setSearch] = useState('');
   const [dsearch, setDsearch] = useState('');          // debounced -> server query
   const [catFilter, setCatFilter] = useState('all');
-  const [sortBy, setSortBy] = useState('avg_return');
-  const [sortDir, setSortDir] = useState('desc');
-  const [expanded, setExpanded] = useState(null);
-  const [trades, setTrades] = useState({});
-  const [tradesLoading, setTradesLoading] = useState(null);
-  const [studyDetail, setStudyDetail] = useState(null);
-  const [signalFilter, setSignalFilter] = useState(null);
-  const [signalFilterName, setSignalFilterName] = useState(null);
-  const [exitFilter, setExitFilter] = useState(null);
-  const [exitFilterName, setExitFilterName] = useState(null);
   const [regimeFilter, setRegimeFilter] = useState(null);
+  const [regime, setRegime] = useState(null);
+
+  const [grouped, setGrouped] = useState([]);
+  const [meta, setMeta] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const [expandedSignal, setExpandedSignal] = useState(null);
+  const [exitRows, setExitRows] = useState({});        // {signal: [exit rows]}
+  const [exitLoading, setExitLoading] = useState(null);
+  const [exitErr, setExitErr] = useState({});          // {signal: message}
+  const [studyDetail, setStudyDetail] = useState(null);
 
   // Debounce the search box so a keystroke doesn't re-query the server on every character.
   useEffect(() => { const t = setTimeout(() => setDsearch(search), 300); return () => clearTimeout(t); }, [search]);
 
-  // All filtering + sorting now happens server-side (the table is 25k+ rows); the page pulls one
-  // page at a time and appends on scroll. Changing any of these params refetches from offset 0.
-  const params = React.useMemo(() => ({
-    ordering: sortBy, dir: sortDir, search: dsearch,
+  // Grouped fetch: ONE row per signal (~375 rows, no pagination). Refetches when the
+  // debounced search / category / regime filter change (keyed off the serialized params).
+  const paramsKey = React.useMemo(() => JSON.stringify({
+    search: dsearch,
     category: catFilter === 'all' ? '' : catFilter,
-    signal: signalFilter || '', exit: exitFilter || '', regime: regimeFilter || '',
-  }), [sortBy, sortDir, dsearch, catFilter, signalFilter, exitFilter, regimeFilter]);
-  const { rows, meta, loading, error, hasMore, loadMore } = usePagedList('/studies', params);
+    regime: regimeFilter || '',
+  }), [dsearch, catFilter, regimeFilter]);
+
+  useEffect(() => {
+    let live = true;
+    setLoading(true); setError(null);
+    const p = JSON.parse(paramsKey);
+    const qs = new URLSearchParams({ group: 'signal' });
+    Object.entries(p).forEach(([k, v]) => { if (v) qs.set(k, v); });
+    apiFetch(`/studies?${qs.toString()}`)
+      .then(d => { if (!live) return; setGrouped(d.grouped || []); setMeta(d); setLoading(false); })
+      .catch(e => { if (live) { setError(e.message || 'Failed to load.'); setLoading(false); } });
+    return () => { live = false; };
+  }, [paramsKey]);
 
   useEffect(() => { fetch(`${API}/regime`).then(r => r.json()).then(setRegime).catch(() => {}); }, []);
 
-  // Deep link to a specific study chart (#/study/<signal>/<exit>/<sector>): fetch just that study
-  // (the full list is no longer in memory to search).
+  // Deep link to a specific study chart (#/study/<signal>/<exit>/<sector>): fetch just that study.
   useEffect(() => {
     const init = parseHash();
     if (init.view === 'study_chart' && init.signal && init.exit) {
@@ -1421,31 +1689,55 @@ function StudiesPage() {
     }
   }, []);
 
+  // Open the chart for a given exit row (optionally scoped to a sector). Parent owns navigation.
+  const openChart = useCallback((row, sector) => {
+    const sec = sector || row.best_sectors?.[0]?.sector || '';
+    navigate(sec ? `/study/${encodeURIComponent(row.signal)}/${encodeURIComponent(row.exit)}/${encodeURIComponent(sec)}`
+                 : `/study/${encodeURIComponent(row.signal)}/${encodeURIComponent(row.exit)}`);
+    setStudyDetail({ ...row, chartSector: sec });
+  }, []);
+
+  // Lazily load a signal's exit ladder on first expand; cache per signal.
+  const toggleSignal = useCallback((g) => {
+    setExpandedSignal(prev => {
+      const next = prev === g.signal ? null : g.signal;
+      if (next && !exitRows[g.signal] && exitLoading !== g.signal) {
+        setExitLoading(g.signal);
+        setExitErr(prev2 => { const n = { ...prev2 }; delete n[g.signal]; return n; });
+        apiFetch(`/studies?paginate=1&page_size=100&signal=${encodeURIComponent(g.signal)}&ordering=avg_return&dir=desc`)
+          .then(d => { setExitRows(prev2 => ({ ...prev2, [g.signal]: d.results || [] })); setExitLoading(null); })
+          .catch(e => { setExitErr(prev2 => ({ ...prev2, [g.signal]: e.message || 'Failed to load exits.' })); setExitLoading(null); });
+      }
+      return next;
+    });
+  }, [exitRows, exitLoading]);
+
+  // Sortable grouped table. Nested best.* columns use accessors.
+  const accessors = React.useMemo(() => ({
+    best_exit: g => g.best?.exit_name,
+    best_avg: g => g.best?.avg_return,
+    best_wr: g => g.best?.win_rate,
+    best_t: g => g.best?.t_stat,
+    range: g => g.max_ret,
+  }), []);
+  const sort = useSortedRows(grouped, 'best_avg', 'desc', accessors);
+
   if (studyDetail) {
     return <StudyChartView study={studyDetail} onBack={() => setStudyDetail(null)} />;
   }
-  if (error && !rows.length) return <div className="studies-page"><ErrorBanner message={error} /></div>;
-  if (loading && !rows.length) return <div className="loading">Loading studies...</div>;
+  if (error && !grouped.length) return <div className="studies-page"><ErrorBanner message={error} /></div>;
+  if (loading && !grouped.length) return <div className="loading">Loading studies...</div>;
 
   const categories = meta.categories || [];
-
-  // Server already filtered + sorted. When a regime filter is active, surface that bucket's stats
-  // for display (each row still carries the full by_regime/by_curve/… JSON).
-  let filtered = rows;
-  if (regimeFilter) {
-    const [rType, rKey] = regimeFilter.split(':');
-    filtered = rows.map(s => {
-      const rd = s[rType]?.[rKey];
-      return rd ? { ...s, _regime_return: rd.avg_return, _regime_wr: rd.win_rate, _regime_trades: rd.trades } : s;
-    });
-  }
+  const totalSignals = meta.total_signals ?? grouped.length;
+  const GROUP_COLS = 10;
 
   return (
     <div className="studies-page">
-      <h1>Indicator Studies <span className="dim">({rows.length.toLocaleString()} of {(meta.total ?? 0).toLocaleString()})</span>
+      <h1>Indicator Studies <span className="dim">({totalSignals.toLocaleString()} signals)</span>
         <LastUpdatedChip value={meta.last_updated} />
       </h1>
-      <p className="subtitle">{(meta.total ?? 0).toLocaleString()} studies matching, across all sector ETFs (5y daily backtest). Sorted & filtered server-side; scroll to load more.</p>
+      <p className="subtitle">One row per signal across all sector ETFs (5y daily backtest). Expand a signal to see its exit ladder; sort either level by any column.</p>
 
       {regime && (
         <div className="regime-bar">
@@ -1460,27 +1752,13 @@ function StudiesPage() {
       <div className="studies-controls">
         <input className="studies-search" type="text" placeholder="Search studies..." value={search} onChange={e => setSearch(e.target.value)} />
         <div className="filters">
-          <button className={catFilter === 'all' ? 'active' : ''} onClick={() => { setCatFilter('all'); setSignalFilter(null); }}>All</button>
+          <button className={catFilter === 'all' ? 'active' : ''} onClick={() => setCatFilter('all')}>All</button>
           {categories.map(c => (
-            <button key={c} className={catFilter === c ? 'active' : ''} onClick={() => { setCatFilter(c); setSignalFilter(null); }}>{c}</button>
+            <button key={c} className={catFilter === c ? 'active' : ''} onClick={() => setCatFilter(c)}>{c}</button>
           ))}
         </div>
-        {(signalFilter || exitFilter) && (
-          <div className="filters">
-            {signalFilter && <>
-              <span className="dim">Signal: </span>
-              <button className="active">{signalFilterName || signalFilter}</button>
-              <button onClick={() => { setSignalFilter(null); setSignalFilterName(null); }}>x</button>
-            </>}
-            {exitFilter && <>
-              <span className="dim" style={{marginLeft: signalFilter ? 8 : 0}}>Exit: </span>
-              <button className="active">{exitFilterName || exitFilter}</button>
-              <button onClick={() => { setExitFilter(null); setExitFilterName(null); }}>x</button>
-            </>}
-          </div>
-        )}
-        <div className="filters" style={{flexWrap:'wrap'}}>
-          <span className="dim" style={{fontSize:11}}>Regime:</span>
+        <div className="filters" style={{ flexWrap: 'wrap' }}>
+          <span className="dim" style={{ fontSize: 11 }}>Regime:</span>
           {[
             ['by_regime:LOW','Rates: Low'],['by_regime:MEDIUM','Rates: Med'],['by_regime:HIGH','Rates: High'],
             null,
@@ -1492,261 +1770,64 @@ function StudiesPage() {
             null,
             ['by_season:NOV_APR','Nov-Apr'],['by_season:MAY_OCT','May-Oct'],
           ].map((item, i) => item === null ? <span key={i} className="filter-sep">|</span> :
-            <button key={item[0]} className={regimeFilter === item[0] ? 'active' : ''} onClick={() => setRegimeFilter(regimeFilter === item[0] ? null : item[0])} style={{fontSize:11,padding:'3px 8px'}}>{item[1]}</button>
+            <button key={item[0]} className={regimeFilter === item[0] ? 'active' : ''} onClick={() => setRegimeFilter(regimeFilter === item[0] ? null : item[0])} style={{ fontSize: 11, padding: '3px 8px' }}>{item[1]}</button>
           )}
-          {regimeFilter && <button onClick={() => setRegimeFilter(null)} style={{fontSize:11,padding:'3px 8px',color:'var(--red)'}}>Clear</button>}
+          {regimeFilter && <button onClick={() => setRegimeFilter(null)} style={{ fontSize: 11, padding: '3px 8px', color: 'var(--red)' }}>Clear</button>}
         </div>
       </div>
 
       <table>
         <thead>
           <tr>
-            {[['id','#'],['name','Study'],['category','Cat'],['exit_name','Exit'],['total_trades','Trades'],['t_stat','Sig (t)'],['avg_return','Avg Ret'],['win_rate','Win%'],['avg_hold','Avg Hold'],['avg_mae','Avg Dip'],['clean_pct','Clean%'],['peak_day','Peak'],['peak_avg','Avg Peak'],['ret_90d','Avg 90d'],['best_peak_ret','Max Tr Peak'],['best_ret_90d','P90 90d']].map(([k,l]) => (
-              <th key={k} className="sortable" onClick={() => { if (sortBy === k) setSortDir(d => d === 'desc' ? 'asc' : 'desc'); else { setSortBy(k); setSortDir('desc'); } }}>
-                <Term k={TH_KEY[k]}>{l}</Term> {sortBy === k ? (sortDir === 'desc' ? '\u25BC' : '\u25B2') : ''}
-              </th>
-            ))}
-            <th><Term k="best">Best</Term></th>
+            <th style={{ width: 18 }}></th>
+            <SortTh label="Signal" colKey="signal_name" sort={sort}><Term k="signal">Signal</Term></SortTh>
+            <SortTh label="Cat" colKey="category" sort={sort}><Term k="category">Cat</Term></SortTh>
+            <SortTh label="# Exits" colKey="n_exits" sort={sort}><Term k="exit"># Exits</Term></SortTh>
+            <SortTh label="Profitable" colKey="profitable" sort={sort} title="Exits with a positive average return">Profitable</SortTh>
+            <SortTh label="Best exit" colKey="best_exit" sort={sort}><Term k="exit">Best exit</Term></SortTh>
+            <SortTh label="Best Avg Ret" colKey="best_avg" sort={sort}><Term k="avgreturn">Best Avg Ret</Term></SortTh>
+            <SortTh label="Win%" colKey="best_wr" sort={sort}><Term k="winrate">Win%</Term></SortTh>
+            <SortTh label="Sig t" colKey="best_t" sort={sort}><Term k="sig">Sig t</Term></SortTh>
+            <SortTh label="Range" colKey="range" sort={sort} title="Min..max average return across this signal's exits">Range</SortTh>
           </tr>
         </thead>
         <tbody>
-          {filtered.map(s => (
-            <React.Fragment key={s.id}>
-              <tr className={s.avg_return > 0 ? 'row-bullish' : 'row-bearish'} onClick={() => {
-                const newId = expanded === s.id ? null : s.id;
-                setExpanded(newId);
-                if (newId && !trades[newId]) {
-                  setTradesLoading(newId);
-                  fetch(`${API}/studies/${newId}/trades?signal=${encodeURIComponent(s.signal)}&exit=${encodeURIComponent(s.exit)}`)
-                    .then(r => r.json())
-                    .then(d => { setTrades(prev => ({...prev, [newId]: d})); setTradesLoading(null); })
-                    .catch(() => setTradesLoading(null));
-                }
-              }} style={{cursor:'pointer'}}>
-                <td className="dim">{s.id}</td>
-                <td className="clickable" onClick={e => { e.stopPropagation(); setSignalFilter(s.signal); setSignalFilterName(s.signal_name); }}>{s.signal_name} <span className="dim" style={{fontSize:10}}>(D)</span></td>
-                <td><span className="study-cat">{s.category}</span></td>
-                <td className="clickable dim" onClick={e => { e.stopPropagation(); setExitFilter(s.exit); setExitFilterName(s.exit_name); }}>{s.exit_name}</td>
-                <td>{(s._regime_trades ?? s.total_trades).toLocaleString()}</td>
-                <td className={s.t_stat == null ? 'dim' : Math.abs(s.t_stat) >= 2 ? 'good' : Math.abs(s.t_stat) < 1 ? 'bad' : ''}
-                    title={s.eff_trades != null ? `${s.eff_trades.toLocaleString()} independent (overlap-deduped) trades` : ''}>
-                  {s.t_stat != null ? s.t_stat.toFixed(1) : '-'}</td>
-                <td className={(s._regime_return ?? s.avg_return) > 0 ? 'good' : 'bad'}>{(s._regime_return ?? s.avg_return) > 0 ? '+' : ''}{(s._regime_return ?? s.avg_return).toFixed(3)}%</td>
-                <td className={(s._regime_wr ?? s.win_rate) > 55 ? 'good' : (s._regime_wr ?? s.win_rate) < 45 ? 'bad' : ''}>{(s._regime_wr ?? s.win_rate).toFixed(1)}%</td>
-                <td className="dim">{s.avg_hold?.toFixed(0) || '-'}d</td>
-                <td className={s.avg_mae == null ? 'dim' : s.avg_mae >= -3 ? 'good' : s.avg_mae >= -8 ? '' : 'bad'}>{s.avg_mae != null ? `${s.avg_mae.toFixed(1)}%` : '-'}</td>
-                <td className={s.clean_pct == null ? 'dim' : s.clean_pct >= 40 ? 'good' : s.clean_pct < 20 ? 'bad' : ''}>{s.clean_pct != null ? `${s.clean_pct.toFixed(0)}%` : '-'}</td>
-                <td className="good">{s.peak_day ? `d${s.peak_day}` : '-'}</td>
-                <td className={s.peak_avg > 0 ? 'good' : 'bad'}>{s.peak_avg ? `${s.peak_avg > 0 ? '+' : ''}${s.peak_avg.toFixed(2)}%` : '-'}</td>
-                <td className={s.ret_90d > 0 ? 'good' : 'bad'}>{s.ret_90d != null ? `${s.ret_90d > 0 ? '+' : ''}${s.ret_90d.toFixed(2)}%` : '-'}</td>
-                <td className={s.best_peak_ret > 0 ? 'good' : 'dim'}>{s.best_peak_ret != null ? `+${s.best_peak_ret.toFixed(1)}%` : '-'}</td>
-                <td className={s.best_ret_90d > 0 ? 'good' : 'dim'}>{s.best_ret_90d != null ? `${s.best_ret_90d > 0 ? '+' : ''}${s.best_ret_90d.toFixed(1)}%` : '-'}</td>
-                <td className="dim">{s.best_sectors?.[0]?.sector || '-'}</td>
+          {sort.rows.map(g => {
+            const best = g.best || {};
+            const isOpen = expandedSignal === g.signal;
+            return (
+            <React.Fragment key={g.signal}>
+              <tr className={best.avg_return > 0 ? 'row-bullish' : 'row-bearish'} style={{ cursor: 'pointer' }} onClick={() => toggleSignal(g)}>
+                <td className="dim">{isOpen ? '▾' : '▸'}</td>
+                <td>{g.signal_name} <span className="dim" style={{ fontSize: 10 }}>(D)</span></td>
+                <td><span className="study-cat">{g.category}</span></td>
+                <td>{g.n_exits}</td>
+                <td className={g.profitable > 0 ? 'good' : 'dim'}>{g.profitable}/{g.n_exits}</td>
+                <td className="dim">{best.exit_name || '-'}</td>
+                <td className={best.avg_return > 0 ? 'good' : 'bad'}>{best.avg_return != null ? `${best.avg_return > 0 ? '+' : ''}${best.avg_return.toFixed(3)}%` : '-'}</td>
+                <td className={best.win_rate > 55 ? 'good' : best.win_rate < 45 ? 'bad' : ''}>{best.win_rate != null ? `${best.win_rate.toFixed(1)}%` : '-'}</td>
+                <td className={best.t_stat == null ? 'dim' : Math.abs(best.t_stat) >= 2 ? 'good' : Math.abs(best.t_stat) < 1 ? 'bad' : ''}>{best.t_stat != null ? best.t_stat.toFixed(1) : '-'}</td>
+                <td className="dim">{g.min_ret != null && g.max_ret != null ? `${g.min_ret > 0 ? '+' : ''}${g.min_ret.toFixed(1)}..${g.max_ret > 0 ? '+' : ''}${g.max_ret.toFixed(1)}%` : '-'}</td>
               </tr>
-              {expanded === s.id && (
+              {isOpen && (
                 <tr className="study-detail-row">
-                  <td colSpan={17}>
-                    <div className="study-detail">
-                      <div className="study-detail-section">
-                        <h4>Best Sectors</h4>
-                        {s.best_sectors?.map(b => (
-                          <div key={b.sector} className="study-sector-row good">{b.sector}: {b.avg_return > 0 ? '+' : ''}{b.avg_return.toFixed(3)}% ({b.trades} trades, {b.win_rate.toFixed(0)}% wr)</div>
-                        ))}
-                      </div>
-                      <div className="study-detail-section">
-                        <h4>Worst Sectors</h4>
-                        {s.worst_sectors?.map(b => (
-                          <div key={b.sector} className="study-sector-row bad">{b.sector}: {b.avg_return > 0 ? '+' : ''}{b.avg_return.toFixed(3)}% ({b.trades} trades, {b.win_rate.toFixed(0)}% wr)</div>
-                        ))}
-                      </div>
-                      <div className="study-detail-section" style={{minWidth:'100%'}}>
-                        <h4>Strategy</h4>
-                        <div style={{fontSize:13,marginBottom:4}}>
-                          <b>Buy</b> when <span className="good">{s.signal_name}</span> triggers on the daily chart.
-                          <b> Sell</b> when <span className="bad">{s.exit_name}</span>.
-                          {s.avg_hold ? ` Average hold: ${s.avg_hold.toFixed(0)} days.` : ''}
-                          {s.ret_90d != null ? ` If held 90 days instead: ${s.ret_90d > 0 ? '+' : ''}${s.ret_90d.toFixed(2)}%.` : ''}
-                          {s.peak_day ? ` Optimal exit: day ${s.peak_day} (${s.peak_avg > 0 ? '+' : ''}${s.peak_avg?.toFixed(2)}%).` : ''}
-                        </div>
-                        <div className="dim">{s.sector_count || '?'} sectors | {s.total_trades?.toLocaleString()} trades</div>
-                      </div>
-                      {s.by_regime && Object.keys(s.by_regime).length > 0 && (
-                        <div className="study-detail-section">
-                          <h4>By Rate Regime</h4>
-                          {['LOW','MEDIUM','HIGH'].map(r => s.by_regime[r] && (
-                            <div key={r} className="study-sector-row">
-                              <span className={r === 'LOW' ? 'good' : r === 'HIGH' ? 'bad' : 'neutral'}>{r}</span>
-                              : {s.by_regime[r].avg_return > 0 ? '+' : ''}{s.by_regime[r].avg_return.toFixed(3)}% ({s.by_regime[r].trades} trades, {s.by_regime[r].win_rate}% wr)
-                            </div>
-                          ))}
-                          {(() => {
-                            const b = ['LOW','MEDIUM','HIGH'].filter(r => s.by_regime[r]).map(r => ({ label: r, value: s.by_regime[r].avg_return, n: s.by_regime[r].trades }));
-                            return b.length >= 2 ? (<div style={{maxWidth:260,marginTop:4}}>
-                              <div className="subtitle darkpool-muted" style={{margin:'2px 0'}}>By rate regime</div>
-                              <TailStrip buckets={b} />
-                            </div>) : null;
-                          })()}
-                        </div>
-                      )}
-                      {s.by_curve && Object.keys(s.by_curve).length > 0 && (
-                        <div className="study-detail-section">
-                          <h4>By Yield Curve</h4>
-                          {['NORMAL','INVERTED'].map(c => s.by_curve[c] && (
-                            <div key={c} className="study-sector-row">
-                              <span className={c === 'NORMAL' ? 'good' : 'bad'}>{c}</span>
-                              : {s.by_curve[c].avg_return > 0 ? '+' : ''}{s.by_curve[c].avg_return.toFixed(3)}% ({s.by_curve[c].trades} trades, {s.by_curve[c].win_rate}% wr)
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      {s.by_vix && Object.keys(s.by_vix).length > 0 && (
-                        <div className="study-detail-section">
-                          <h4>By VIX Level</h4>
-                          {['LOW_VIX','MED_VIX','HIGH_VIX'].map(v => s.by_vix[v] && (
-                            <div key={v} className="study-sector-row">
-                              <span className={v === 'LOW_VIX' ? 'good' : v === 'HIGH_VIX' ? 'bad' : 'neutral'}>{v.replace('_',' ')}</span>
-                              : {s.by_vix[v].avg_return > 0 ? '+' : ''}{s.by_vix[v].avg_return.toFixed(3)}% ({s.by_vix[v].trades} trades, {s.by_vix[v].win_rate}% wr)
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      {s.by_spy_trend && Object.keys(s.by_spy_trend).length > 0 && (
-                        <div className="study-detail-section">
-                          <h4>By SPY Trend</h4>
-                          {['BULL','BEAR'].map(t => s.by_spy_trend[t] && (
-                            <div key={t} className="study-sector-row">
-                              <span className={t === 'BULL' ? 'good' : 'bad'}>{t}</span>
-                              : {s.by_spy_trend[t].avg_return > 0 ? '+' : ''}{s.by_spy_trend[t].avg_return.toFixed(3)}% ({s.by_spy_trend[t].trades} trades, {s.by_spy_trend[t].win_rate}% wr)
-                            </div>
-                          ))}
-                          {(() => {
-                            const b = ['BULL','BEAR'].filter(t => s.by_spy_trend[t]).map(t => ({ label: t, value: s.by_spy_trend[t].avg_return, n: s.by_spy_trend[t].trades }));
-                            return b.length >= 2 ? (<div style={{maxWidth:200,marginTop:4}}>
-                              <div className="subtitle darkpool-muted" style={{margin:'2px 0'}}>By SPY trend</div>
-                              <TailStrip buckets={b} />
-                            </div>) : null;
-                          })()}
-                        </div>
-                      )}
-                      {s.by_season && Object.keys(s.by_season).length > 0 && (
-                        <div className="study-detail-section">
-                          <h4>By Season</h4>
-                          {['NOV_APR','MAY_OCT'].map(t => s.by_season[t] && (
-                            <div key={t} className="study-sector-row">
-                              <span className={t === 'NOV_APR' ? 'good' : 'neutral'}>{t.replace('_','-')}</span>
-                              : {s.by_season[t].avg_return > 0 ? '+' : ''}{s.by_season[t].avg_return.toFixed(3)}% ({s.by_season[t].trades} trades, {s.by_season[t].win_rate}% wr)
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                    <div className="study-trades">
-                      <h4>All Trades</h4>
-                      {tradesLoading === s.id ? <div className="dim">Loading trades...</div> :
-                       trades[s.id] ? (() => {
-                        const allT = trades[s.id].trades || [];
-                        const sectors = [...new Set(allT.map(t => t.sector || t.etf))].sort();
-                        const _ts = (k, d) => [trades[s.id]?.[k] ?? d, (v) => setTrades(prev => ({...prev, [s.id]: {...prev[s.id], [k]: v}}))];
-                        const [tradeSectorFilter, setTradeSectorFilter] = _ts('_sectorFilter', 'all');
-                        const [tradeSort, setTradeSort] = _ts('_sort', 'entry_date');
-                        const [tradeSortDir, setTradeSortDir] = _ts('_sortDir', 'desc');
-                        const [tradeRegimeFilter, setTradeRegimeFilter] = _ts('_regimeFilter', null);
-                        let filtered = tradeSectorFilter === 'all' ? [...allT] : allT.filter(t => (t.sector || t.etf) === tradeSectorFilter);
-                        if (tradeRegimeFilter) {
-                          const [rk, rv] = tradeRegimeFilter.split(':');
-                          filtered = filtered.filter(t => t[rk] === rv);
-                        }
-                        filtered.sort((a, b) => {
-                          let av = a[tradeSort] ?? a['return_pct'] ?? 0, bv = b[tradeSort] ?? b['return_pct'] ?? 0;
-                          if (typeof av === 'string') return tradeSortDir === 'desc' ? bv.localeCompare(av) : av.localeCompare(bv);
-                          return tradeSortDir === 'desc' ? bv - av : av - bv;
-                        });
-                        const thClick = (col) => { if (tradeSort === col) setTradeSortDir(tradeSortDir === 'desc' ? 'asc' : 'desc'); else { setTradeSort(col); setTradeSortDir('desc'); } };
-                        const thArrow = (col) => tradeSort === col ? (tradeSortDir === 'desc' ? ' \u25BC' : ' \u25B2') : '';
-                        return (
-                        <div>
-                          <div className="filters" style={{marginBottom:8}}>
-                            <button className={tradeSectorFilter === 'all' ? 'active' : ''} onClick={() => setTradeSectorFilter('all')}>All ({allT.length})</button>
-                            {sectors.slice(0, 15).map(sec => {
-                              const cnt = allT.filter(t => (t.sector || t.etf) === sec).length;
-                              return <button key={sec} className={tradeSectorFilter === sec ? 'active' : ''} onClick={() => setTradeSectorFilter(sec)}>{sec} ({cnt})</button>;
-                            })}
-                          </div>
-                          <div className="filters" style={{marginBottom:8,flexWrap:'wrap'}}>
-                            <span className="dim" style={{fontSize:11}}>Regime:</span>
-                            {[
-                              ['regime:LOW','Rates Low'],['regime:MEDIUM','Rates Med'],['regime:HIGH','Rates High'],
-                              null,
-                              ['curve:NORMAL','Normal'],['curve:INVERTED','Inverted'],
-                              null,
-                              ['vix:LOW_VIX','VIX Low'],['vix:MED_VIX','VIX Med'],['vix:HIGH_VIX','VIX High'],
-                              null,
-                              ['spy:BULL','Bull'],['spy:BEAR','Bear'],
-                              null,
-                              ['season:NOV_APR','Nov-Apr'],['season:MAY_OCT','May-Oct'],
-                            ].map((item, i) => item === null ? <span key={i} className="filter-sep">|</span> :
-                              <button key={item[0]} className={tradeRegimeFilter === item[0] ? 'active' : ''} onClick={() => setTradeRegimeFilter(tradeRegimeFilter === item[0] ? null : item[0])} style={{fontSize:11,padding:'3px 8px'}}>{item[1]}</button>
-                            )}
-                            {tradeRegimeFilter && <button onClick={() => setTradeRegimeFilter(null)} style={{fontSize:11,padding:'3px 8px',color:'var(--red)'}}>Clear</button>}
-                          </div>
-                          <div className="trades-table-wrap">
-                          <table className="trades-table">
-                            <thead><tr>
-                              {[['entry_date','Date'],['sector','Sector'],['etf','ETF'],['entry_price','Entry'],['exit_price','Exit'],['exit_date','Exit Date'],['return_pct','Return'],['spy_ret','SPY'],['alpha','Alpha'],['hold_days','Hold'],['max_drawdown','DD'],['peak_day','Peak'],['peak_ret','Peak Ret'],['ret_90d','90d']].map(([k,l]) => (
-                                <th key={k} className="sortable" onClick={() => thClick(k)}><Term k={TH_KEY[k]}>{l}</Term>{thArrow(k)}</th>
-                              ))}
-                              <th></th>
-                            </tr></thead>
-                            <tbody>
-                              {filtered.map((t, ti) => {
-                                const ret = t.return ?? t.return_pct ?? 0;
-                                return (
-                                <tr key={ti} className={ret > 0 ? 'row-bullish' : 'row-bearish'}>
-                                  <td>{t.entry_date}</td>
-                                  <td>{t.sector}</td>
-                                  <td className="etf">{t.etf}</td>
-                                  <td>${t.entry_price?.toFixed(2)}</td>
-                                  <td>${t.exit_price?.toFixed(2)}</td>
-                                  <td>{t.exit_date}</td>
-                                  <td className={t.ongoing ? 'neutral' : ret > 0 ? 'good' : 'bad'}>{t.ongoing ? 'OPEN ' : ''}{ret > 0 ? '+' : ''}{ret.toFixed(2)}%</td>
-                                  <td className={t.spy_ret > 0 ? 'good' : t.spy_ret < 0 ? 'bad' : 'dim'}>{t.spy_ret != null ? `${t.spy_ret > 0 ? '+' : ''}${t.spy_ret.toFixed(1)}%` : '-'}</td>
-                                  <td className={t.alpha > 0 ? 'good' : t.alpha < 0 ? 'bad' : 'dim'} style={{fontWeight:600}}>{t.alpha != null ? `${t.alpha > 0 ? '+' : ''}${t.alpha.toFixed(1)}%` : '-'}</td>
-                                  <td className="dim">{t.hold_days}d</td>
-                                  <td className="bad">{t.max_drawdown != null ? `${t.max_drawdown.toFixed(1)}%` : '-'}</td>
-                                  <td className="dim">{t.peak_day != null ? `d${t.peak_day}` : '-'}</td>
-                                  <td className={t.peak_ret > 0 ? 'good' : 'dim'}>{t.peak_ret != null ? `+${t.peak_ret.toFixed(1)}%` : '-'}</td>
-                                  <td className={t.ret_90d > 0 ? 'good' : t.ret_90d < 0 ? 'bad' : 'dim'}>{t.ret_90d != null ? `${t.ret_90d > 0 ? '+' : ''}${t.ret_90d.toFixed(1)}%` : '-'}</td>
-                                  <td><button className="chart-link" onClick={() => { const sec = t.etf || t.sector; navigate(`/study/${encodeURIComponent(s.signal)}/${encodeURIComponent(s.exit)}/${encodeURIComponent(sec)}`); setStudyDetail({...s, chartSector: sec}); }}>chart</button></td>
-                                </tr>
-                                );
-                              })}
-                            </tbody>
-                          </table>
-                          {(() => {
-                            const closed = filtered.filter(t => !t.ongoing);
-                            const open = filtered.length - closed.length;
-                            const wins = closed.filter(t => (t.return_pct ?? t.return ?? 0) > 0).length;
-                            const avgRet = closed.length > 0 ? closed.reduce((s, t) => s + (t.return_pct ?? t.return ?? 0), 0) / closed.length : 0;
-                            return <div className="dim" style={{padding:8}}>
-                              {closed.length} closed trades | {wins} wins ({closed.length > 0 ? (wins/closed.length*100).toFixed(1) : 0}% WR) | Avg: {avgRet > 0 ? '+' : ''}{avgRet.toFixed(2)}%
-                              {open > 0 && <span className="neutral"> | {open} ongoing</span>}
-                            </div>;
-                          })()}
-                          </div>
-                        </div>
-                        );
-                      })() : null}
-                    </div>
+                  <td colSpan={GROUP_COLS}>
+                    {exitLoading === g.signal ? <div className="dim" style={{ padding: 8 }}>Loading exits...</div> :
+                     exitErr[g.signal] ? <ErrorBanner message={exitErr[g.signal]} /> :
+                     exitRows[g.signal] ? (
+                       exitRows[g.signal].length ?
+                         <StudyExitLadder rows={exitRows[g.signal]} onChart={openChart} /> :
+                         <div className="dim" style={{ padding: 8 }}>No exits for this signal.</div>
+                     ) : <div className="dim" style={{ padding: 8 }}>Expand to load exits.</div>}
                   </td>
                 </tr>
               )}
             </React.Fragment>
-          ))}
+            );
+          })}
         </tbody>
       </table>
-      {hasMore && <ScrollSentinel onVisible={loadMore} disabled={loading} />}
-      {loading && rows.length > 0 && <div className="loading dim" style={{padding:12}}>Loading more…</div>}
-      {!hasMore && rows.length > 0 && <div className="dim" style={{padding:12,textAlign:'center'}}>All {(meta.total ?? rows.length).toLocaleString()} loaded.</div>}
+      {!grouped.length && <div className="dim" style={{ padding: 12, textAlign: 'center' }}>No studies match.</div>}
     </div>
   );
 }
