@@ -7128,6 +7128,217 @@ function SyntheticMaCrossPage() {
   );
 }
 
+// Short-term absolute single-stock oversold-reversal entry. Reads GET /oversold-bounce; POST recomputes.
+// The edge the RS bar LACKS: on absolute price, oversold RSI crosses give positive short-term forward
+// return and deeper oversold pays more (the tail). Shows the entry backtest + a live "just crossed out of
+// oversold, most-oversold-first" firing list.
+function OversoldBouncePage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const firing = (data && data.firing) || [];
+  const sort = useSortedRows(firing, 'min_rsi_7d', 'asc');
+
+  const load = () => apiFetch('/oversold-bounce').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/oversold-bounce`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/oversold-bounce`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading oversold bounce...</div>;
+  if (data.computed === false) {
+    return (
+      <div className="studies-page">
+        <h1>Oversold Bounce</h1>
+        <p className="subtitle">Short-term single-stock oversold-reversal entry.</p>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing (~3-4 min)...' : 'Compute now'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const params = data.params || {};
+  const horizons = params.horizons_days || [1, 3, 5, 10, 21];
+  const sgn = v => v == null ? 'dim' : v > 0 ? 'good' : v < 0 ? 'bad' : 'dim';
+  const p2 = v => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
+  const capFmt = v => v == null ? '–' : v >= 1e9 ? `$${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `$${(v / 1e6).toFixed(0)}M` : `$${(v / 1e3).toFixed(0)}K`;
+
+  return (
+    <div className="studies-page">
+      <h1>Oversold Bounce <LastUpdatedChip value={data.last_updated} /></h1>
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '4px 0 16px' }}>
+        <p style={{ margin: 0 }}>
+          Absolute single-stock <b>oversold-reversal entry</b> across {params.universe_n || '~1000'} stocks —
+          the edge the relative-strength bar <b>lacks</b>. On absolute price, RSI crossing up out of oversold
+          gives positive short-term forward return, and <b>deeper oversold pays more</b> (the tail).
+        </p>
+        <p style={{ margin: '8px 0 0', fontSize: 12 }} className="dim">{data.note}</p>
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Recomputing...' : 'Recompute'}</button>
+        </p>
+      </div>
+
+      <h3 style={{ margin: '0 0 6px' }}>Entry backtest — forward absolute return (mean / %pos / t)</h3>
+      <table className="studies-table">
+        <thead><tr><th style={{ textAlign: 'left' }}>Entry (RSI cross up)</th>{horizons.map(h => <th key={h} style={{ textAlign: 'right' }}>+{h}d</th>)}</tr></thead>
+        <tbody>
+          {(data.by_threshold || []).map(row => (
+            <tr key={row.event} className="study-row">
+              <td>{row.event}</td>
+              {horizons.map(h => {
+                const c = (row.fwd || {})[`${h}d`] || {};
+                return <td key={h} style={{ textAlign: 'right' }} className={sgn(c.mean_pct)} title={`${c.pos_pct}% pos, t${c.t}, n${c.n}`}>{p2(c.mean_pct)}</td>;
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <h3 style={{ margin: '16px 0 6px' }}>The tail — x30 crosses by oversold depth (min RSI, prior 5 bars)</h3>
+      <table className="studies-table">
+        <thead><tr><th style={{ textAlign: 'left' }}>Prior-min RSI</th><th style={{ textAlign: 'right' }}>+5d</th><th style={{ textAlign: 'right' }}>+10d</th><th style={{ textAlign: 'right' }}>n</th></tr></thead>
+        <tbody>
+          {(data.by_depth || []).map(row => (
+            <tr key={row.bucket} className="study-row">
+              <td>{row.bucket}</td>
+              <td style={{ textAlign: 'right' }} className={sgn(row.fwd5?.mean_pct)} title={`${row.fwd5?.pos_pct}% pos, t${row.fwd5?.t}`}>{p2(row.fwd5?.mean_pct)}</td>
+              <td style={{ textAlign: 'right' }} className={sgn(row.fwd10?.mean_pct)} title={`${row.fwd10?.pos_pct}% pos, t${row.fwd10?.t}`}>{p2(row.fwd10?.mean_pct)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{row.fwd5?.n?.toLocaleString?.() ?? '–'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <h3 style={{ margin: '16px 0 6px' }}>Firing now — crossed up out of oversold (most oversold first) <span className="dim" style={{ fontWeight: 400, fontSize: 13 }}>({firing.length})</span></h3>
+      <table className="studies-table">
+        <thead><tr>
+          <SortTh label="Ticker" colKey="ticker" sort={sort} />
+          <SortTh label="Sector" colKey="sectors" sort={sort} />
+          <SortTh label="Min RSI 7d" colKey="min_rsi_7d" sort={sort} align="right" title="How oversold it got — lower = deeper = bigger expected bounce" />
+          <SortTh label="RSI now" colKey="rsi_now" sort={sort} align="right" />
+          <SortTh label="Cross" colKey="threshold" sort={sort} align="right" />
+          <SortTh label="Bars ago" colKey="days_ago" sort={sort} align="right" />
+          <SortTh label="Close" colKey="close" sort={sort} align="right" />
+          <SortTh label="Mkt cap" colKey="market_cap" sort={sort} align="right" />
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(r => (
+            <tr key={r.ticker} className="study-row">
+              <td><b>{r.ticker}</b></td>
+              <td className="dim">{(r.sectors || []).join(', ')}</td>
+              <td style={{ textAlign: 'right' }} className={r.min_rsi_7d < 20 ? 'good' : ''}>{r.min_rsi_7d}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.rsi_now}</td>
+              <td style={{ textAlign: 'right' }} className="dim">x{r.threshold}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.days_ago}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.close}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{capFmt(r.market_cap)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="subtitle" style={{ marginTop: 12 }}>Directional; forward windows, no fees; stock-universe survivorship. Not wired into risk rating.</p>
+    </div>
+  );
+}
+
+// Diversifiers: rank the 93 sleeves by correlation to SPY (low = diversifier), not by return. Reads
+// GET /diversifier. Commodities/bonds don't beat SPY but the uncorrelated ones (Gold the standout) add
+// drawdown control. good_diversifier = corr<0.35 AND positive 5y return.
+function DiversifierPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const rows = (data && data.rows) || [];
+  const sort = useSortedRows(rows, 'corr', 'asc');
+
+  const load = () => apiFetch('/diversifier').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/diversifier`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/diversifier`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading diversifiers...</div>;
+  if (data.computed === false) {
+    return (
+      <div className="studies-page">
+        <h1>Diversifiers</h1>
+        <div className="empty-state" style={{ padding: '40px 0' }}>
+          <p>{data.message || 'Not computed yet.'}</p>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Compute now'}</button>
+        </div>
+      </div>
+    );
+  }
+
+  const s = data.summary || {};
+  const sgn = v => v == null ? 'dim' : v > 0 ? 'good' : v < 0 ? 'bad' : 'dim';
+  const pc = v => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+
+  return (
+    <div className="studies-page">
+      <h1>Diversifiers <LastUpdatedChip value={data.last_updated} /></h1>
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '4px 0 16px' }}>
+        <p style={{ margin: 0 }}>
+          Sleeves ranked by <b>correlation to SPY</b> (low = diversifier), not by return. SPY 5y{' '}
+          <span className="good">{pc(s.spy_5y)}</span>; only <b>{s.n_beat_spy}/{s.n_sleeves}</b> sleeves beat it.
+          Commodities don't reliably beat SPY — their value is being <b>uncorrelated</b> (drawdown control).
+        </p>
+        <p style={{ margin: '8px 0 0' }} className="good">
+          Best diversifiers (corr &lt; {data.params?.lowcorr_threshold ?? 0.35}, positive return): {(s.good_diversifiers || []).join(', ') || '–'}.
+          {' '}<span className="dim">Gold is the standout — beat SPY <b>and</b> corr ~0.15.</span>
+        </p>
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Recomputing...' : 'Recompute'}</button>
+        </p>
+      </div>
+
+      <table className="studies-table">
+        <thead><tr>
+          <SortTh label="Sleeve" colKey="name" sort={sort} />
+          <SortTh label="ETF" colKey="etf" sort={sort} />
+          <SortTh label="5y ret" colKey="ret5y" sort={sort} align="right" />
+          <SortTh label="vs SPY" colKey="vs_spy" sort={sort} align="right" />
+          <SortTh label="Corr SPY" colKey="corr" sort={sort} align="right" title="Daily-return correlation to SPY — lower = better diversifier" />
+          <SortTh label="Beta" colKey="beta" sort={sort} align="right" />
+          <SortTh label="Ann vol" colKey="ann_vol" sort={sort} align="right" />
+          <SortTh label="Diversifier" colKey="good_diversifier" sort={sort} align="right" />
+        </tr></thead>
+        <tbody>
+          {sort.rows.map(r => (
+            <tr key={r.etf} className="study-row" style={r.good_diversifier ? { background: 'rgba(100,255,218,0.06)' } : null}>
+              <td>{r.name}{r.commodity ? <span className="dim" style={{ fontSize: 11 }}> ·comm</span> : ''}</td>
+              <td className="dim">{r.etf}</td>
+              <td style={{ textAlign: 'right' }} className={sgn(r.ret5y)}>{pc(r.ret5y)}</td>
+              <td style={{ textAlign: 'right' }} className={sgn(r.vs_spy)}>{pc(r.vs_spy)}</td>
+              <td style={{ textAlign: 'right' }} className={r.corr < 0.35 ? 'good' : ''}>{r.corr}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.beta}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.ann_vol}%</td>
+              <td style={{ textAlign: 'right' }}>{r.good_diversifier ? <span className="good">✓</span> : ''}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="subtitle" style={{ marginTop: 12 }}>{data.note}</p>
+    </div>
+  );
+}
+
 // NOTE: name kept as parseHash for minimal churn; it now reads window.location.pathname (pretty URLs).
 function parseHash() {
   const h = window.location.pathname;
@@ -7135,6 +7346,8 @@ function parseHash() {
   if (h.startsWith('/live')) return { view: 'live' };
   if (h.startsWith('/alt-data')) return { view: 'altdata' };
   if (h.startsWith('/dark-pool')) return { view: 'darkpool' };
+  if (h.startsWith('/oversold-bounce')) return { view: 'oversoldbounce' };
+  if (h.startsWith('/diversifier')) return { view: 'diversifier' };
   if (h.startsWith('/synthetic-ma-cross')) return { view: 'synthmacross' };
   if (h.startsWith('/rs-methods')) return { view: 'rsmethods' };
   if (h.startsWith('/rotation')) return { view: 'rotationpick' };
@@ -7228,7 +7441,8 @@ export default function App() {
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
                        altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
-                       rsmethods: 'rsmethods', synthmacross: 'synthmacross', volshock: 'volshock' };
+                       rsmethods: 'rsmethods', synthmacross: 'synthmacross', oversoldbounce: 'oversoldbounce',
+                       diversifier: 'diversifier', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
       else if (r.view === 'sector') { setPage('dashboard'); handleSectorClick(r.sector); }
       else if (r.view === 'chart') { setPage('dashboard'); setChartTicker(r.ticker); }
@@ -7348,6 +7562,14 @@ export default function App() {
             <span className="sidebar-icon">&#10005;</span>
             Synthetic MA-Cross
           </li>
+          <li className={`sidebar-item ${page === 'oversoldbounce' ? 'active' : ''}`} onClick={() => { setPage('oversoldbounce'); navigate('/oversold-bounce'); }}>
+            <span className="sidebar-icon">&#8623;</span>
+            Oversold Bounce
+          </li>
+          <li className={`sidebar-item ${page === 'diversifier' ? 'active' : ''}`} onClick={() => { setPage('diversifier'); navigate('/diversifier'); }}>
+            <span className="sidebar-icon">&#9878;</span>
+            Diversifiers
+          </li>
           <li className={`sidebar-item ${page === 'volshock' ? 'active' : ''}`} onClick={() => { setPage('volshock'); navigate('/vol-shock'); }}>
             <span className="sidebar-icon">&#9889;</span>
             Vol-Shock
@@ -7367,7 +7589,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
