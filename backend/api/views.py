@@ -1964,6 +1964,16 @@ class ProfitabilityGuardView(_StudyResultView):
     json_path = "/app/.data/studies/profitability_guard.json"
 
 
+class FactorLabView(_StudyResultView):
+    """Factor Lab: sweep many filters/tilts/combos (profit guard, FCF+, low-debt, gross margin, rev growth,
+    A/D accumulation divergence, small/micro cap, momentum, earnings yield, composite value, inverse-vol
+    weighting, and stacked combos) on the value-pick baseline, ranked to find the best return / risk-adjusted.
+    GET reads BacktestResult[factor_lab]; POST recomputes."""
+    kind = "factor_lab"
+    script = "factor_lab.py"
+    json_path = "/app/.data/studies/factor_lab.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""

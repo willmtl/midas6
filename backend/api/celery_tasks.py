@@ -517,6 +517,20 @@ def run_profitability_guard():
 
 
 @shared_task
+def run_factor_lab():
+    """Weekly: factor-lab sweep (filters/tilts/combos on the value pick, best-return search). Heavy +
+    slow-moving → weekly. → BacktestResult[factor_lab]."""
+    import subprocess, os
+    if not os.path.exists("/app/factor_lab.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/factor_lab.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("factor_lab failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_signal_firing():
     """Nightly: per-signal firing scan (all signals × full universe, last 3 bars) → SignalFiring.
     After candles refresh; powers the grouped Studies 'firing now' column."""

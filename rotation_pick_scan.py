@@ -62,11 +62,13 @@ def build():
         name = name_by_etf.get(etf, etf)
         cands = [(t, funds.get(t, {}).get("pb_ratio")) for t in holds_by_etf[etf]]
         cands = [(t, pb) for t, pb in cands if pb is not None and pb > 0]
-        # drop traps; if that empties the sector, fall back to the unguarded set (don't lose the sector)
+        # Factor Lab winner = guard + low_debt: drop traps, then prefer low-debt (debt/equity<1) names;
+        # layered fallback so a sector is never lost.
         guarded = [(t, pb) for t, pb in cands if not gflags.get(t, {}).get("trap")]
-        use = guarded if guarded else cands
+        lowdebt = [(t, pb) for t, pb in guarded if gflags.get(t, {}).get("low_debt")]
+        use = lowdebt if lowdebt else (guarded if guarded else cands)
         row = {"rank": rank, "sector": name, "etf": etf, "momentum_6m": round(m, 1),
-               "n_candidates": len(cands), "n_after_guard": len(guarded)}
+               "n_candidates": len(cands), "n_after_guard": len(guarded), "n_low_debt": len(lowdebt)}
         if use:
             t, pb = min(use, key=lambda x: x[1])
             f = funds.get(t, {})
@@ -75,6 +77,7 @@ def build():
             row.update({
                 "pick": t, "is_etf_proxy": False, "pb_ratio": round(pb, 2),
                 "guard_status": g.get("status"), "margin_pct": g.get("margin"),
+                "debt_to_equity": g.get("debt_to_equity"),
                 "net_income": g.get("net_income"), "improving": g.get("improving"),
                 "last_close": round(float(dfp["Close"].iloc[-1]), 2) if dfp is not None and len(dfp) else None,
                 "market_cap": f.get("market_cap"), "pe_ratio": f.get("pe_ratio"),

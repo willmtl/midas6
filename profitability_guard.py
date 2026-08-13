@@ -34,11 +34,15 @@ def guard_flags(tickers):
         latest_eq = _f(eq.iloc[-1]) if len(eq) else None
         eq_back = _f(eq.iloc[-5]) if len(eq) >= 5 else (_f(eq.iloc[0]) if len(eq) else None)
         latest_rev = _f(rev.iloc[-1]) if len(rev) else None
+        debt = d["total_debt"].dropna() if "total_debt" in d.columns else []
+        latest_debt = _f(debt.iloc[-1]) if len(debt) else None
 
         profitable = latest_ni is not None and latest_ni > 0
         improving = latest_ni is not None and prior_ni is not None and latest_ni > prior_ni
         book_stable = latest_eq is not None and eq_back is not None and latest_eq >= eq_back
         trap = (latest_ni is not None and latest_ni < 0) and (not book_stable) and (not improving)
+        de = (latest_debt / latest_eq) if (latest_debt is not None and latest_eq and latest_eq > 0) else None
+        low_debt = de is not None and de < 1.0    # Factor Lab: guard+low_debt best all-around (t2.77/Sh1.31)
         if trap:
             status = "trap"
         elif latest_ni is not None and latest_ni < 0 and improving:
@@ -50,5 +54,6 @@ def guard_flags(tickers):
         margin = round(latest_ni / latest_rev * 100, 1) if (latest_ni is not None and latest_rev) else None
         out[t] = {"status": status, "profitable": bool(profitable), "improving": bool(improving),
                   "book_stable": bool(book_stable) if latest_eq is not None else None,
-                  "trap": bool(trap), "net_income": latest_ni, "margin": margin}
+                  "trap": bool(trap), "net_income": latest_ni, "margin": margin,
+                  "debt_to_equity": round(de, 2) if de is not None else None, "low_debt": bool(low_debt)}
     return out

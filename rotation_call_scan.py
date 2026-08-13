@@ -83,11 +83,13 @@ def build():
         cands = [(t, funds.get(t, {}).get("pb_ratio")) for t in holds_by_etf.get(etf, [])]
         cands = [(t, pb) for t, pb in cands if pb is not None and pb > 0]
         guarded = [(t, pb) for t, pb in cands if not gflags.get(t, {}).get("trap")]
-        use = guarded if guarded else cands
+        lowdebt = [(t, pb) for t, pb in guarded if gflags.get(t, {}).get("low_debt")]
+        use = lowdebt if lowdebt else (guarded if guarded else cands)
         row = {"sector": name, "etf": etf,
                "regime_score_pct": r.get("regime_score_pct"),
                "combo_hit_pct": r.get("combo_hit_pct"), "combo_mean_pct": r.get("combo_mean_pct"),
-               "combo_n": r.get("combo_n"), "n_candidates": len(cands), "n_after_guard": len(guarded)}
+               "combo_n": r.get("combo_n"), "n_candidates": len(cands), "n_after_guard": len(guarded),
+               "n_low_debt": len(lowdebt)}
         if use:
             t, pb = min(use, key=lambda x: x[1])
             f = funds.get(t, {})
@@ -99,6 +101,7 @@ def build():
             row.update({
                 "pick": t, "is_etf_proxy": False, "pb_ratio": round(pb, 2),
                 "guard_status": g.get("status"), "margin_pct": g.get("margin"),
+                "debt_to_equity": g.get("debt_to_equity"),
                 "net_income": g.get("net_income"), "improving": g.get("improving"),
                 "last_close": round(last, 2) if last else None,
                 "rsi10": rsi, "entry_state": state_txt, "entry_key": state_key,

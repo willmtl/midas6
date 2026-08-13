@@ -244,4 +244,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_profitability_guard",
         "schedule": crontab(hour=23, minute=55, day_of_week=0),
     },
+    "factor-lab-weekly": {              # factor sweep (best-return search) — Sundays 23:58 UTC
+        "task": "api.celery_tasks.run_factor_lab",
+        "schedule": crontab(hour=23, minute=58, day_of_week=0),
+    },
 }
