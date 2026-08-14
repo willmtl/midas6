@@ -7396,6 +7396,82 @@ function PortfolioBlenderPage() {
   );
 }
 
+// ---- Strategy Lab -----------------------------------------------------------
+// Reads GET /strategy-lab. Can A/B beat C WITHOUT the sector rotation, and do C's rules travel?
+function StrategyLabPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => apiFetch('/strategy-lab').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/strategy-lab`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/strategy-lab`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading strategy lab...</div>;
+
+  const R = data.results || {};
+  const LABEL = {
+    C_ref: 'C — rotation + rules (the engine)', B_pure: 'B pure — dip in uptrend, no rotation',
+    B_value: 'B value — cheap-P/B dips, no rotation', B_quality: "B + C's rules (all quality dips)",
+    B_value_q: "B + cheapest book ratio + low debt + guard", A_pure: 'A pure — capitulation, no rotation',
+    A_quality: "A + C's rules", A_value_q: 'A + cheapest book ratio + low debt + guard',
+  };
+  const order = ['C_ref', 'B_pure', 'B_value', 'B_quality', 'B_value_q', 'A_pure', 'A_quality', 'A_value_q'];
+  const rows = order.filter(k => R[k]).map(k => ({ key: k, ...R[k] }));
+  const pctS = (v) => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+  const c = data.c_ref_vs_spy;
+
+  return (
+    <div className="studies-page">
+      <h1>🔬 Strategy Lab <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle" style={{ marginTop: 2 }}>
+        Can A or B beat C <b>without the sector rotation</b>, and do C's rules travel? Isolates the rotation filter vs the pick rules.
+      </p>
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '8px 0 16px' }}>
+        <p style={{ margin: 0, fontSize: 13 }}>{data.verdict}</p>
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Recompute'}</button>
+        </p>
+      </div>
+      <table className="studies-table">
+        <thead><tr>
+          <th>Strategy</th>
+          <th style={{ textAlign: 'right' }}>vs SPY</th>
+          <th style={{ textAlign: 'right' }}>t</th>
+          <th style={{ textAlign: 'right' }}>Sharpe</th>
+          <th style={{ textAlign: 'right' }}>Max DD</th>
+          <th style={{ textAlign: 'right' }}>Names</th>
+        </tr></thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.key} className="study-row"
+              style={r.key === 'C_ref' ? { background: 'rgba(63,185,80,0.12)' } : (r.vs_spy > c ? { background: 'rgba(88,166,255,0.08)' } : undefined)}>
+              <td><b>{LABEL[r.key] || r.key}</b></td>
+              <td style={{ textAlign: 'right' }} className={r.vs_spy > 0 ? 'good' : 'bad'}>{pctS(r.vs_spy)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.t_stat == null ? '–' : r.t_stat}</td>
+              <td style={{ textAlign: 'right' }}>{r.sharpe}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pctS(r.max_drawdown)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.avg_names}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="subtitle" style={{ marginTop: 12, fontSize: 12 }}>
+        <b>Read:</b> rotation is the RETURN amplifier (concentration into strong sectors); C's rules are a portable
+        QUALITY edge (they rescue A/B) but can't replace the rotation. B+rules is the best low-drawdown alternative. {data.caveat}
+      </p>
+    </div>
+  );
+}
+
 // RS-trend method sweep. Reads GET /rs-methods (BacktestResult[rs_methods]); POST recomputes (poll
 // every 8s until `computed`). ~20 ways to read the ETF/SPY relative-strength bar, each feeding the
 // SAME cheapest-P/B large-cap pick — so only the sector-SELECTION rule varies. The banner carries the
@@ -7988,6 +8064,7 @@ function parseHash() {
   if (h.startsWith('/profitability-guard')) return { view: 'profitguard' };
   if (h.startsWith('/factor-lab')) return { view: 'factorlab' };
   if (h.startsWith('/portfolio-blender')) return { view: 'blender' };
+  if (h.startsWith('/strategy-lab')) return { view: 'strategylab' };
   if (h.startsWith('/rs-methods')) return { view: 'rsmethods' };
   if (h.startsWith('/rotation')) return { view: 'rotationpick' };
   if (h.startsWith('/vol-shock')) return { view: 'volshock' };
@@ -8080,7 +8157,7 @@ export default function App() {
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
                        altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
-                       rotationcall: 'rotationcall', entrysignal: 'entrysignal', profitguard: 'profitguard', factorlab: 'factorlab', blender: 'blender',
+                       rotationcall: 'rotationcall', entrysignal: 'entrysignal', profitguard: 'profitguard', factorlab: 'factorlab', blender: 'blender', strategylab: 'strategylab',
                        rsmethods: 'rsmethods', synthmacross: 'synthmacross', oversoldbounce: 'oversoldbounce',
                        diversifier: 'diversifier', regime: 'regime', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
@@ -8214,6 +8291,10 @@ export default function App() {
             <span className="sidebar-icon">&#128256;</span>
             Blender
           </li>
+          <li className={`sidebar-item ${page === 'strategylab' ? 'active' : ''}`} onClick={() => { setPage('strategylab'); navigate('/strategy-lab'); }}>
+            <span className="sidebar-icon">&#128300;</span>
+            Strategy Lab
+          </li>
           <li className={`sidebar-item ${page === 'rsmethods' ? 'active' : ''}`} onClick={() => { setPage('rsmethods'); navigate('/rs-methods'); }}>
             <span className="sidebar-icon">&#128202;</span>
             RS Methods
@@ -8253,7 +8334,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'profitguard' ? <ProfitabilityGuardPage /> : page === 'factorlab' ? <FactorLabPage /> : page === 'blender' ? <PortfolioBlenderPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'profitguard' ? <ProfitabilityGuardPage /> : page === 'factorlab' ? <FactorLabPage /> : page === 'blender' ? <PortfolioBlenderPage /> : page === 'strategylab' ? <StrategyLabPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
