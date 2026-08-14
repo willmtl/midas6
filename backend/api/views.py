@@ -1984,6 +1984,15 @@ class PortfolioBlenderView(_StudyResultView):
     json_path = "/app/.data/studies/portfolio_blender.json"
 
 
+class StrategyLabView(_StudyResultView):
+    """Strategy Lab: can A or B beat C WITHOUT the sector rotation, and do C's rules travel? Runs B (dip in
+    uptrend) and A (capitulation) pure and with C's rules (posP/B + guard + low_debt) applied, no rotation,
+    vs the C reference. Isolates rotation-filter vs pick-rules. GET reads BacktestResult[strategy_lab]."""
+    kind = "strategy_lab"
+    script = "strategy_lab.py"
+    json_path = "/app/.data/studies/strategy_lab.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""

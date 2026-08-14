@@ -88,6 +88,8 @@ urlpatterns = [
     path("factor-lab", views.FactorLabView.as_view(), name="factor-lab"),
     # Portfolio blender: mix CORE value + CAPITULATION sleeves (correlation, crisis-alpha, allocation)
     path("portfolio-blender", views.PortfolioBlenderView.as_view(), name="portfolio-blender"),
+    # Strategy lab: can A/B beat C without the rotation; do C's rules travel?
+    path("strategy-lab", views.StrategyLabView.as_view(), name="strategy-lab"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),

@@ -79,6 +79,7 @@ x-backend-volumes: &backend-volumes
   - ./profitability_guard.py:/app/profitability_guard.py
   - ./factor_lab.py:/app/factor_lab.py
   - ./portfolio_blender.py:/app/portfolio_blender.py
+  - ./strategy_lab.py:/app/strategy_lab.py
   - ./.data:/app/.data
 
 services:

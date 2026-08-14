@@ -545,6 +545,19 @@ def run_portfolio_blender():
 
 
 @shared_task
+def run_strategy_lab():
+    """Weekly: strategy lab (can A/B beat C without rotation; do C's rules travel?). Heavy → weekly."""
+    import subprocess, os
+    if not os.path.exists("/app/strategy_lab.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/strategy_lab.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("strategy_lab failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_signal_firing():
     """Nightly: per-signal firing scan (all signals × full universe, last 3 bars) → SignalFiring.
     After candles refresh; powers the grouped Studies 'firing now' column."""

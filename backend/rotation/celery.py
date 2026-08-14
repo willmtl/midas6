@@ -252,4 +252,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_portfolio_blender",
         "schedule": crontab(hour=23, minute=58, day_of_week=6),
     },
+    "strategy-lab-weekly": {            # rotation-vs-rules decomposition — Sat 23:52 UTC
+        "task": "api.celery_tasks.run_strategy_lab",
+        "schedule": crontab(hour=23, minute=52, day_of_week=6),
+    },
 }
