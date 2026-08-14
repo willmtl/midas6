@@ -80,6 +80,7 @@ x-backend-volumes: &backend-volumes
   - ./factor_lab.py:/app/factor_lab.py
   - ./portfolio_blender.py:/app/portfolio_blender.py
   - ./strategy_lab.py:/app/strategy_lab.py
+  - ./value_ranking_lab.py:/app/value_ranking_lab.py
   - ./.data:/app/.data
 
 services:

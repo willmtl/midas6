@@ -90,6 +90,8 @@ urlpatterns = [
     path("portfolio-blender", views.PortfolioBlenderView.as_view(), name="portfolio-blender"),
     # Strategy lab: can A/B beat C without the rotation; do C's rules travel?
     path("strategy-lab", views.StrategyLabView.as_view(), name="strategy-lab"),
+    # Value ranking lab: which value metric (P/B, EV/EBIT, FCF-yield, ...) picks the best name
+    path("value-ranking", views.ValueRankingView.as_view(), name="value-ranking"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),

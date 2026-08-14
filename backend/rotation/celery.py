@@ -256,4 +256,8 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_strategy_lab",
         "schedule": crontab(hour=23, minute=52, day_of_week=6),
     },
+    "value-ranking-weekly": {           # which value metric picks the best name — Sat 23:46 UTC
+        "task": "api.celery_tasks.run_value_ranking",
+        "schedule": crontab(hour=23, minute=46, day_of_week=6),
+    },
 }

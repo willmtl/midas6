@@ -1993,6 +1993,15 @@ class StrategyLabView(_StudyResultView):
     json_path = "/app/.data/studies/strategy_lab.json"
 
 
+class ValueRankingView(_StudyResultView):
+    """Value Ranking Lab: hold the rotation+guard+low_debt selection fixed, vary ONLY the value metric that
+    picks the stock (cheapest P/B vs EV/EBIT vs FCF-yield vs earnings-yield vs P/S vs composite). Finds which
+    value lens picks the best-returning name. GET reads BacktestResult[value_ranking]; POST recomputes."""
+    kind = "value_ranking"
+    script = "value_ranking_lab.py"
+    json_path = "/app/.data/studies/value_ranking.json"
+
+
 class NewsOverreactionView(_StudyResultView):
     """News overreaction detector + reversion backtest: good-news-crash / bad-news-pop divergence,
     forward reversion bucketed by move size (the edge lives in the 10-15% tail), + gap profile."""
