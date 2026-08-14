@@ -7472,6 +7472,76 @@ function StrategyLabPage() {
   );
 }
 
+// ---- Value Ranking Lab ------------------------------------------------------
+// Reads GET /value-ranking. Which value metric picks the best name? Selection (rotation+guard+low_debt)
+// held fixed; only the ranking metric varies. Result: cheapest P/B beats EV/EBIT, FCF-yield, composite.
+function ValueRankingPage() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [running, setRunning] = useState(false);
+
+  const load = () => apiFetch('/value-ranking').then(setData).catch(e => setErr(e.message));
+  useEffect(() => { load(); }, []);
+  const runCompute = () => {
+    setRunning(true);
+    fetch(`${API}/value-ranking`, { method: 'POST' }).then(r => r.json()).then(() => {
+      const t = setInterval(() => fetch(`${API}/value-ranking`).then(r => r.json()).then(d => {
+        if (d.computed) { clearInterval(t); setRunning(false); setData(d); }
+      }).catch(() => {}), 8000);
+    }).catch(() => setRunning(false));
+  };
+
+  if (err) return <div className="studies-page"><ErrorBanner message={err} onRetry={() => { setErr(null); load(); }} /></div>;
+  if (!data) return <div className="loading">Loading value ranking lab...</div>;
+
+  const RES = data.results || {}, leg = data.legend || {};
+  const rows = (data.ranking || Object.keys(RES)).filter(k => RES[k]).map(k => ({ key: k, ...RES[k].no_fallback, dbase: RES[k].vs_baseline, fb: RES[k].fallback?.vs_spy }));
+  const pctS = (v) => v == null || isNaN(Number(v)) ? '–' : `${Number(v) > 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+
+  return (
+    <div className="studies-page">
+      <h1>💎 Value Ranking Lab <LastUpdatedChip value={data.last_updated} /></h1>
+      <p className="subtitle" style={{ marginTop: 2 }}>
+        Which value metric picks the best stock? Selection (rotation + guard + low_debt) fixed; only the ranking metric varies.
+      </p>
+      <div className="empty-state" style={{ textAlign: 'left', padding: '14px 16px', margin: '8px 0 16px' }}>
+        <p style={{ margin: 0, fontSize: 13 }}>{data.verdict}</p>
+        <p style={{ margin: '10px 0 0' }}>
+          <button className="refresh-btn" onClick={runCompute} disabled={running}>{running ? 'Computing...' : 'Recompute'}</button>
+        </p>
+      </div>
+      <table className="studies-table">
+        <thead><tr>
+          <th>Value metric</th>
+          <th style={{ textAlign: 'right' }}>vs SPY</th>
+          <th style={{ textAlign: 'right' }}>Δ vs P/B</th>
+          <th style={{ textAlign: 'right' }}>t</th>
+          <th style={{ textAlign: 'right' }}>Sharpe</th>
+          <th style={{ textAlign: 'right' }}>Max DD</th>
+        </tr></thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.key} className="study-row"
+              style={r.key === data.best_metric ? { background: 'rgba(63,185,80,0.12)' } : undefined}>
+              <td title={leg[r.key] || ''}>{r.key === data.best_metric && '🏆 '}<b>{r.key}</b> <span className="dim" style={{ fontSize: 11 }}>{leg[r.key]}</span></td>
+              <td style={{ textAlign: 'right' }} className={r.vs_spy > 0 ? 'good' : 'bad'}>{pctS(r.vs_spy)}</td>
+              <td style={{ textAlign: 'right' }} className={r.key === 'pb' ? 'dim' : (r.dbase > 0 ? 'good' : 'bad')}>{r.key === 'pb' ? '—' : pctS(r.dbase)}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{r.t_stat == null ? '–' : r.t_stat}</td>
+              <td style={{ textAlign: 'right' }}>{r.sharpe}</td>
+              <td style={{ textAlign: 'right' }} className="dim">{pctS(r.max_drawdown)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="subtitle" style={{ marginTop: 12, fontSize: 12 }}>
+        <b>Why P/B wins:</b> book value is stable/slow-moving, so cheapest-P/B reliably finds the genuinely
+        asset-cheap name; EV/EBIT and FCF-yield pick names on temporarily-inflated single-quarter earnings/cash
+        flow (cyclical peaks) that mean-revert. {data.caveat}
+      </p>
+    </div>
+  );
+}
+
 // RS-trend method sweep. Reads GET /rs-methods (BacktestResult[rs_methods]); POST recomputes (poll
 // every 8s until `computed`). ~20 ways to read the ETF/SPY relative-strength bar, each feeding the
 // SAME cheapest-P/B large-cap pick — so only the sector-SELECTION rule varies. The banner carries the
@@ -8065,6 +8135,7 @@ function parseHash() {
   if (h.startsWith('/factor-lab')) return { view: 'factorlab' };
   if (h.startsWith('/portfolio-blender')) return { view: 'blender' };
   if (h.startsWith('/strategy-lab')) return { view: 'strategylab' };
+  if (h.startsWith('/value-ranking')) return { view: 'valuerank' };
   if (h.startsWith('/rs-methods')) return { view: 'rsmethods' };
   if (h.startsWith('/rotation')) return { view: 'rotationpick' };
   if (h.startsWith('/vol-shock')) return { view: 'volshock' };
@@ -8157,7 +8228,7 @@ export default function App() {
       const simple = { settings: 'settings', live: 'live', news: 'news', research: 'research',
                        journal: 'journal', drilldown: 'drilldown', docs: 'docs', backtestlab: 'backtestlab',
                        altdata: 'altdata', darkpool: 'darkpool', rotationpick: 'rotationpick',
-                       rotationcall: 'rotationcall', entrysignal: 'entrysignal', profitguard: 'profitguard', factorlab: 'factorlab', blender: 'blender', strategylab: 'strategylab',
+                       rotationcall: 'rotationcall', entrysignal: 'entrysignal', profitguard: 'profitguard', factorlab: 'factorlab', blender: 'blender', strategylab: 'strategylab', valuerank: 'valuerank',
                        rsmethods: 'rsmethods', synthmacross: 'synthmacross', oversoldbounce: 'oversoldbounce',
                        diversifier: 'diversifier', regime: 'regime', volshock: 'volshock' };
       if (simple[r.view]) { setPage(simple[r.view]); setSelectedSector(null); setChartTicker(null); }
@@ -8295,6 +8366,10 @@ export default function App() {
             <span className="sidebar-icon">&#128300;</span>
             Strategy Lab
           </li>
+          <li className={`sidebar-item ${page === 'valuerank' ? 'active' : ''}`} onClick={() => { setPage('valuerank'); navigate('/value-ranking'); }}>
+            <span className="sidebar-icon">&#128142;</span>
+            Value Ranking
+          </li>
           <li className={`sidebar-item ${page === 'rsmethods' ? 'active' : ''}`} onClick={() => { setPage('rsmethods'); navigate('/rs-methods'); }}>
             <span className="sidebar-icon">&#128202;</span>
             RS Methods
@@ -8334,7 +8409,7 @@ export default function App() {
         </ul>
       </nav>
       <div className="main">
-        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'profitguard' ? <ProfitabilityGuardPage /> : page === 'factorlab' ? <FactorLabPage /> : page === 'blender' ? <PortfolioBlenderPage /> : page === 'strategylab' ? <StrategyLabPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
+        {page === 'settings' ? <SettingsPage /> : page === 'docs' ? <DocsPage /> : page === 'drilldown' ? <StockDrilldownPage /> : page === 'live' ? <LiveSignalsHub /> : page === 'backtestlab' ? <BacktestLabPage /> : page === 'news' ? <NewsHub /> : page === 'research' ? <ResearchHub /> : page === 'altdata' ? <AltDataPage /> : page === 'darkpool' ? <DarkPoolPage /> : page === 'rotationcall' ? <RotationCallPage /> : page === 'entrysignal' ? <EntrySignalPage /> : page === 'profitguard' ? <ProfitabilityGuardPage /> : page === 'factorlab' ? <FactorLabPage /> : page === 'blender' ? <PortfolioBlenderPage /> : page === 'strategylab' ? <StrategyLabPage /> : page === 'valuerank' ? <ValueRankingPage /> : page === 'rotationpick' ? <RotationPicksPage /> : page === 'rsmethods' ? <RsMethodsPage /> : page === 'synthmacross' ? <SyntheticMaCrossPage /> : page === 'oversoldbounce' ? <OversoldBouncePage /> : page === 'diversifier' ? <DiversifierPage /> : page === 'regime' ? <RegimePage /> : page === 'volshock' ? <VolShockPage /> : page === 'journal' ? <TradeJournalPage /> : <>
         <header>
           <h1>Sector Rotation Dashboard</h1>
           <div className="header-right">
