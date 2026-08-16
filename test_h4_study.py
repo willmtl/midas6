@@ -79,8 +79,36 @@ def test_sig_gap_dn():
     print("test_sig_gap_dn OK")
 
 
+def test_backtest_and_agg():
+    from h4_study import backtest_ticker, agg_rows, EXITS
+    # monotonic ramp: every entry's forward return is strictly positive
+    close = 100 * (1.01 ** np.arange(80))
+    df = _ohlc_from_close(close)
+    res = backtest_ticker(df)
+    assert "mo_break_hi" in res
+    flat = res["mo_break_hi"]["flat"]
+    assert "1b" in flat and len(flat["1b"]) > 0
+    assert all(r > 0 for r in flat["1b"])           # ramp ⇒ positive forward returns
+    rows = agg_rows({k: v for k, v in flat.items()}, [e[0] for e in EXITS])
+    if rows:
+        assert set(["exit", "name", "trades", "avg_pct", "median_pct", "win_pct", "t"]) <= set(rows[0])
+    print("test_backtest_and_agg OK")
+
+
+def test_dtrend_split():
+    from h4_study import backtest_ticker
+    close = 100 * (1.01 ** np.arange(80))
+    df = _ohlc_from_close(close)
+    dtrend = {d.date(): "up" for d in df.index}      # all days flagged up-trend
+    res = backtest_ticker(df, dtrend=dtrend)
+    any_up = any(res[s]["by_dtrend"]["up"].get("1b") for s in res)
+    assert any_up
+    print("test_dtrend_split OK")
+
+
 CHECKS = {"resample": test_resample, "bucket": test_bucket_of,
-          "volshock": test_sig_volshock_dn, "ndown": test_sig_ndown, "gap": test_sig_gap_dn}
+          "volshock": test_sig_volshock_dn, "ndown": test_sig_ndown, "gap": test_sig_gap_dn,
+          "backtest": test_backtest_and_agg, "dtrend": test_dtrend_split}
 
 
 def main():

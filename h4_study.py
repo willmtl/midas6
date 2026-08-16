@@ -238,3 +238,111 @@ SIGNALS = {
 FAMILIES = {}
 for _k, _m in SIGNALS.items():
     FAMILIES.setdefault(_m["family"], []).append(_k)
+
+
+# Pure stat helpers copied from studies.py so this module stays Django-free (unit-testable).
+def _tstat_from_returns(returns):
+    arr = np.asarray(returns, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) < 3:
+        return None
+    sd = arr.std(ddof=1)
+    if not (sd > 0):
+        return None
+    return round(float(arr.mean() / (sd / np.sqrt(len(arr)))), 2)
+
+
+def _episode_starts(entry_idxs, gap=GAP):
+    starts, last = set(), -10 ** 9
+    for i in entry_idxs:
+        if i - last >= gap:
+            starts.add(i)
+            last = i
+    return starts
+
+
+EXITS = [(f"{b}b", b, day_label(b)) for b in FIXED_BARS]
+EXIT_LABEL = {k: f"Hold {k} ({d})" for k, b, d in EXITS}
+EXIT_LABEL["rsi_x_dn"] = "Till RSI crosses back below SMA"
+
+
+def exit_keys_for(sig):
+    keys = [k for k, _, _ in EXITS]
+    if SIGNALS[sig].get("exit_fn") == "rsi_x_dn":
+        keys = keys + ["rsi_x_dn"]
+    return keys
+
+
+def _rsi_x_dn_exit(df):
+    """Exit bars where RSI(14) crosses back below its SMA(14) — the native MR exit for RSI signals."""
+    rsi = ta.momentum.rsi(df["Close"], window=14)
+    sma = rsi.rolling(14).mean()
+    dn = (rsi < sma) & (rsi.shift(1) >= sma.shift(1))
+    return dn.fillna(False).values
+
+
+def _empty_exit_pool(sig):
+    return {k: [] for k in exit_keys_for(sig)}
+
+
+def backtest_ticker(df, dtrend=None):
+    """Backtest every signal on one 4h frame. dtrend: {date -> 'up'|'dn'} daily-trend map (optional)."""
+    close = df["Close"].values
+    n = len(close)
+    dates = df.index.normalize()
+    out = {}
+    for sig, meta in SIGNALS.items():
+        entry, mag = meta["fn"](df)
+        buckets = meta["buckets"]
+        idxs = sorted(_episode_starts([i for i in range(n) if entry[i]], gap=GAP))
+        flat = _empty_exit_pool(sig)
+        by_bucket = {b[0]: _empty_exit_pool(sig) for b in buckets}
+        by_dtrend = {"up": _empty_exit_pool(sig), "dn": _empty_exit_pool(sig)}
+        dn_exit = _rsi_x_dn_exit(df) if meta.get("exit_fn") == "rsi_x_dn" else None
+        for i in idxs:
+            ep = float(close[i])
+            if ep <= 0:
+                continue
+            blab = bucket_of(mag[i], buckets)
+            dstate = None
+            if dtrend is not None:
+                dstate = dtrend.get(dates[i].date())
+            for k, bars, _ in EXITS:
+                j = i + bars
+                if j < n:
+                    r = (close[j] - ep) / ep * 100
+                    flat[k].append(r)
+                    if blab is not None:
+                        by_bucket[blab][k].append(r)
+                    if dstate in ("up", "dn"):
+                        by_dtrend[dstate][k].append(r)
+            if dn_exit is not None:
+                j = next((q for q in range(i + 1, n) if dn_exit[q]), None)
+                if j is not None:
+                    r = (close[j] - ep) / ep * 100
+                    flat["rsi_x_dn"].append(r)
+                    if blab is not None:
+                        by_bucket[blab]["rsi_x_dn"].append(r)
+                    if dstate in ("up", "dn"):
+                        by_dtrend[dstate]["rsi_x_dn"].append(r)
+        out[sig] = {"flat": flat, "by_bucket": by_bucket, "by_dtrend": by_dtrend}
+    return out
+
+
+def agg_rows(pool, exit_keys, min_trades=20):
+    """Aggregate {exit_key: [returns]} into sorted ladder rows (n>=min_trades)."""
+    rows = []
+    for k in exit_keys:
+        r = pool.get(k, [])
+        if len(r) < min_trades:
+            continue
+        a = np.array(r, dtype=float)
+        a = a[np.isfinite(a)]
+        if len(a) < min_trades:
+            continue
+        rows.append({"exit": k, "name": EXIT_LABEL.get(k, k), "trades": int(len(a)),
+                     "avg_pct": round(float(a.mean()), 3), "median_pct": round(float(np.median(a)), 3),
+                     "win_pct": round(float((a > 0).mean() * 100), 1),
+                     "t": _tstat_from_returns(list(a))})
+    rows.sort(key=lambda x: -x["avg_pct"])
+    return rows
