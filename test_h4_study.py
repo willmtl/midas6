@@ -31,7 +31,56 @@ def test_resample():
     print("test_resample OK")
 
 
-CHECKS = {"resample": test_resample}
+def _ohlc_from_close(close, idx=None):
+    close = np.asarray(close, float)
+    n = len(close)
+    idx = idx if idx is not None else _idx(n, freq="4h")
+    return pd.DataFrame({
+        "Open": close, "High": close * 1.001, "Low": close * 0.999,
+        "Close": close, "Volume": np.full(n, 1000.0),
+    }, index=idx)
+
+
+def test_bucket_of():
+    from h4_study import bucket_of
+    b = [("a", -100, -3), ("b", -3, -2), ("c", -2, 0)]
+    assert bucket_of(-5, b) == "a"
+    assert bucket_of(-2.5, b) == "b"
+    assert bucket_of(-1, b) == "c"
+    assert bucket_of(5, b) is None
+    print("test_bucket_of OK")
+
+
+def test_sig_volshock_dn():
+    from h4_study import sig_mr_volshock_dn
+    close = np.concatenate([np.full(40, 100.0), [90.0], np.full(5, 90.0)])  # -10% shock at idx 40
+    entry, mag = sig_mr_volshock_dn(_ohlc_from_close(close))
+    assert entry[40] and mag[40] < -2
+    assert not entry[:40].any()
+    print("test_sig_volshock_dn OK")
+
+
+def test_sig_ndown():
+    from h4_study import sig_mr_ndown
+    close = np.array([100, 99, 98, 97, 96, 97, 98], float)  # 4-down run ends at idx4; reversal bar = idx5
+    entry, mag = sig_mr_ndown(_ohlc_from_close(close))
+    assert entry[5] and mag[5] == 4          # enter the reversal bar, bucketed by completed run length
+    assert not entry[4] and not entry[6]     # no entry mid-run and no look-ahead
+    print("test_sig_ndown OK")
+
+
+def test_sig_gap_dn():
+    from h4_study import sig_mr_gap_dn
+    df = _ohlc_from_close(np.full(30, 100.0))
+    df.iloc[20, df.columns.get_loc("Open")] = 96.0   # -4% gap-down open at idx 20
+    df.iloc[20, df.columns.get_loc("Close")] = 96.0
+    entry, mag = sig_mr_gap_dn(df)
+    assert entry[20] and mag[20] < -2
+    print("test_sig_gap_dn OK")
+
+
+CHECKS = {"resample": test_resample, "bucket": test_bucket_of,
+          "volshock": test_sig_volshock_dn, "ndown": test_sig_ndown, "gap": test_sig_gap_dn}
 
 
 def main():
