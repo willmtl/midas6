@@ -203,6 +203,7 @@ def build():
     picks = []
     held = set()          # cross-sector dedup: a name can sit in multiple GICS/ETF pools (e.g. INSP in Medtech
                           # AND Healthcare) — never hold it twice; sectors picked in accel rank order (matches backtest).
+    skipped = []          # sectors dropped for having no qualifying US/CA value stock (commodity/bond/foreign)
     for rank, (etf, acc) in enumerate(ranked, 1):
         name = name_by_etf.get(etf, etf)
         cands = [(t, funds.get(t, {}).get("pb_ratio")) for t in holds_by_etf[etf] if t not in held]
@@ -266,17 +267,15 @@ def build():
                 "revenue_growth": f.get("revenue_growth"),
                 "pick_sectors": sector_holdings.get_sectors_for_ticker(t)})
         else:
-            # No positive-P/B stock (pure commodity ETF, or a market whose holdings lack P/B like
-            # foreign listings) -> HOLD THE ETF ITSELF, treated as the position. This is a trend/
-            # momentum sleeve, not a value pick -- flagged is_etf_proxy so the app can badge it.
-            dfe = px.get(etf)
-            _dive = _ad_divergence(dfe, HALF)
-            row.update({
-                "pick": etf, "is_etf_proxy": True, "pb_ratio": None,
-                "last_close": round(float(dfe["Close"].iloc[-1]), 2) if dfe is not None and len(dfe) else None,
-                "accumulating": _dive[0], "ad_slope_3m": _dive[1], "price_ret_3m": _dive[2],
-                "market_cap": None, "pe_ratio": None, "forward_pe": None,
-                "profit_margin": None, "revenue_growth": None, "pick_sectors": [name]})
+            # No qualifying US/CA positive-P/B value stock (pure commodity/bond/crypto sector, or a
+            # foreign/index sleeve whose holdings lack P/B). SKIP THE SLOT — do NOT hold the raw ETF.
+            # Backtest (usca_small_proxy vs usca_small): holding these as ETF proxies SUBTRACTS -468.3pp
+            # total (322.1% vs 790.4%), Sharpe 1.34 vs 1.49 — the alpha is entirely in the value pick, a
+            # raw beta sleeve only dilutes it. Remaining picks renormalize to 100% in the conviction step.
+            skipped.append({"rank": rank, "sector": name, "etf": etf, "acceleration": round(acc, 1)})
+            print(f"  #{rank:>2} {name:22} ({etf}): no qualifying US/CA value stock -> SLOT SKIPPED "
+                  f"(proxy-hold backtests -468pp)", flush=True)
+            continue
         picks.append(row)
 
     # div_2x CONVICTION WEIGHTING: keep the full basket (breadth intact — same cheapest-P/B pick per sector),
@@ -314,14 +313,19 @@ def build():
                             "GICS pool, candidates pass profit-guard + low-debt + $5M dvol (+ $50M floor for "
                             "pharma sectors); size-tilt to <$2B, then CAP-AWARE value pick (small-cap: top-5 "
                             "cheapest P/B -> cheapest P/E among profitable; large-cap: cheapest P/B); if a "
-                            "sector has NO qualifying stock (pure commodity ETF) HOLD THE ETF itself"),
+                            "sector has NO qualifying US/CA value stock (pure commodity/bond/foreign) SKIP the "
+                            "slot and renormalize the remaining picks (proxy-holding backtests -468pp)"),
                    "backtest": ("usca_small flagship: +790.4% total / Sharpe 1.49 / DD -20.5% / t3.34 "
                                 "(survivorship-de-biased, USD incl. FX, point-in-time; survivorship_smallcap_study). "
                                 "NOTE: live GICS universe ≈ but not identical to the backtest's, so live basket "
                                 "differs; the RULES match")},
         "picks": picks,
-        "note": ("Value picks are the alpha; commodity/market sleeves with no P/B stock are held via their "
-                 "ETF (trend sleeve, not value — badged in the app). Monthly-rebalance; directional, no fees."),
+        "n_sectors_skipped": len(skipped),
+        "skipped_sectors": skipped,
+        "note": ("Value picks are the alpha; sectors with no qualifying US/CA value stock (pure commodity/"
+                 "bond/foreign sleeves) are SKIPPED, not held via ETF — backtest: proxy-holding subtracts "
+                 "-468pp (322% vs 790%). Weights renormalize over the remaining picks. Monthly-rebalance; "
+                 "directional, no fees."),
     }
     return payload
 
