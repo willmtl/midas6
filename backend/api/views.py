@@ -1856,6 +1856,15 @@ class VolShockStudyView(_StudyResultView):
     json_path = "/app/.data/studies/vol_shock_study.json"
 
 
+class H4StudyView(_StudyResultView):
+    """H4 short-horizon studies engine: 5 signal families × bar-based exit ladder over the liquid
+    top-250 stocks, magnitude-bucketed (tail-not-average), daily-trend split, daily benchmark.
+    GET reads BacktestResult[h4_study]; POST recomputes (fetch may take a while)."""
+    kind = "h4_study"
+    script = "h4_study.py"
+    json_path = "/app/.data/studies/h4_study.json"
+
+
 class SignalFiringView(APIView):
     """Names (stock/ETF/commodity) currently firing a given study signal (last N bars).
     GET ?signal=<key> -> the firing list for the Studies 'firing now' pane."""
@@ -1888,6 +1897,14 @@ class RotationPicksView(_StudyResultView):
     kind = "rotation_picks"
     script = "rotation_pick_scan.py"
     json_path = "/app/.data/studies/rotation_picks.json"
+
+
+class RotationHistoryView(_StudyResultView):
+    """TIME MACHINE: the flagship basket reconstructed point-in-time at every month-end over ~5y, with each
+    pick's realized next-month return + div_2x weights. Powers the month-by-month ◀ ▶ replay."""
+    kind = "rotation_history"
+    script = "rotation_history_scan.py"
+    json_path = "/app/.data/studies/rotation_history.json"
 
 
 class RsMethodsView(_StudyResultView):
@@ -2000,6 +2017,58 @@ class ValueRankingView(_StudyResultView):
     kind = "value_ranking"
     script = "value_ranking_lab.py"
     json_path = "/app/.data/studies/value_ranking.json"
+
+
+class ReturnLabView(_StudyResultView):
+    """Return Lab: push the validated engine (rotation+guard+low_debt+cheapest-P/B) for MORE return across
+    4 levers — concentration+weighting, leverage, orthogonal-sleeve blends, and regime/drawdown overlays.
+    Reports the return-vs-drawdown frontier so the risk cost of each lever is explicit. GET reads
+    BacktestResult[return_lab]; POST recomputes."""
+    kind = "return_lab"
+    script = "return_lab.py"
+    json_path = "/app/.data/studies/return_lab.json"
+
+
+class DeepPoolView(_StudyResultView):
+    """More stocks per ETF: cheapest-P/B from the ETF's full expanded holdings vs our top-20. Same engine,
+    deeper candidate pool. GET reads BacktestResult[deep_pool]; POST recomputes."""
+    kind = "deep_pool"
+    script = "deep_pool_study.py"
+    json_path = "/app/.data/studies/deep_pool.json"
+
+
+class BearDefenseView(_StudyResultView):
+    """Dual-momentum bear defense: relative momentum picks sectors, absolute momentum gates in/out (cash).
+    GET reads BacktestResult[bear_defense]; POST recomputes."""
+    kind = "bear_defense"
+    script = "bear_defense.py"
+    json_path = "/app/.data/studies/bear_defense.json"
+
+
+class V2StrategyView(_StudyResultView):
+    """V2: stack the levers that helped (deep pool + top-5 inverse-vol + slow-momentum bear gate),
+    decomposed additively vs the validated baseline. GET reads BacktestResult[v2_strategy]; POST recomputes."""
+    kind = "v2_strategy"
+    script = "v2_strategy.py"
+    json_path = "/app/.data/studies/v2_strategy.json"
+
+
+class WalkForwardView(_StudyResultView):
+    """Walk-forward / subperiod validation of the validated engine (halves, thirds, per-year, rolling-12mo).
+    GET reads BacktestResult[walk_forward]; POST recomputes."""
+    kind = "walk_forward"
+    script = "walk_forward.py"
+    json_path = "/app/.data/studies/walk_forward.json"
+
+
+class SectorAccelerationView(_StudyResultView):
+    """Live sector-acceleration leaderboard — the walk-forward-validated sector signal (accel = 3mo-now
+    minus 3mo-3ago; +422% vs SPY). Ranks all sectors by momentum acceleration; top-10 = the rotation
+    pick-zone; flags 'hidden turns' (negative 6mo momentum but inflecting up). GET reads
+    BacktestResult[sector_acceleration]; POST recomputes."""
+    kind = "sector_acceleration"
+    script = "sector_acceleration_scan.py"
+    json_path = "/app/.data/studies/sector_acceleration.json"
 
 
 class NewsOverreactionView(_StudyResultView):

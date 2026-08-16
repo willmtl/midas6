@@ -64,10 +64,14 @@ urlpatterns = [
     # News overreaction detector + reversion backtest (size-bucketed); intraday RSI crossover study
     path("news-overreaction", views.NewsOverreactionView.as_view(), name="news-overreaction"),
     path("rsi-intraday", views.RsiIntradayView.as_view(), name="rsi-intraday"),
+    # H4 short-horizon studies engine (5 families × exit ladder, magnitude buckets, 0-3 day holds)
+    path("h4-study", views.H4StudyView.as_view(), name="h4-study"),
     # Per-signal live firing (names firing each study signal in the last N bars)
     path("signal-firing", views.SignalFiringView.as_view(), name="signal-firing"),
     # Live rotation-pick scanner (cheapest-P/B in each strengthening sector)
     path("rotation-picks", views.RotationPicksView.as_view(), name="rotation-picks"),
+    # Time machine: month-by-month PIT reconstruction of the flagship basket + realized returns
+    path("rotation-history", views.RotationHistoryView.as_view(), name="rotation-history"),
     # RS-trend method sweep (~20 selection rules on the ETF/SPY bar, one value pick)
     path("rs-methods", views.RsMethodsView.as_view(), name="rs-methods"),
     # MA crossover run on every synthetic RS candle (mean-reversion diagnostic)
@@ -92,6 +96,12 @@ urlpatterns = [
     path("strategy-lab", views.StrategyLabView.as_view(), name="strategy-lab"),
     # Value ranking lab: which value metric (P/B, EV/EBIT, FCF-yield, ...) picks the best name
     path("value-ranking", views.ValueRankingView.as_view(), name="value-ranking"),
+    path("return-lab", views.ReturnLabView.as_view(), name="return-lab"),
+    path("deep-pool", views.DeepPoolView.as_view(), name="deep-pool"),
+    path("bear-defense", views.BearDefenseView.as_view(), name="bear-defense"),
+    path("v2-strategy", views.V2StrategyView.as_view(), name="v2-strategy"),
+    path("walk-forward", views.WalkForwardView.as_view(), name="walk-forward"),
+    path("sector-acceleration", views.SectorAccelerationView.as_view(), name="sector-acceleration"),
     # Short-term burst scanner + Global confluence scanner (both from burst_scan.py)
     path("short-term", views.ShortTermView.as_view(), name="short-term"),
     path("global", views.GlobalView.as_view(), name="global"),
