@@ -44,6 +44,7 @@ django.setup()
 
 from pathlib import Path
 import config
+import price_basis
 import sector_holdings
 import ta
 from studies import _tstat_from_returns
@@ -167,7 +168,7 @@ def build():
     shares_p = _pit_monthly_panel(reps, "shares_outstanding", midx)
     equity_p = _pit_monthly_panel(reps, "total_equity", midx)
     common = stock_monthly.columns.intersection(shares_p.columns).intersection(equity_p.columns)
-    pb_panel = (stock_monthly[common] * shares_p[common]) / equity_p[common].where(equity_p[common] != 0)
+    pb_panel = (price_basis.as_traded_close(stock_monthly[common]) * shares_p[common]) / equity_p[common].where(equity_p[common] != 0)
 
     print("computing entry panels...", flush=True)
     panels = _entry_panels(stock_daily, midx)

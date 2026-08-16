@@ -23,6 +23,7 @@ import django
 django.setup()
 import numpy as np, pandas as pd, ta
 import config, sector_holdings, indicators
+import price_basis
 from backtest_lowpb import _arm, _monthly_close, BENCH, CRYPTO
 from seq_fundamental_study import load_candles, load_financial_reports
 from trend_stock_studies import _pit_monthly_panel, _available_at
@@ -49,7 +50,7 @@ def build():
     shares_p = _pit_monthly_panel(reps, "shares_outstanding", midx)
     equity_p = _pit_monthly_panel(reps, "total_equity", midx)
     common = stock_monthly.columns.intersection(shares_p.columns).intersection(equity_p.columns)
-    pb_panel = (stock_monthly[common] * shares_p[common]) / equity_p[common].where(equity_p[common] != 0)
+    pb_panel = (price_basis.as_traded_close(stock_monthly[common]) * shares_p[common]) / equity_p[common].where(equity_p[common] != 0)
     mktcap_panel = stock_monthly[common] * shares_p[common]
 
     # ---- the RS "dynamic bar" (etf/spy) + every trend read on it -------------

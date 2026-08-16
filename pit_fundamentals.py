@@ -327,6 +327,7 @@ def bucket_ps(v):
 
 def bucket_pb(v):
     if _na(v): return "NA"
+    if v < 0: return "negative equity"
     if v < 1: return "cheap (<1)"
     if v < 3: return "fair (1-3)"
     if v < 6: return "rich (3-6)"
@@ -348,6 +349,7 @@ def bucket_div_yield(v):
 
 def bucket_debt_to_equity(v):
     if _na(v): return "NA"
+    if v < 0: return "negative equity"
     if v < 0.5: return "low (<0.5)"
     if v < 1.5: return "moderate (0.5-1.5)"
     return "high (>=1.5)"

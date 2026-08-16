@@ -104,8 +104,9 @@ def import_candles_task():
         start_date = min(need_incremental.values()) - timedelta(days=2)
         start = start_date.isoformat()
         for ch in _chunks(list(need_incremental.keys())):
-            Candle.objects.filter(ticker__in=ch, interval="1d", date__gte=start_date).delete()
-            _batch_import(ch, start=start)
+            # replace_since delete now happens INSIDE _batch_import, and ONLY after a non-empty
+            # fetch — a failed download (e.g. yfinance egress down) must never wipe history.
+            _batch_import(ch, start=start, replace_since=start_date)
 
     # Also seed Sector table if empty
     if Sector.objects.count() == 0:
@@ -127,8 +128,11 @@ def import_candles_task():
             "incremental": len(need_incremental), "stale_after": len(stale)}
 
 
-def _batch_import(tickers, period=None, start=None):
-    """Download and save candles to DB."""
+def _batch_import(tickers, period=None, start=None, replace_since=None):
+    """Download and save candles to DB. If `replace_since` is set, delete that trailing window for
+    these tickers — but ONLY AFTER a non-empty download succeeds. Deleting before/without a good
+    fetch (e.g. when yfinance egress is down) destroyed history: the delete ran, the refetch returned
+    empty, and the bars were gone with nothing to replace them. Never delete on an empty fetch."""
     kwargs = {"tickers": tickers, "interval": "1d", "group_by": "ticker", "auto_adjust": True, "threads": True, "progress": False}
     if period:
         kwargs["period"] = period
@@ -137,7 +141,12 @@ def _batch_import(tickers, period=None, start=None):
 
     data = yf.download(**kwargs)
     if data is None or data.empty:
+        logger.warning("_batch_import: empty download for %d tickers — skipping delete+insert "
+                       "(self-heals next run; history preserved)", len(tickers))
         return
+
+    if replace_since is not None:
+        Candle.objects.filter(ticker__in=list(tickers), interval="1d", date__gte=replace_since).delete()
 
     bulk = []
     for ticker in tickers:

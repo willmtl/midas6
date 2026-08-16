@@ -31,6 +31,7 @@ django.setup()
 
 from pathlib import Path
 import config, sector_holdings
+import price_basis
 from studies import _tstat_from_returns
 from seq_fundamental_study import load_candles, load_financial_reports
 from trend_stock_studies import _pit_monthly_panel, _available_at, _ret_delist, CRYPTO
@@ -82,7 +83,7 @@ def build():
     ni = _pit_monthly_panel(reps, "net_income", midx)
     rev = _pit_monthly_panel(reps, "revenue", midx)
     common = stock_m.columns.intersection(shares.columns).intersection(equity.columns)
-    pb = (stock_m[common] * shares[common]) / equity[common].where(equity[common] != 0)
+    pb = (price_basis.as_traded_close(stock_m[common]) * shares[common]) / equity[common].where(equity[common] != 0)
     # PIT guards (aligned to pb columns/index)
     ni = ni.reindex(index=midx, columns=common)
     equity = equity.reindex(index=midx, columns=common)

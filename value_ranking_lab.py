@@ -27,6 +27,7 @@ django.setup()
 
 from pathlib import Path
 import config, sector_holdings
+import price_basis
 from studies import _tstat_from_returns
 from seq_fundamental_study import load_candles, load_financial_reports
 from trend_stock_studies import _pit_monthly_panel, _available_at, _ret_delist, CRYPTO
@@ -84,7 +85,7 @@ def build():
     shares, equity, ni, debt, opinc, cash, rev, fcf = map(R, (shares, equity, ni, debt, opinc, cash, rev, fcf))
     mktcap = px * shares
     ev = mktcap + debt.fillna(0) - cash.fillna(0)
-    pb = mktcap / equity.where(equity != 0)
+    pb = (price_basis.as_traded_close(px) * shares) / equity.where(equity != 0)
     trap = (ni < 0) & (~(equity >= equity.shift(12))) & (~(ni > ni.shift(4)))
     low_debt = (debt / equity.where(equity != 0)) < 1.0
 

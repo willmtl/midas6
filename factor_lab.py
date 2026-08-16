@@ -21,6 +21,7 @@ django.setup()
 
 from pathlib import Path
 import config, sector_holdings
+import price_basis
 from studies import _tstat_from_returns
 from seq_fundamental_study import load_candles, load_financial_reports
 from trend_stock_studies import _pit_monthly_panel, _available_at, _ret_delist, CRYPTO
@@ -79,7 +80,7 @@ def build():
         return p.reindex(index=midx, columns=common)
     px = stock_m[common]
     shares, equity, ni, rev, fcf, debt, gross = map(R, (shares, equity, ni, rev, fcf, debt, gross))
-    pb = (px * shares) / equity.where(equity != 0)
+    pb = (price_basis.as_traded_close(px) * shares) / equity.where(equity != 0)
     mktcap = px * shares
 
     # ---- candle-derived panels (A/D accumulation, momentum, vol) ----

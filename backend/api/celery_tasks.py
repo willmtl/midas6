@@ -409,6 +409,57 @@ def run_congress_trades():
 
 
 @shared_task
+def run_etf_flows():
+    """Daily: refresh recent ETF fund flows (Polygon share_class_shares_outstanding → creation/redemption)
+    → core.ETFFlow. INCREMENTAL (last ~15 trading days, scoped-delete keeps history); the one-off full 5y
+    backfill is `fetch_etf_flows.py --run`. No-op without POLYGON_API_KEY (Polygon is the only ETF-flow source
+    — EODHD outstandingShares='NA', yfinance empty)."""
+    import os, subprocess
+    if not os.environ.get("POLYGON_API_KEY"):
+        return {"skipped": "no POLYGON_API_KEY"}
+    proc = subprocess.run(["python", "-u", "/app/fetch_etf_flows.py", "--run", "--days", "15", "--jobs", "8"],
+                          cwd="/app", capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("run_etf_flows failed (rc=%s): %s", proc.returncode, proc.stderr[-1500:])
+    else:
+        logger.info("run_etf_flows done: %s", proc.stdout[-500:])
+    return proc.returncode
+
+
+@shared_task
+def run_delisted_fundamentals():
+    """One-off (manually enqueued): EODHD quarterly fundamentals + GicSector for the delisted names we have
+    candles for → core.FinancialReport (survivorship de-bias). Runs IN-PROCESS in the persistent worker so it
+    survives session/docker-exec reaping (subprocess spawn was getting killed). Streaming writes; resumable."""
+    import sys
+    if "/app" not in sys.path:
+        sys.path.insert(0, "/app")
+    from core.models import FinancialReport
+    import fetch_delisted_fundamentals as fdf
+    before = FinancialReport.objects.values("ticker").distinct().count()
+    logger.info("run_delisted_fundamentals START (in-process); FR tickers before=%s", before)
+    fdf.run(offset=0, limit=None, jobs=12)
+    after = FinancialReport.objects.values("ticker").distinct().count()
+    logger.info("run_delisted_fundamentals DONE; FR tickers after=%s (+%s)", after, after - before)
+    return {"fr_before": before, "fr_after": after}
+
+
+@shared_task
+def run_fred():
+    """Daily: refresh FRED macro/liquidity series → core.MacroSeries (M2, Fed balance sheet WALCL, reverse repo,
+    TGA, broad USD, HY OAS spread, 10y-2y curve). No API key (fredgraph CSV; fred.stlouisfed.org egress works).
+    Feeds the macro-liquidity regime + leading risk-off layer (see macro_liquidity_study)."""
+    import subprocess
+    proc = subprocess.run(["python", "-u", "/app/fetch_fred.py", "--run"], cwd="/app",
+                          capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0:
+        logger.error("run_fred failed (rc=%s): %s", proc.returncode, proc.stderr[-1500:])
+    else:
+        logger.info("run_fred done: %s", proc.stdout[-400:])
+    return proc.returncode
+
+
+@shared_task
 def run_congress_study():
     """Nightly: PIT market-adjusted forward-return study of congressional trades vs SPY →
     BacktestResult[congress_study] (the script persists to DB itself)."""
@@ -481,7 +532,8 @@ def run_rotation_picks():
     import subprocess, os
     if not os.path.exists("/app/rotation_pick_scan.py"):
         return {"error": "not mounted"}
-    proc = subprocess.run(["python", "-u", "/app/rotation_pick_scan.py"], cwd="/app",
+    env = {**os.environ, "EXPANDED_UNIVERSE": "1"}      # live picks use the fuller ETF pool (forward -> no survivorship risk)
+    proc = subprocess.run(["python", "-u", "/app/rotation_pick_scan.py"], cwd="/app", env=env,
                           capture_output=True, text=True, timeout=1200)
     if proc.returncode != 0:
         logger.error("rotation_pick_scan failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
@@ -495,7 +547,8 @@ def run_rotation_call():
     import subprocess, os
     if not os.path.exists("/app/rotation_call_scan.py"):
         return {"error": "not mounted"}
-    proc = subprocess.run(["python", "-u", "/app/rotation_call_scan.py"], cwd="/app",
+    env = {**os.environ, "EXPANDED_UNIVERSE": "1"}      # live picks use the fuller ETF pool (forward -> no survivorship risk)
+    proc = subprocess.run(["python", "-u", "/app/rotation_call_scan.py"], cwd="/app", env=env,
                           capture_output=True, text=True, timeout=1200)
     if proc.returncode != 0:
         logger.error("rotation_call_scan failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
@@ -568,6 +621,69 @@ def run_value_ranking():
     if proc.returncode != 0:
         logger.error("value_ranking_lab failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
     return proc.returncode
+
+
+@shared_task
+def run_return_lab():
+    """Weekly: return lab (4 levers to push return: concentration/weighting, leverage, orthogonal blends,
+    regime overlays). Heavy → weekly. Script lives in backend/ so it's at /app/return_lab.py."""
+    import subprocess, os
+    if not os.path.exists("/app/return_lab.py"):
+        return {"error": "missing"}
+    proc = subprocess.run(["python", "-u", "/app/return_lab.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("return_lab failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+def _run_backend_study(script):
+    """Run a backend/ study script (already at /app) and log failure. Returns rc."""
+    import subprocess, os
+    if not os.path.exists(f"/app/{script}"):
+        return {"error": "missing", "script": script}
+    proc = subprocess.run(["python", "-u", f"/app/{script}"], cwd="/app",
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("%s failed (rc=%s): %s", script, proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
+def run_deep_pool():
+    """Weekly: more-stocks-per-ETF (top-20 vs full expanded pool)."""
+    return _run_backend_study("deep_pool_study.py")
+
+
+@shared_task
+def run_bear_defense():
+    """Weekly: dual-momentum bear-defense overlay."""
+    return _run_backend_study("bear_defense.py")
+
+
+@shared_task
+def run_v2_strategy():
+    """Weekly: stacked v2 (deep pool + inv-vol top-5 + slow-momentum bear gate)."""
+    return _run_backend_study("v2_strategy.py")
+
+
+@shared_task
+def run_walk_forward():
+    """Weekly: walk-forward / subperiod validation of the validated engine."""
+    return _run_backend_study("walk_forward.py")
+
+
+@shared_task
+def run_sector_acceleration():
+    """Nightly: sector-acceleration leaderboard (the validated sector signal). Before the pick scan."""
+    return _run_backend_study("sector_acceleration_scan.py")
+
+
+@shared_task
+def run_live_conviction():
+    """Nightly (after rotation picks): score the live basket 0-5 and tag perfect plays; augments the
+    rotation_picks payload with conviction + writes BacktestResult[perfect_plays]."""
+    return _run_backend_study("live_conviction.py")
 
 
 @shared_task

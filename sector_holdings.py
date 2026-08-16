@@ -784,12 +784,48 @@ HOLDINGS = {
 }
 
 
-def get_holdings(sector_name: str) -> list[str]:
-    """Get the holdings ticker list for a sector."""
+import os as _os
+import json as _json
+_EXPANDED = None
+
+
+def _expanded_holdings() -> dict:
+    """Lazy-load EODHD-expanded constituents written by backend/expand_holdings.py. Unioned into
+    get_holdings() AFTER the hardcoded top-20 so live scanners see the fuller sector universe. Absent
+    file -> {} (no change). Backtests are unaffected: new names lack PIT FinancialReport and are
+    filtered out by the point-in-time panels."""
+    global _EXPANDED
+    if _EXPANDED is None:
+        _EXPANDED = {}
+        for _p in ("/app/.data/expanded_holdings.json",
+                   _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".data", "expanded_holdings.json")):
+            try:
+                with open(_p) as _f:
+                    _EXPANDED = _json.load(_f)
+                break
+            except Exception:
+                continue
+    return _EXPANDED
+
+
+def get_holdings(sector_name: str, expanded=None) -> list[str]:
+    """Get the holdings ticker list for a sector. DEFAULT = hardcoded top-20 ONLY, which preserves the
+    validated backtests (+229% vs SPY) unchanged. Pass expanded=True (or set env EXPANDED_UNIVERSE=1) to
+    union the EODHD-expanded constituents — used by the live scanners / deep-pool study, deliberately NOT
+    by the nightly validated backtests (whose numbers must stay on the clean top-20 universe)."""
     data = HOLDINGS.get(sector_name)
-    if data:
-        return data["holdings"]
-    return []
+    base = list(data["holdings"]) if data else []
+    if expanded is None:
+        expanded = bool(_os.environ.get("EXPANDED_UNIVERSE"))
+    if expanded:
+        ext = _expanded_holdings().get(sector_name)
+        if ext and ext.get("added"):
+            seen = set(base)
+            for t in ext["added"]:
+                if t not in seen:
+                    seen.add(t)
+                    base.append(t)
+    return base
 
 
 def get_all_unique_tickers() -> list[str]:

@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""ARIMA / SARIMA sector forecasting — the last untested idea. Fit a time-series model on each sector ETF's
+monthly return series (expanding window, refit each month, no look-ahead), forecast next month's return, rank
+sectors by the forecast, pick as usual, compare to the price-ACCEL baseline. SARIMA adds a 12-month seasonal
+term (sector seasonality). Prior: return series are ~white noise so ARIMA point-forecasts rarely beat momentum,
+but it's untested here. Arms (same engine: top-10 -> cheapest as-traded-P/B guard low-debt div_2x, monthly;
+common window where the forecast is defined):
+  price_accel   baseline (flagship ranking)
+  arima         rank by ARIMA(1,0,1) 1-step return forecast
+  sarima        rank by SARIMA(1,0,1)(1,0,0,12) 1-step return forecast
+  arima_confirm price-accel top-10 among sectors whose ARIMA forecast > 0
+Report LEADING WITH TOTAL RETURN ([[return-priority]]). -> BacktestResult[arima] + JSON.
+Run: MSYS_NO_PATHCONV=1 docker exec rotation-backend-1 python -u /app/arima_study.py
+"""
+import os, json, warnings
+warnings.filterwarnings("ignore")
+import numpy as np, pandas as pd
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings")
+import django
+django.setup()
+
+from pathlib import Path
+import config, sector_holdings, price_basis
+from seq_fundamental_study import load_candles, load_financial_reports
+from trend_stock_studies import _pit_monthly_panel, _available_at, _ret_delist, CRYPTO
+from backtest_lowpb import _monthly_close, _tstat_from_returns, BENCH
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+TOP_N = 10; CONV = 2.0; MIN_DVOL = 5e6; WARMUP = 24
+OUT = Path(__file__).resolve().parent / ".data" / "studies" / "arima.json"
+
+
+def _perf(r, spy):
+    r = np.asarray(r, float); n = len(r)
+    tot = float(np.prod(1 + r) - 1) * 100
+    sp = float(np.prod(1 + np.asarray(spy)) - 1) * 100
+    ann = (float(np.prod(1 + r)) ** (12.0 / n) - 1) * 100 if n else 0.0
+    sh = float(r.mean() / r.std() * np.sqrt(12)) if r.std() > 1e-9 else 0.0
+    eqc = np.cumprod(1 + r); dd = float(((eqc / np.maximum.accumulate(eqc)) - 1).min() * 100)
+    t = _tstat_from_returns(list(r))
+    return dict(total=round(tot, 1), annual=round(ann, 1), vs_spy=round(tot - sp, 1), sharpe=round(sh, 2),
+                dd=round(dd, 1), t_stat=round(t, 2) if t is not None else None, months=n)
+
+
+def forecast_matrix(ret_df, seasonal):
+    """[midx x etf] one-step-ahead forecast of next month's return; signal[i] uses returns through month i."""
+    fc = pd.DataFrame(index=ret_df.index, columns=ret_df.columns, dtype=float)
+    for col in ret_df.columns:
+        s = ret_df[col].dropna()
+        if len(s) < WARMUP + 2:
+            continue
+        vals = s.values * 100.0                      # % scale for numeric stability
+        idx = s.index
+        for k in range(WARMUP, len(s)):
+            hist = vals[:k + 1]
+            try:
+                if seasonal:
+                    m = SARIMAX(hist, order=(1, 0, 1), seasonal_order=(1, 0, 0, 12),
+                                enforce_stationarity=False, enforce_invertibility=False)
+                else:
+                    m = ARIMA(hist, order=(1, 0, 1))
+                res = m.fit(method_kwargs={"maxiter": 50, "disp": 0}) if not seasonal else m.fit(disp=0, maxiter=50)
+                f = float(res.forecast(steps=1)[0]) / 100.0
+                if np.isfinite(f):
+                    fc.loc[idx[k], col] = f
+            except Exception:
+                continue
+    return fc
+
+
+def build():
+    etfs = {n: e for n, e in config.SECTOR_ETFS.items() if e not in CRYPTO}
+    sector_map, all_holds = {}, set()
+    for n, e in etfs.items():
+        h = [t for t in sector_holdings.get_holdings(n) if t not in (e, BENCH) and t not in CRYPTO]
+        sector_map[e] = (n, set(h)); all_holds.update(h)
+    all_holds = sorted(all_holds)
+    etf_tk = list(etfs.values())
+    etf_daily = load_candles(etf_tk + [BENCH])
+    etf_m = _monthly_close({t: d for t, d in etf_daily.items() if t in etf_tk})
+    midx = etf_m.index
+    price_accel = etf_m.pct_change(3) - etf_m.pct_change(3).shift(3)
+    spy_m = etf_daily[BENCH]["Close"].resample("ME").last().reindex(midx)
+    etf_ret = etf_m.pct_change()
+
+    print(f"fitting ARIMA forecasts over {len(etf_tk)} ETFs x {len(midx)} months (warmup {WARMUP})...", flush=True)
+    fc_arima = forecast_matrix(etf_ret, seasonal=False)
+    start_i = next((i for i in range(len(midx)) if fc_arima.iloc[i].notna().sum() >= TOP_N), WARMUP)
+    start_i = max(start_i, 9)
+    print(f"ARIMA forecasts ready; common window from {midx[start_i].date()}", flush=True)
+
+    stock_daily = load_candles(all_holds)
+    stock_m = _monthly_close(stock_daily).reindex(midx)
+    reps = load_financial_reports(all_holds)
+    sh, eq, ni, dt = (_pit_monthly_panel(reps, f, midx) for f in
+                      ("shares_outstanding", "total_equity", "net_income", "total_debt"))
+    common = stock_m.columns.intersection(sh.columns).intersection(eq.columns)
+    R = lambda p: p.reindex(index=midx, columns=common)
+    px = stock_m[common]; sh, eq, ni, dt = R(sh), R(eq), R(ni), R(dt)
+    pb = (price_basis.as_traded_close(px) * sh) / eq.where(eq != 0)
+    trap = (ni < 0) & (~(eq >= eq.shift(12))) & (~(ni > ni.shift(4)))
+    low = (dt / eq.where(eq != 0)) < 1.0
+    dvol, adl_m = {}, {}
+    for t in common:
+        d = stock_daily.get(t)
+        if d is None or "Volume" not in d or len(d) < 90:
+            continue
+        v = d["Volume"]
+        dvol[t] = (d["Close"] * v).rolling(20).mean().resample("ME").last().reindex(midx)
+        if {"High", "Low", "Close"}.issubset(d.columns):
+            rng = (d["High"] - d["Low"]).replace(0, np.nan)
+            mfm = ((d["Close"] - d["Low"]) - (d["High"] - d["Close"])) / rng
+            adl_m[t] = (mfm.fillna(0) * v).cumsum().resample("ME").last().reindex(midx)
+    dvol = pd.DataFrame(dvol).reindex(index=midx, columns=common)
+    adl = pd.DataFrame(adl_m).reindex(index=midx, columns=common)
+    ad_slope3 = adl - adl.shift(3); px_ret3 = px.pct_change(3)
+
+    def pick(etf, date, held):
+        _, holds = sector_map.get(etf, (etf, set()))
+        c = [h for h in holds if h in px.columns and h not in held and _available_at(px[h], date)
+             and pd.notna(pb.loc[date, h]) and pb.loc[date, h] > 0 and not bool(trap.loc[date, h])
+             and pd.notna(dvol.loc[date, h]) and dvol.loc[date, h] >= MIN_DVOL]
+        g = [x for x in c if bool(low.loc[date, x])] or c
+        return min(g, key=lambda h: pb.loc[date, h]) if g else None
+
+    def accumulating(name, date):
+        a, p = ad_slope3.loc[date].get(name), px_ret3.loc[date].get(name)
+        return pd.notna(a) and pd.notna(p) and a > 0 and p < 0
+
+    def run(order_fn):
+        rets, spies = [], []
+        for i in range(start_i, len(midx) - 1):
+            date, ndate = midx[i], midx[i + 1]
+            sp = spy_m.iloc[i + 1] / spy_m.iloc[i] - 1
+            if not np.isfinite(sp):
+                continue
+            order = order_fn(date)[:TOP_N]
+            if not order:
+                continue
+            held = set(); wsum = rr = 0.0
+            for etf in order:
+                p = pick(etf, date, held)
+                if not p:
+                    continue
+                held.add(p)
+                r = _ret_delist(px[p], date, ndate)
+                if r is None or not np.isfinite(r):
+                    continue
+                w = CONV if accumulating(p, date) else 1.0
+                wsum += w; rr += w * float(r)
+            if wsum <= 0:
+                continue
+            rets.append(rr / wsum); spies.append(float(sp))
+        return _perf(rets, spies)
+
+    def o_price(d):
+        s = price_accel.loc[d].dropna(); return list(s.sort_values(ascending=False).index)
+
+    def o_fc(fc, d):
+        s = fc.loc[d].dropna(); return list(s.sort_values(ascending=False).index) if len(s) else []
+
+    def o_confirm(d):
+        pos = set(fc_arima.loc[d][fc_arima.loc[d] > 0].index)
+        s = price_accel.loc[d].dropna(); return [e for e in s.sort_values(ascending=False).index if e in pos]
+
+    import sys
+    results = {"price_accel": run(o_price), "arima": run(lambda d: o_fc(fc_arima, d)),
+               "arima_confirm": run(o_confirm)}
+    if "--sarima" in sys.argv:
+        print("\n(ARIMA arms done; fitting SARIMA — slower...)", flush=True)
+        try:
+            fc_sarima = forecast_matrix(etf_ret, seasonal=True)
+            results["sarima"] = run(lambda d: o_fc(fc_sarima, d))
+        except Exception as e:
+            print("SARIMA failed:", e, flush=True)
+
+    base = results["price_accel"]
+    order = sorted(results, key=lambda k: results[k]["total"], reverse=True)
+    print(f"\n=== ARIMA/SARIMA vs PRICE-ACCEL (common window from {midx[start_i].date()}; TOTAL RETURN) ===", flush=True)
+    print(f"  {'mode':<15}{'total':>9}{'annual':>8}{'vsSPY':>8}{'Sharpe':>8}{'DD':>8}{'t':>6}{'mo':>5}", flush=True)
+    for k in order:
+        r = results[k]
+        star = "  <= price baseline" if k == "price_accel" else ("  <= BEST" if k == order[0] else "")
+        print(f"  {k:<15}{r['total']:>8}%{r['annual']:>7}%{r['vs_spy']:>8}{r['sharpe']:>8}{r['dd']:>7}%"
+              f"{str(r['t_stat']):>6}{r['months']:>5}{star}", flush=True)
+    best = order[0]; b = results[best]
+    verdict = (f"Price-accel {base['total']}% ({base['annual']}%/yr) over the forecast window. "
+               f"ARIMA {results['arima']['total']}%, SARIMA {results.get('sarima', {}).get('total', 'n/a')}%. "
+               f"BEST = {best}: {b['total']}%. "
+               + ("A forecast model beats price-accel." if best not in ("price_accel",) and b["total"] > base["total"] + 10
+                  else "ARIMA/SARIMA do NOT beat price momentum — return series are ~unpredictable at monthly sector level (as expected)."))
+    print("\n" + verdict, flush=True)
+    return {"computed_at": pd.Timestamp.utcnow().isoformat(),
+            "params": {"top_n": TOP_N, "conv": CONV, "warmup": WARMUP, "window_start": str(midx[start_i].date()),
+                       "months": int(base["months"]), "orders": "ARIMA(1,0,1); SARIMA(1,0,1)(1,0,0,12)",
+                       "objective": "MAX TOTAL RETURN"},
+            "results": results, "best": best, "verdict": verdict,
+            "caveat": "Expanding-window refit each month on monthly returns (no look-ahead); fixed orders (no auto "
+                      "pmdarima). Forecast starts after 24-mo warmup so window is shorter than the full flagship. "
+                      "All arms same window. PIT/no-fees/survivorship as base, div_2x, $5M vol."}
+
+
+def main():
+    p = build()
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(p, indent=2, default=str))
+    try:
+        from core.models import BacktestResult
+        from django.utils import timezone
+        BacktestResult.objects.update_or_create(
+            kind="arima", defaults={"payload": json.loads(json.dumps(p, default=str)), "computed_at": timezone.now()})
+        print("Saved BacktestResult[arima]", flush=True)
+    except Exception as e:
+        print("DB save failed:", e, flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -30,6 +30,7 @@ from studies import _tstat_from_returns
 from seq_fundamental_study import load_candles, load_financial_reports
 from trend_stock_studies import _pit_monthly_panel, _available_at, _ret_delist, CRYPTO
 from backtest_lowpb import _monthly_close, BENCH
+import price_basis
 
 OUT = Path(__file__).resolve().parent / ".data" / "studies" / "strategy_lab.json"
 LOOKBACK, TOP_N = 6, 10
@@ -81,7 +82,7 @@ def build():
         return p.reindex(index=midx, columns=common)
     px = stock_m[common]
     shares, equity, ni, debt = map(R, (shares, equity, ni, debt))
-    pb = (px * shares) / equity.where(equity != 0)
+    pb = (price_basis.as_traded_close(px) * shares) / equity.where(equity != 0)
     trap = (ni < 0) & (~(equity >= equity.shift(12))) & (~(ni > ni.shift(4)))
     low_debt = (debt / equity.where(equity != 0)) < 1.0
     quality = (pb > 0) & (~trap) & low_debt

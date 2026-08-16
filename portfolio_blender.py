@@ -28,6 +28,7 @@ from studies import _tstat_from_returns
 from seq_fundamental_study import load_candles, load_financial_reports
 from trend_stock_studies import _pit_monthly_panel, _available_at, _ret_delist, CRYPTO
 from backtest_lowpb import _monthly_close, BENCH
+import price_basis
 
 OUT = Path(__file__).resolve().parent / ".data" / "studies" / "portfolio_blender.json"
 LOOKBACK, TOP_N = 6, 10
@@ -89,7 +90,7 @@ def build():
         return p.reindex(index=midx, columns=common)
     px = stock_m[common]
     shares, equity, ni, debt = map(R, (shares, equity, ni, debt))
-    pb = (px * shares) / equity.where(equity != 0)
+    pb = (price_basis.as_traded_close(px) * shares) / equity.where(equity != 0)
     book_stable = equity >= equity.shift(12)
     ni_improving = ni > ni.shift(4)
     trap = (ni < 0) & (~book_stable) & (~ni_improving)

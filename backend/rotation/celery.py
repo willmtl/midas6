@@ -58,11 +58,14 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_eodhd_earnings",
         "schedule": crontab(hour=21, minute=5),
     },
-    # EODHD analyst estimate revisions (current vs 7d/30d) → EstimateRevision. Estimates move
-    # slowly, so weekly (Sunday) is enough. 21:10 UTC.
-    "eodhd-estimates-weekly": {
+    # EODHD analyst estimate revisions (current vs 7d/30d) → EstimateRevision. The Earnings::Trend
+    # endpoint returns ONLY the current snapshot — no history, NOT backfillable — so a PIT revision-
+    # momentum series can only accrue FORWARD. Weekly (~4 asof/mo) would take years to build a usable
+    # backtest; run WEEKDAY-DAILY (~21 asof/mo) to build it at monthly-rebalance resolution in months.
+    # ~1174 API calls/run; no-op without EODHD_API_KEY. 21:10 UTC Mon–Fri. [[always-want-history]]
+    "eodhd-estimates-daily": {
         "task": "api.celery_tasks.run_eodhd_estimates",
-        "schedule": crontab(hour=21, minute=10, day_of_week=0),
+        "schedule": crontab(hour=21, minute=10, day_of_week="1-5"),
     },
     # DISABLED 2026-08-09 (cutover to local LLM): classify_recent_news uses the Anthropic API and
     # sends headlines OUT of Docker, against the local-only constraint. The playbook fade flag +
@@ -192,6 +195,14 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_market_cap",
         "schedule": crontab(hour=20, minute=55),
     },
+    "polygon-etf-flows": {           # ETF fund flows (Polygon shares outstanding → creation/redemption)
+        "task": "api.celery_tasks.run_etf_flows",
+        "schedule": crontab(hour=21, minute=0),
+    },
+    "fred-macro-daily": {            # FRED macro/liquidity (M2, net liquidity, HY spread, curve)
+        "task": "api.celery_tasks.run_fred",
+        "schedule": crontab(hour=21, minute=8),
+    },
     "eodhd-delisted-weekly": {       # survivorship-free reference (weekly)
         "task": "api.celery_tasks.run_delisted",
         "schedule": crontab(hour=21, minute=5, day_of_week=0),
@@ -232,6 +243,10 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_signal_firing",
         "schedule": crontab(hour=22, minute=10),
     },
+    "sector-acceleration-nightly": {    # sector-acceleration leaderboard (the validated sector signal) — 22:03
+        "task": "api.celery_tasks.run_sector_acceleration",
+        "schedule": crontab(hour=22, minute=3),
+    },
     "rotation-picks-nightly": {         # live rotation-pick basket (cheapest-P/B in strong sectors)
         "task": "api.celery_tasks.run_rotation_picks",
         "schedule": crontab(hour=22, minute=5),
@@ -239,6 +254,10 @@ app.conf.beat_schedule = {
     "rotation-call-nightly": {          # flagship Rotation Call (regime-leaders ∩ value ∩ oversold entry)
         "task": "api.celery_tasks.run_rotation_call",
         "schedule": crontab(hour=22, minute=7),
+    },
+    "live-conviction-nightly": {        # score live basket 0-5, tag perfect plays — after picks — 22:12 UTC
+        "task": "api.celery_tasks.run_live_conviction",
+        "schedule": crontab(hour=22, minute=12),
     },
     "profitability-guard-weekly": {     # value-trap guard study (slow-moving) — Sundays 23:55 UTC
         "task": "api.celery_tasks.run_profitability_guard",
@@ -259,5 +278,25 @@ app.conf.beat_schedule = {
     "value-ranking-weekly": {           # which value metric picks the best name — Sat 23:46 UTC
         "task": "api.celery_tasks.run_value_ranking",
         "schedule": crontab(hour=23, minute=46, day_of_week=6),
+    },
+    "return-lab-weekly": {              # 4 return levers (concentration/leverage/orthogonal/regime) — Sat 23:40 UTC
+        "task": "api.celery_tasks.run_return_lab",
+        "schedule": crontab(hour=23, minute=40, day_of_week=6),
+    },
+    "deep-pool-weekly": {               # more-stocks-per-ETF (top-20 vs full pool) — Sat 23:34 UTC
+        "task": "api.celery_tasks.run_deep_pool",
+        "schedule": crontab(hour=23, minute=34, day_of_week=6),
+    },
+    "bear-defense-weekly": {            # dual-momentum bear overlay — Sat 23:30 UTC
+        "task": "api.celery_tasks.run_bear_defense",
+        "schedule": crontab(hour=23, minute=30, day_of_week=6),
+    },
+    "v2-strategy-weekly": {             # stacked v2 decomposition — Sat 23:26 UTC
+        "task": "api.celery_tasks.run_v2_strategy",
+        "schedule": crontab(hour=23, minute=26, day_of_week=6),
+    },
+    "walk-forward-weekly": {            # subperiod validation — Sat 23:22 UTC
+        "task": "api.celery_tasks.run_walk_forward",
+        "schedule": crontab(hour=23, minute=22, day_of_week=6),
     },
 }

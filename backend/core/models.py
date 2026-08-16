@@ -1007,6 +1007,49 @@ class MarketCapHistory(models.Model):
         return f"{self.ticker} {self.date} mc={self.market_cap}"
 
 
+class ETFFlow(models.Model):
+    """Daily ETF fund flow derived from Polygon `share_class_shares_outstanding` (which updates daily
+    with creations/redemptions — EODHD returns 'NA' and yfinance is empty for ETFs). flow_shares =
+    Δ(shares_out) vs the prior stored trading day; flow_usd = flow_shares × close; flow_pct =
+    flow_shares / prior shares_out. A real point-in-time flow signal: money entering a sector ETF can
+    confirm/lead its momentum, heavy outflow can mark capitulation. Source: Polygon dated ticker-details
+    (/v3/reference/tickers/{tk}?date=YYYY-MM-DD)."""
+    ticker = models.CharField(max_length=20, db_index=True)
+    date = models.DateField(db_index=True)
+    shares_out = models.BigIntegerField(null=True, blank=True)     # share_class_shares_outstanding as-of date
+    close = models.FloatField(null=True, blank=True)               # price used for flow_usd (DB adj close)
+    flow_shares = models.BigIntegerField(null=True, blank=True)    # Δ shares vs prior stored trading day
+    flow_usd = models.FloatField(null=True, blank=True)            # flow_shares × close
+    flow_pct = models.FloatField(null=True, blank=True)            # flow_shares / prior shares_out
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ["ticker", "date"]
+        indexes = [models.Index(fields=["ticker", "date"])]
+
+    def __str__(self):
+        return f"{self.ticker} {self.date} shares={self.shares_out} flow%={self.flow_pct}"
+
+
+class MacroSeries(models.Model):
+    """Macro / liquidity time series from FRED (fredgraph CSV endpoint — no API key needed). `series` is
+    the FRED series id: M2SL (M2 money supply), WALCL (Fed total assets), RRPONTSYD (o/n reverse repo),
+    WTREGEN (Treasury General Account), DTWEXBGS (broad USD index), BAMLH0A0HYM2 (HY OAS credit spread),
+    T10Y2Y (10y-2y curve). Feeds a liquidity-regime conditioner + a LEADING risk-off rule (the momentum-
+    ranked defensive sleeve was a lagging trigger — see the defensive_sleeve study)."""
+    series = models.CharField(max_length=32, db_index=True)
+    date = models.DateField(db_index=True)
+    value = models.FloatField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ["series", "date"]
+        indexes = [models.Index(fields=["series", "date"])]
+
+    def __str__(self):
+        return f"{self.series} {self.date}={self.value}"
+
+
 class DelistedCompany(models.Model):
     """Delisted / inactive tickers from EODHD (exchange 'delisted' list) — a survivorship-free
     reference so backtests can acknowledge names that later died (delisting = a real exit)."""

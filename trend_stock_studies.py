@@ -186,8 +186,15 @@ def _ret_delist(series, date, end):
         return e / s - 1
     win = series.loc[date:end].dropna()
     win = win[win > 0]
-    if len(win) <= 1:            # only the entry price survived (or nothing) -> total loss realized
-        return -1.0
+    if len(win) == 0:            # no valid price at all in the window (entry non-positive) -> can't realize
+        return None
+    # Delisting = exit at the LAST TRADED price (deal price for an M&A/going-private, last print for a fade).
+    # The old blanket -100% here was a BUG: it treated EVERY acquisition/rename/data-gap as a total loss
+    # (e.g. STMP/Stamps.com acquired @ $330 was booked at -100%), biasing delist-aware backtests badly
+    # pessimistic. When only the entry price survives (data ends at entry, len==1), this returns 0% = a flat
+    # exit at last-known price. LIMITATION: genuine gap-to-zero bankruptcies with no intermediate monthly
+    # print are now under-penalized (booked flat, not -100%); without a delisting-reason/daily feed this is
+    # the least-biased default. See memory delisted-survivorship / verify_survivorship.py.
     return win.iloc[-1] / s - 1
 
 
@@ -246,7 +253,10 @@ def run(save_db=False):
     shares_p = _pit_monthly_panel(reps, "shares_outstanding", midx)
     equity_p = _pit_monthly_panel(reps, "total_equity", midx)
     common = stock_monthly.columns.intersection(shares_p.columns).intersection(equity_p.columns)
-    pb_panel = (stock_monthly[common] * shares_p[common]) / equity_p[common].where(equity_p[common] != 0)
+    # P/B on AS-TRADED price (undo future-split back-adjustment look-ahead, finding #2); returns keep adj close.
+    import price_basis
+    px_at = price_basis.as_traded_close(stock_monthly[common], price_basis.refresh_splits(list(common)))
+    pb_panel = (px_at * shares_p[common]) / equity_p[common].where(equity_p[common] != 0)
     panels = {
         "beta": _point_in_time_beta(daily_close, sorted(all_holds), spy_daily),
         "insider": _insider_monthly_panel(sorted(all_holds), midx),
