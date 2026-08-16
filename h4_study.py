@@ -346,3 +346,186 @@ def agg_rows(pool, exit_keys, min_trades=20):
                      "t": _tstat_from_returns(list(a))})
     rows.sort(key=lambda x: -x["avg_pct"])
     return rows
+
+
+def _daily_trend_map(daily_df):
+    """{date -> 'up'|'dn'} from a daily OHLCV frame: 'up' when Close >= SMA(50), else 'dn'."""
+    if daily_df is None or len(daily_df) < 50:
+        return {}
+    sma = daily_df["Close"].rolling(50).mean()
+    state = np.where(daily_df["Close"] >= sma, "up", "dn")
+    return {d.date(): s for d, s in zip(daily_df.index, state)}
+
+
+def _merge_into(dst, src):
+    for k, v in src.items():
+        dst.setdefault(k, []).extend(v)
+
+
+def daily_benchmark(tickers):
+    """Same signals on DAILY DB candles as a scale benchmark. Returns {sig: [agg rows]}."""
+    from seq_fundamental_study import load_candles
+    daily = load_candles(tickers)
+    pools = {s: {} for s in SIGNALS}
+    for tk, df in daily.items():
+        if len(df) < 120:
+            continue
+        res = backtest_ticker(df)
+        for s in SIGNALS:
+            _merge_into(pools[s], res[s]["flat"])
+    return {s: agg_rows(pools[s], exit_keys_for(s)) for s in SIGNALS}
+
+
+def _accumulate(agg_flat, agg_bucket, agg_dtrend, res):
+    for s in SIGNALS:
+        _merge_into(agg_flat[s], res[s]["flat"])
+        for b, d in res[s]["by_bucket"].items():
+            for k, v in d.items():
+                agg_bucket[s][b].setdefault(k, []).extend(v)
+        for dstate in ("up", "dn"):
+            for k, v in res[s]["by_dtrend"][dstate].items():
+                agg_dtrend[s][dstate].setdefault(k, []).extend(v)
+
+
+def _bt_worker(tk, df, dtrend):
+    return tk, str(df.index[0].date()), str(df.index[-1].date()), backtest_ticker(df, dtrend=dtrend)
+
+
+def run(tickers, years, allow_fetch, jobs):
+    from intraday_data import get_4h
+    from seq_fundamental_study import load_candles
+    agg_flat = {s: {} for s in SIGNALS}
+    agg_bucket = {s: {b[0]: {} for b in SIGNALS[s]["buckets"]} for s in SIGNALS}
+    agg_dtrend = {s: {"up": {}, "dn": {}} for s in SIGNALS}
+    daily_all = load_candles(tickers)                       # for daily-trend maps (parent-side, no MP DB)
+    got, spans = 0, []
+
+    def _one(tk):
+        df = get_4h(tk, years, allow_fetch)
+        if df is None or len(df) < 120:
+            return None
+        dtrend = _daily_trend_map(daily_all.get(tk))
+        return tk, str(df.index[0].date()), str(df.index[-1].date()), backtest_ticker(df, dtrend=dtrend)
+
+    if jobs and jobs > 1:
+        from multiprocessing import Pool
+        # Fetch must be single-threaded (rate limit); pre-fetch serially, then compute in parallel.
+        for tk in tickers:
+            get_4h(tk, years, allow_fetch)
+        payloads = [(tk, get_4h(tk, years, False)) for tk in tickers]
+        payloads = [(tk, df) for tk, df in payloads if df is not None and len(df) >= 120]
+        with Pool(jobs) as pool:
+            results = pool.starmap(_bt_worker, [(tk, df, _daily_trend_map(daily_all.get(tk)))
+                                                for tk, df in payloads])
+        for item in results:
+            if item is None:
+                continue
+            tk, d0, d1, res = item
+            got += 1
+            spans.append((tk, d0, d1))
+            _accumulate(agg_flat, agg_bucket, agg_dtrend, res)
+    else:
+        for i, tk in enumerate(tickers):
+            item = _one(tk)
+            if item is None:
+                continue
+            tk_, d0, d1, res = item
+            got += 1
+            spans.append((tk_, d0, d1))
+            _accumulate(agg_flat, agg_bucket, agg_dtrend, res)
+            if (i + 1) % 25 == 0:
+                print(f"  ...{i + 1}/{len(tickers)} ({got} with data)", flush=True)
+
+    bench = daily_benchmark([s[0] for s in spans] or tickers)
+    signals_payload = {}
+    for s in SIGNALS:
+        eks = exit_keys_for(s)
+        border = [b[0] for b in SIGNALS[s]["buckets"]]
+        signals_payload[s] = {
+            "name": SIGNALS[s]["name"], "family": SIGNALS[s]["family"],
+            "all": agg_rows(agg_flat[s], eks),
+            "by_bucket": {b: agg_rows(agg_bucket[s][b], eks) for b in border},
+            "bucket_order": border,
+            "by_dtrend": {d: agg_rows(agg_dtrend[s][d], eks) for d in ("up", "dn")},
+            "daily": bench[s],
+        }
+    earliest = min((s[1] for s in spans), default=None)
+    latest = max((s[2] for s in spans), default=None)
+    return {
+        "families": FAMILIES,
+        "signals": signals_payload,
+        "params": {"timeframe": "4h", "universe": "liquid top stocks", "n_with_data": got,
+                   "exit_bars": FIXED_BARS, "episode_gap_bars": GAP,
+                   "history": {"from": earliest, "to": latest}},
+    }
+
+
+def main():
+    import os, json, argparse
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings")
+    import django
+    django.setup()
+    import pandas as pd
+    from pathlib import Path
+    from intraday_data import liquid_universe
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=250, help="universe size (top-N by dollar volume)")
+    ap.add_argument("--limit", type=int, default=None, help="cap tickers actually processed")
+    ap.add_argument("--no-fetch", action="store_true")
+    ap.add_argument("--jobs", type=int, default=1)
+    ap.add_argument("--years", type=float, default=5)
+    ap.add_argument("--families", default=None, help="comma list to restrict SIGNALS by family")
+    args = ap.parse_args()
+
+    if args.families:
+        keep = set(args.families.split(","))
+        for k in [k for k, m in SIGNALS.items() if m["family"] not in keep]:
+            del SIGNALS[k]
+        FAMILIES.clear()
+        for k, m in SIGNALS.items():
+            FAMILIES.setdefault(m["family"], []).append(k)
+
+    tickers = liquid_universe(n=args.n)
+    if args.limit:
+        tickers = tickers[:args.limit]
+    print(f"{len(tickers)} liquid tickers | {len(SIGNALS)} signals | jobs={args.jobs} | "
+          f"fetch={'off' if args.no_fetch else 'on'}", flush=True)
+
+    payload = run(tickers, args.years, allow_fetch=not args.no_fetch, jobs=args.jobs)
+    payload["computed_at"] = pd.Timestamp.utcnow().isoformat()
+    payload["note"] = ("EODHD 1h resampled to 4h; entry at signal-bar close; episode-deduped; NO fees. "
+                       "Exits are in BARS (0-3 day focus). Every signal bucketed by magnitude (tail-not-"
+                       "average) and split by the stock's DAILY trend. 'daily' column = same signal on DB "
+                       "daily candles. Caveats: EODHD 1h depth varies; current-liquid universe = survivorship "
+                       "bias; NewsItem not backfilled pre-2025 so the event family is price-based only.")
+
+    STUD = Path(__file__).resolve().parent / ".data" / "studies"
+    STUD.mkdir(parents=True, exist_ok=True)
+    (STUD / "h4_study.json").write_text(json.dumps(payload, indent=2, default=str))
+    try:
+        from core.models import BacktestResult
+        from django.utils import timezone
+        BacktestResult.objects.update_or_create(
+            kind="h4_study",
+            defaults={"payload": json.loads(json.dumps(payload, default=str)),
+                      "computed_at": timezone.now()})
+        print("saved BacktestResult[h4_study]", flush=True)
+    except Exception as e:
+        print("DB save failed:", e, flush=True)
+
+    # Console summary: best exit per signal by avg return.
+    for fam, sigs in FAMILIES.items():
+        print(f"\n=== {fam} ===", flush=True)
+        for s in sigs:
+            rows = payload["signals"][s]["all"]
+            if rows:
+                b = rows[0]
+                print(f"  {s:16} best {b['exit']:4} avg {b['avg_pct']:+.2f}% win {b['win_pct']}% "
+                      f"t={b['t']} n={b['trades']}", flush=True)
+            else:
+                print(f"  {s:16} (no exit reached n>=20)", flush=True)
+
+
+if __name__ == "__main__":
+    main()

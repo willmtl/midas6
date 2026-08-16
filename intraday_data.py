@@ -81,10 +81,12 @@ def get_4h(ticker, years=5, allow_fetch=True):
 
 
 def liquid_universe(n=250, months=12):
-    """Top-`n` stocks by MEDIAN daily dollar-volume (close*volume) over the trailing `months`, from DB
-    daily Candle, restricted to tickers that have a Fundamental row and are NOT sector ETFs. Lazy DB
-    import so this module imports without Django. Respects the Postgres /dev/shm limit by disabling
-    parallel gather for the aggregate scan."""
+    """Top-`n` US stocks by MEDIAN daily dollar-volume (close*volume, USD) over the trailing `months`,
+    from DB daily Candle. Restricted to tickers that have a Fundamental row, are NOT sector ETFs, and
+    are US-listed (no exchange suffix like .KS/.T/.HK) — foreign listings are priced in local currency
+    (contaminating the dollar-volume rank) and EODHD serves them under a non-.US suffix so the 1h fetch
+    would fail. Lazy DB import so this module imports without Django. Respects the Postgres /dev/shm
+    limit by disabling parallel gather for the aggregate scan."""
     import django
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings")
     django.setup()
@@ -104,6 +106,6 @@ def liquid_universe(n=250, months=12):
         rows = cur.fetchall()
     ranked = sorted(
         ((tk, float(mdv or 0)) for tk, mdv in rows
-         if tk in funda and tk not in etfs and mdv),
+         if tk in funda and tk not in etfs and "." not in tk and mdv),
         key=lambda x: -x[1])
     return [tk for tk, _ in ranked[:n]]
