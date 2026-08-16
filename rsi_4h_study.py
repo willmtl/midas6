@@ -25,6 +25,7 @@ django.setup()
 
 import ta
 from studies import _episode_starts, _tstat_from_returns
+from intraday_data import fetch_1h, resample_ohlc, get_4h
 
 RSI_P = 14
 SMA_P = 14
@@ -42,52 +43,6 @@ RTH_HOURS = 6.5
 FIXED_BARS = [1, 2, 3, 5, 10, 20, 40]
 
 
-def fetch_1h(sym, years):
-    """Paginated EODHD 1h intraday back ~`years` (120-day windows). Returns a UTC-indexed OHLCV df."""
-    end = int(time.time())
-    floor = end - int(years * 365.25 * 86400)
-    frames, cur_to = [], end
-    for _ in range(80):
-        cur_from = max(floor, cur_to - 120 * 86400)
-        u = (f"https://eodhd.com/api/intraday/{sym}?interval=1h&from={cur_from}&to={cur_to}"
-             f"&api_token={EOD}&fmt=json")
-        try:
-            import requests
-            r = requests.get(u, timeout=30)
-            if r.status_code != 200:
-                break
-            j = r.json()
-        except Exception:
-            break
-        if isinstance(j, list) and j:
-            frames.append(pd.DataFrame(j))
-            earliest = min(x["timestamp"] for x in j)
-            if cur_from <= floor or earliest <= floor:
-                break
-        else:
-            if cur_from <= floor:
-                break
-        cur_to = cur_from
-        time.sleep(0.25)
-    if not frames:
-        return None
-    df = pd.concat(frames, ignore_index=True).drop_duplicates("timestamp")
-    df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-    df = (df.set_index("dt").sort_index()[["open", "high", "low", "close", "volume"]]
-          .apply(pd.to_numeric, errors="coerce").dropna())
-    return df
-
-
-def resample_ohlc(df, hours, from_1h=False):
-    """Resample to `hours`-bar OHLCV. Works from 1h bars (raw EODHD, lower-cased cols) or from an
-    already-4h frame (Title-cased cols) — 8h/12h bin boundaries align with 4h, so it's exact."""
-    cols = ["open", "high", "low", "close", "volume"] if from_1h else ["Open", "High", "Low", "Close", "Volume"]
-    agg = {c: f for c, f in zip(cols, ["first", "max", "min", "last", "sum"])}
-    out = df[cols].resample(f"{hours}h").agg(agg).dropna()
-    out.columns = ["Open", "High", "Low", "Close", "Volume"]
-    return out
-
-
 def get_tf(ticker, tf, years, allow_fetch):
     """4h is fetched (1h→4h) and cached; 8h/12h are resampled UP from the cached 4h (no re-fetch)."""
     hours = TF_HOURS[tf]
@@ -99,12 +54,7 @@ def get_tf(ticker, tf, years, allow_fetch):
         except Exception:
             pass
     if tf == "4h":
-        if not allow_fetch or not EOD:
-            return None
-        raw = fetch_1h(f"{ticker}.US", years)
-        if raw is None or raw.empty:
-            return None
-        df = resample_ohlc(raw, 4, from_1h=True)
+        return get_4h(ticker, years, allow_fetch)         # shared fetch/cache (same parquet path)
     else:
         four = get_tf(ticker, "4h", years, allow_fetch)   # reuse the cached 4h
         if four is None:
