@@ -87,6 +87,7 @@ x-backend-volumes: &backend-volumes
   - ./h4_c_fees.py:/app/h4_c_fees.py
   - ./h4_c_liquidfloor.py:/app/h4_c_liquidfloor.py
   - ./h4_c_options.py:/app/h4_c_options.py
+  - ./h4_c_optstrat.py:/app/h4_c_optstrat.py
   - ./news_overreaction.py:/app/news_overreaction.py
   - ./ground_earnings.py:/app/ground_earnings.py
   - ./signal_firing_scan.py:/app/signal_firing_scan.py

@@ -125,17 +125,19 @@ def _stressed(daily, d):
 
 
 def _weight_of(tr, mode, wmap):
-    """Position weight for a trade under a sizing mode."""
+    """Position weight for a trade under a sizing mode. Multiplied by tr['opt_mult'] (options amplifier;
+    defaults 1.0) so option signals can up/down-weight a dip without touching other callers."""
+    om = tr.get("opt_mult", 1.0)
     if mode == "continuous":
-        return _cont_weight(tr["upside"])
+        return _cont_weight(tr["upside"]) * om
     if mode == "vol_parity":                     # risk-parity: down-size the wildest names
         v = tr.get("vol")
-        return 0.0 if (not v or v <= 0) else float(min(VOLPARITY_CAP, TARGET_VOL / v))
+        return (0.0 if (not v or v <= 0) else float(min(VOLPARITY_CAP, TARGET_VOL / v))) * om
     if mode == "vol_parity_x_conv":              # risk-parity scaled by conviction (upside)
         v = tr.get("vol")
         base = 0.0 if (not v or v <= 0) else float(min(VOLPARITY_CAP, TARGET_VOL / v))
-        return base * (WEIGHTS["steep_2x"].get(tr["bucket"], 0) / 2.0)
-    return wmap.get(tr["bucket"], 0)
+        return base * (WEIGHTS["steep_2x"].get(tr["bucket"], 0) / 2.0) * om
+    return wmap.get(tr["bucket"], 0) * om
 
 
 def simulate(trades, daily, spybar, cfg):
