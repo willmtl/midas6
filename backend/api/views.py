@@ -1882,6 +1882,15 @@ class H4CIndicatorsView(_StudyResultView):
     json_path = "/app/.data/studies/h4_c_indicators.json"
 
 
+class H4CUpsideView(_StudyResultView):
+    """H4-on-C 0-3 day entries bucketed by PIT analyst implied-upside (target/price-1, dated Benzinga
+    archive) — does the dip-buy pay more on high-upside deep-value C names? GET reads
+    BacktestResult[h4_c_upside]; POST recomputes (long — fetch)."""
+    kind = "h4_c_upside"
+    script = "h4_c_upside.py"
+    json_path = "/app/.data/studies/h4_c_upside.json"
+
+
 class SignalFiringView(APIView):
     """Names (stock/ETF/commodity) currently firing a given study signal (last N bars).
     GET ?signal=<key> -> the firing list for the Studies 'firing now' pane."""
