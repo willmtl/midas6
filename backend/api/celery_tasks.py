@@ -729,6 +729,49 @@ def run_burst_scan():
 
 
 @shared_task
+def run_h4_c_live():
+    """Nightly (after rotation picks): LIVE H4 dip-buy scan on the current C value basket → refetches
+    fresh 4h for the ~10 basket names, saves BacktestResult[h4_c_live], and Slack-alerts any C name
+    firing an H4 oversold dip now (ranked by the h4_c_upside study's per-upside-bucket expected 3b).
+    EXPANDED_UNIVERSE=1 so the basket matches the live rotation picks."""
+    import os, subprocess
+    if not os.path.exists("/app/h4_c_live_scan.py"):
+        logger.error("run_h4_c_live: /app/h4_c_live_scan.py not found (mount it)")
+        return {"error": "not mounted"}
+    env = {**os.environ, "EXPANDED_UNIVERSE": "1"}
+    proc = subprocess.run(["python", "-u", "/app/h4_c_live_scan.py"], cwd="/app", env=env,
+                          capture_output=True, text=True, timeout=1200)
+    if proc.returncode != 0:
+        logger.error("h4_c_live_scan failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+        return proc.returncode
+    # Alert on any firing name (Slack/Discord/generic webhook; logged-only if unset).
+    try:
+        from core.models import BacktestResult
+        row = BacktestResult.objects.filter(kind="h4_c_live").first()
+        firing = [r for r in ((row.payload or {}).get("rows") or []) if r.get("is_firing")] if row else []
+        if firing:
+            def _line(r):
+                up = f"{r.get('upside_pct'):+.0f}%" if r.get("upside_pct") is not None else "n/a"
+                exp = f"{r.get('expected_3b'):+.2f}%/3b" if r.get("expected_3b") is not None else ""
+                sigs = ",".join(s.get("key") for s in (r.get("fired_signals") or []))
+                return f"• {r['ticker']} ({r.get('sector')}) — {r.get('conviction')} upside {up} {exp} [{sigs}]"
+            text = ("*H4 Dip-Buy — %d C name(s) in an oversold dip now:*\n%s"
+                    % (len(firing), "\n".join(_line(r) for r in firing)))
+            webhook = os.environ.get("FRESH_ALERT_WEBHOOK")
+            if webhook:
+                from api.tasks import _post_slack
+                _post_slack(webhook, text)
+                logger.info("h4_c_live alert sent: %d firing", len(firing))
+            else:
+                logger.warning("FRESH_ALERT_WEBHOOK not set — h4_c_live alert logged only:\n%s", text)
+        else:
+            logger.info("h4_c_live: 0 firing, no alert")
+    except Exception as e:
+        logger.error("h4_c_live alert step failed: %s", e)
+    return proc.returncode
+
+
+@shared_task
 def run_backtest_decomp():
     """Nightly: rotation-edge decomposition (pick vs rotation vs both, 200MA both-numbers,
     value×technical) → BacktestResult[decomposition]. Runs AFTER candles/fundamentals refresh."""

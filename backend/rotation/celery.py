@@ -259,6 +259,10 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_live_conviction",
         "schedule": crontab(hour=22, minute=12),
     },
+    "h4-c-live-nightly": {              # live H4 dip-buy on the C basket (oversold dip × analyst upside) + alert — after picks
+        "task": "api.celery_tasks.run_h4_c_live",
+        "schedule": crontab(hour=22, minute=25),
+    },
     "profitability-guard-weekly": {     # value-trap guard study (slow-moving) — Sundays 23:55 UTC
         "task": "api.celery_tasks.run_profitability_guard",
         "schedule": crontab(hour=23, minute=55, day_of_week=0),
