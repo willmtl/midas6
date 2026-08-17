@@ -1891,6 +1891,15 @@ class H4CUpsideView(_StudyResultView):
     json_path = "/app/.data/studies/h4_c_upside.json"
 
 
+class H4CLiveView(_StudyResultView):
+    """LIVE H4 dip-buy scanner on the current daily-C value basket: which C names are in an H4 oversold
+    dip NOW, ranked by the h4_c_upside study's expected 3b return for the signal × analyst-upside bucket.
+    GET reads BacktestResult[h4_c_live]; POST re-scans (fetches fresh 4h for the ~10 basket names)."""
+    kind = "h4_c_live"
+    script = "h4_c_live_scan.py"
+    json_path = "/app/.data/studies/h4_c_live.json"
+
+
 class SignalFiringView(APIView):
     """Names (stock/ETF/commodity) currently firing a given study signal (last N bars).
     GET ?signal=<key> -> the firing list for the Studies 'firing now' pane."""

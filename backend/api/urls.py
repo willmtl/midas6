@@ -72,6 +72,8 @@ urlpatterns = [
     path("h4-c-indicators", views.H4CIndicatorsView.as_view(), name="h4-c-indicators"),
     # H4-on-C entries bucketed by PIT analyst implied-upside (deep-value dip-buy)
     path("h4-c-upside", views.H4CUpsideView.as_view(), name="h4-c-upside"),
+    # LIVE H4 dip-buy scanner on the current C basket (oversold dip now × analyst upside)
+    path("h4-c-live", views.H4CLiveView.as_view(), name="h4-c-live"),
     # Per-signal live firing (names firing each study signal in the last N bars)
     path("signal-firing", views.SignalFiringView.as_view(), name="signal-firing"),
     # Live rotation-pick scanner (cheapest-P/B in each strengthening sector)
