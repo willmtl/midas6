@@ -73,7 +73,7 @@ def collect(mode, allowedC, store, sectors):
             if not sched:
                 continue
             trades.append({"entry_ts": ts[i], "bucket": bucket_upside(up), "upside": up,
-                           "sector": sectors.get(tk, tk), "sched": sched})
+                           "sector": sectors.get(tk, tk), "sched": sched, "vol": float(vol[i])})
     return trades
 
 
@@ -89,14 +89,18 @@ def main():
 
     BASE = {"weight": "steep_2x", "hold": E.HOLD_FIXED, "gate": True}
     BEST = {"weight": "steep_4x", "hold": E.HOLD_FIXED, "gate": False, "hedge_frac": 0.5}
+    VP = {"weight": "vol_parity", "hold": E.HOLD_FIXED, "gate": False, "hedge_frac": 0.5}          # risk-parity + hedge
+    VPX = {"weight": "vol_parity_x_conv", "hold": E.HOLD_FIXED, "gate": False, "hedge_frac": 0.5}  # risk-parity x conviction
     rows = []
     for uni in ["C_only", "highvol_in_C", "highvol"]:
         trades = collect(uni, allowedC, store, sectors)
-        for cfgname, cfg in [("baseline", BASE), ("steep4x+hedge50", BEST)]:
+        for cfgname, cfg in [("baseline", BASE), ("steep4x+hedge50", BEST),
+                             ("volparity+hedge", VP), ("volparity_x_conv+hedge", VPX)]:
             m = E.simulate(trades, daily, spybar, cfg)
             rows.append({"universe": uni, "config": cfgname, "n_trades_pool": len(trades), **m})
             print(f"  {uni:14} {cfgname:16} n{len(trades):>6}  total {m['total_return_pct']:>8}%  "
-                  f"DD {m['max_dd_pct']:>7}  Sh {m['sharpe']:>5}  taken {m['n_taken']}", flush=True)
+                  f"DD {m['max_dd_pct']:>7} @{m.get('dd_start')}->{m.get('dd_end')}  Sh {m['sharpe']:>5}  "
+                  f"[data from {m.get('data_start')}]", flush=True)
 
     payload = {"computed_at": pd.Timestamp.utcnow().isoformat(), "rows": rows,
                "params": {"vol_band_pct": [VOL_LO, VOL_HI], "min_dvol": MIN_DVOL, "signals": SIGS},

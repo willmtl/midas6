@@ -115,15 +115,34 @@ def _spy(years=5):
     return daily, bar
 
 
+TARGET_VOL = 60.0        # vol-parity target (% annualized): size = TARGET_VOL / name_vol, capped
+VOLPARITY_CAP = 4.0
+
+
 def _stressed(daily, d):
     info = daily.get(d, {})
     return info.get("r1", 0.0) <= -SELLOFF_THR or info.get("r3", 0.0) <= -STRESS3D_THR
 
 
+def _weight_of(tr, mode, wmap):
+    """Position weight for a trade under a sizing mode."""
+    if mode == "continuous":
+        return _cont_weight(tr["upside"])
+    if mode == "vol_parity":                     # risk-parity: down-size the wildest names
+        v = tr.get("vol")
+        return 0.0 if (not v or v <= 0) else float(min(VOLPARITY_CAP, TARGET_VOL / v))
+    if mode == "vol_parity_x_conv":              # risk-parity scaled by conviction (upside)
+        v = tr.get("vol")
+        base = 0.0 if (not v or v <= 0) else float(min(VOLPARITY_CAP, TARGET_VOL / v))
+        return base * (WEIGHTS["steep_2x"].get(tr["bucket"], 0) / 2.0)
+    return wmap.get(tr["bucket"], 0)
+
+
 def simulate(trades, daily, spybar, cfg):
     """cfg: weight('steep_2x'|...|'continuous'), hold(dict), gate(bool), hedge_frac(float),
     calm_lev(float|None gross cap when calm), sector_cap(int|None)."""
-    wmap = None if cfg["weight"] == "continuous" else WEIGHTS[cfg["weight"]]
+    mode = cfg["weight"]
+    wmap = WEIGHTS.get(mode)                      # None for continuous / vol_parity modes
     hold = cfg["hold"]
     ebt = defaultdict(list); allts = set()
     for tr in trades:
@@ -162,13 +181,13 @@ def simulate(trades, daily, spybar, cfg):
         news = ebt.get(t, [])
         if cfg.get("gate") and news and stressed:
             news = []
-        news = sorted(news, key=lambda x: (-(_cont_weight(x["upside"]) if wmap is None else wmap.get(x["bucket"], 0))))
+        news = sorted(news, key=lambda x: -_weight_of(x, mode, wmap))
         if cfg.get("sector_cap"):
             per = defaultdict(int)
             for p in open_pos:
                 per[p["sector"]] += 1
         for tr in news:
-            w = _cont_weight(tr["upside"]) if wmap is None else wmap.get(tr["bucket"], 0)
+            w = _weight_of(tr, mode, wmap)
             if w <= 0:
                 continue
             if cfg.get("sector_cap"):
@@ -185,14 +204,21 @@ def simulate(trades, daily, spybar, cfg):
     sd = rets.std(ddof=1) if len(rets) > 1 else 0
     sharpe = round(float(rets.mean() / sd * np.sqrt(C.BARS_PER_YEAR)), 2) if sd > 0 else 0.0
     peaks = np.maximum.accumulate(eq)
-    maxdd = round(float(((eq - peaks) / peaks).min() * 100), 1)
+    dd_series = (eq - peaks) / peaks
+    trough_i = int(dd_series.argmin())
+    peak_i = int(np.argmax(eq[:trough_i + 1])) if trough_i > 0 else 0
+    maxdd = round(float(dd_series.min() * 100), 1)
+    dd_start = str(eq_ts[peak_i])[:10] if eq_ts else None
+    dd_end = str(eq_ts[trough_i])[:10] if eq_ts else None
+    span_start = str(eq_ts[0])[:10] if eq_ts else None      # earliest bar in the sim (data span)
     # loss streak
     best = strk = 0
     for _, r in sorted(taken_pnl):
         strk = strk + 1 if r <= 0 else 0
         best = max(best, strk)
     return {"total_return_pct": total, "sharpe": sharpe, "max_dd_pct": maxdd,
-            "n_taken": n_taken, "max_loss_streak": best}
+            "n_taken": n_taken, "max_loss_streak": best,
+            "dd_start": dd_start, "dd_end": dd_end, "data_start": span_start}
 
 
 def main():
