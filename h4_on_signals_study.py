@@ -198,3 +198,118 @@ def candidate_windows(selector, b_limit=None):
                 merged.setdefault(tk, set()).update(s)
         return merged, {"n_windows": nwin, "n_names": len(merged)}
     raise ValueError(selector)
+
+
+def _merge(dst, src):
+    for k, v in src.items():
+        dst.setdefault(k, []).extend(v)
+
+
+def _base_rate(frames, horizon_bars=3):
+    pool = []
+    for df in frames.values():
+        c = df["Close"].values
+        if len(c) > horizon_bars:
+            r = (c[horizon_bars:] - c[:-horizon_bars]) / c[:-horizon_bars] * 100
+            pool.extend([x for x in r if np.isfinite(x)])
+    return round(float(np.mean(pool)), 3) if pool else None
+
+
+def run_selector(selector, years, allow_fetch, b_limit=None):
+    from intraday_data import get_4h
+    allowed, cwmeta = candidate_windows(selector, b_limit=b_limit)
+    names = sorted(allowed)
+    flat = {s: {} for s in H.SIGNALS}
+    bucket = {s: {b[0]: {} for b in H.SIGNALS[s]["buckets"]} for s in H.SIGNALS}
+    frames = {}
+    got = dropped = 0
+    for tk in names:
+        df = get_4h(tk, years, allow_fetch)
+        if df is None or len(df) < 120:
+            dropped += 1
+            continue
+        got += 1
+        frames[tk] = df
+        res = backtest_ticker_masked(df, allowed[tk])
+        for s in H.SIGNALS:
+            _merge(flat[s], res[s]["flat"])
+            for b, d in res[s]["by_bucket"].items():
+                for k, v in d.items():
+                    bucket[s][b].setdefault(k, []).extend(v)
+    standalone = {}
+    try:
+        from core.models import BacktestResult
+        h4 = BacktestResult.objects.get(kind="h4_study").payload
+        standalone = {s: h4["signals"][s]["all"] for s in H.SIGNALS if s in h4.get("signals", {})}
+    except Exception:
+        pass
+    base3 = _base_rate(frames, 3)
+    sigs = {}
+    for s in H.SIGNALS:
+        eks = H.exit_keys_for(s)
+        border = [b[0] for b in H.SIGNALS[s]["buckets"]]
+        sigs[s] = {"name": H.SIGNALS[s]["name"], "family": H.SIGNALS[s]["family"],
+                   "all": H.agg_rows(flat[s], eks),
+                   "by_bucket": {b: H.agg_rows(bucket[s][b], eks) for b in border},
+                   "bucket_order": border,
+                   "standalone_h4": standalone.get(s, [])}
+    return {"selector": selector, "families": H.FAMILIES, "signals": sigs,
+            "candidates": {**cwmeta, "n_with_4h": got, "n_dropped_no_4h": dropped},
+            "base_rate_3b": base3}
+
+
+def run(selectors, years, allow_fetch, b_limit=None):
+    return {sel: run_selector(sel, years, allow_fetch, b_limit=b_limit) for sel in selectors}
+
+
+def main():
+    import os, json, argparse
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings")
+    import django; django.setup()
+    from pathlib import Path
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selector", default="all", help="A|B|C|union|all")
+    ap.add_argument("--no-fetch", action="store_true", help="fast pass: cached 4h only")
+    ap.add_argument("--b-limit", type=int, default=None, help="cap B universe (fast verify)")
+    ap.add_argument("--years", type=float, default=5)
+    args = ap.parse_args()
+    sels = ["C", "A", "B", "union"] if args.selector == "all" else [args.selector]
+    print(f"selectors={sels} fetch={'off' if args.no_fetch else 'on'}", flush=True)
+    payload = {"by_selector": {}}
+    for sel in sels:
+        print(f"[{sel}] building candidate windows + masked backtest...", flush=True)
+        payload["by_selector"][sel] = run_selector(sel, args.years, allow_fetch=not args.no_fetch, b_limit=args.b_limit)
+        c = payload["by_selector"][sel]["candidates"]
+        print(f"[{sel}] done: {c}", flush=True)
+    payload["computed_at"] = pd.Timestamp.utcnow().isoformat()
+    payload["note"] = ("Daily A/B/C signal selects the name; the H4 engine times a 0-3 day entry inside the "
+                       "candidate window. Bucketed by magnitude; benchmarked vs standalone H4 (broad universe) "
+                       "and the candidate base rate. Gross of fees; EODHD 1h depth varies (dropped names counted); "
+                       "current-membership candidate universe = survivorship bias; small/mid-cap H4 liquidity thinner.")
+    STUD = Path(__file__).resolve().parent / ".data" / "studies"
+    STUD.mkdir(parents=True, exist_ok=True)
+    (STUD / "h4_on_signals.json").write_text(json.dumps(payload, indent=2, default=str))
+    try:
+        from core.models import BacktestResult
+        from django.utils import timezone
+        BacktestResult.objects.update_or_create(
+            kind="h4_on_signals",
+            defaults={"payload": json.loads(json.dumps(payload, default=str)), "computed_at": timezone.now()})
+        print("saved BacktestResult[h4_on_signals]", flush=True)
+    except Exception as e:
+        print("DB save failed:", e, flush=True)
+    for sel, p in payload["by_selector"].items():
+        print(f"\n=== {sel}  ({p['candidates']}) base3b={p['base_rate_3b']} ===", flush=True)
+        rows = []
+        for s, d in p["signals"].items():
+            best3 = next((r for r in d["all"] if r["exit"] == "3b"), None)
+            if best3:
+                sa = next((r for r in d["standalone_h4"] if r["exit"] == "3b"), None)
+                rows.append((s, best3, sa))
+        for s, b, sa in sorted(rows, key=lambda x: -x[1]["avg_pct"]):
+            saj = f"(standalone {sa['avg_pct']:+.2f}%)" if sa else ""
+            print(f"  {s:16} 3b avg {b['avg_pct']:+.2f}% win {b['win_pct']}% t={b['t']} n={b['trades']} {saj}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
