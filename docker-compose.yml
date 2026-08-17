@@ -89,6 +89,7 @@ x-backend-volumes: &backend-volumes
   - ./h4_c_options.py:/app/h4_c_options.py
   - ./h4_c_optstrat.py:/app/h4_c_optstrat.py
   - ./h4_c_short.py:/app/h4_c_short.py
+  - ./fetch_short_interest.py:/app/fetch_short_interest.py
   - ./news_overreaction.py:/app/news_overreaction.py
   - ./ground_earnings.py:/app/ground_earnings.py
   - ./signal_firing_scan.py:/app/signal_firing_scan.py

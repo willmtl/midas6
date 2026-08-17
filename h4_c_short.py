@@ -72,12 +72,40 @@ def main():
     from h4_on_signals_study import candidate_windows
     from core.models import Fundamental, OptionSnapshot
 
+    import datetime as _dt
     allowedC, _ = candidate_windows("C")
     names = sorted(allowedC)
-    # short interest (Fundamental, dated) + put/call OI (OptionSnapshot)
-    fund = _asof_store(Fundamental.objects.filter(ticker__in=names)
-                       .values("ticker", "date", "short_pct_float", "short_ratio").order_by("ticker", "date"),
-                       ["short_pct_float", "short_ratio"])
+    # DATED short interest from the Polygon backfill archive (.data/short_interest.jsonl); ~8-business-day
+    # publication lag baked into the as-of so it's point-in-time (short interest is public ~8d after settlement).
+    LAG = _dt.timedelta(days=11)
+    si = {}
+    try:
+        with open("/app/.data/short_interest.jsonl") as fh:
+            for line in fh:
+                r = json.loads(line)
+                d = r.get("date")
+                if not d or r.get("days_to_cover") is None:
+                    continue
+                rec = si.setdefault(r["ticker"], ([], {"days_to_cover": [], "short_interest": []}))
+                rec[0].append(_dt.date.fromisoformat(d))
+                rec[1]["days_to_cover"].append(r["days_to_cover"])
+                rec[1]["short_interest"].append(r["short_interest"])
+    except FileNotFoundError:
+        print("WARN: short_interest.jsonl not found — run fetch_short_interest.py first", flush=True)
+
+    def si_asof(tk, d):
+        rec = si.get(tk)
+        if not rec:
+            return None
+        i = bisect.bisect_right(rec[0], d - LAG) - 1        # most recent settlement public by date d
+        if i < 0:
+            return None
+        dtc = rec[1]["days_to_cover"][i]
+        prev = rec[1]["short_interest"][i - 1] if i >= 1 else None
+        cur = rec[1]["short_interest"][i]
+        chg = ((cur / prev - 1) * 100) if (prev and cur is not None and prev > 0) else None
+        return {"days_to_cover": dtc, "si_change_pct": chg}
+
     opt = _asof_store(OptionSnapshot.objects.filter(ticker__in=names).exclude(pc_oi=None)
                       .values("ticker", "date", "pc_oi").order_by("ticker", "date"), ["pc_oi"])
 
@@ -99,7 +127,7 @@ def main():
             if i + 3 >= n or c[i] <= 0 or ts[i].date() not in ad:
                 continue
             feats = {}
-            f1 = _asof(fund, tk, ts[i].date(), ["short_pct_float", "short_ratio"])
+            f1 = si_asof(tk, ts[i].date())
             if f1:
                 feats.update(f1)
             f2 = _asof(opt, tk, ts[i].date(), ["pc_oi"])
@@ -108,12 +136,14 @@ def main():
             r3 = (c[i + 3] - c[i]) / c[i] * 100
             entries.append((r3, feats))
 
-    out = {f: _bucket(entries, f) for f in ["short_pct_float", "short_ratio", "pc_oi"]}
+    FEATS = ["days_to_cover", "si_change_pct", "pc_oi"]
+    out = {f: _bucket(entries, f) for f in FEATS}
     payload = {"computed_at": pd.Timestamp.utcnow().isoformat(), "n_names": n_names, "n_entries": len(entries),
                "by_feature": out,
-               "note": ("C oversold-dip 3-bar return bucketed by positioning: short_pct_float / short_ratio "
-                        "(Fundamental, as-of) and pc_oi (put/call OPEN interest, OptionSnapshot — thin history). "
-                        "Each shown both ways (Q1 low..Q5 high). Gross of fees.")}
+               "note": ("C oversold-dip 3-bar return bucketed by positioning: days_to_cover + si_change_pct "
+                        "(DATED short interest from Polygon backfill, as-of with 11d publication lag) and pc_oi "
+                        "(put/call OPEN interest, OptionSnapshot — thin history). Each both ways (Q1 low..Q5 high). "
+                        "Hypothesis: high days-to-cover / rising short interest into a dip = squeeze fuel. Gross of fees.")}
     Path("/app/.data/studies").mkdir(parents=True, exist_ok=True)
     Path("/app/.data/studies/h4_c_short.json").write_text(json.dumps(payload, indent=2, default=str))
     try:
@@ -125,7 +155,7 @@ def main():
     except Exception as e:
         print("DB save failed:", e, flush=True)
     print(f"\n=== POSITIONING AMPLIFIERS on C dip-buy ({len(entries)} entries) ===", flush=True)
-    for f in ["short_pct_float", "short_ratio", "pc_oi"]:
+    for f in FEATS:
         d = out[f]
         if "Q1 low" not in d:
             print(f"  {f}: coverage {d.get('coverage')} — {d.get('note')}", flush=True); continue
