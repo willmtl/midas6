@@ -84,6 +84,7 @@ x-backend-volumes: &backend-volumes
   - ./h4_c_volpick.py:/app/h4_c_volpick.py
   - ./h4_vol_ddfix.py:/app/h4_vol_ddfix.py
   - ./h4_c_ema.py:/app/h4_c_ema.py
+  - ./h4_c_fees.py:/app/h4_c_fees.py
   - ./news_overreaction.py:/app/news_overreaction.py
   - ./ground_earnings.py:/app/ground_earnings.py
   - ./signal_firing_scan.py:/app/signal_firing_scan.py

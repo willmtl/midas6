@@ -154,6 +154,8 @@ def simulate(trades, daily, spybar, cfg):
     open_pos = []
     eq_ts, eq_val, taken_pnl = [], [], []
     n_taken = 0
+    cost_rate = cfg.get("cost_bps", 0) / 1e4      # per-side transaction cost (bps of notional)
+    prev_stressed = False
     for t in timeline:
         d = pd.Timestamp(t).date()
         stressed = _stressed(daily, d)
@@ -163,18 +165,26 @@ def simulate(trades, daily, spybar, cfg):
             gcap = cfg["calm_lev"]
         scale = min(1.0, gcap / gross_now) if gross_now > 0 else 1.0
         contrib = 0.0; still = []
+        exit_notional = 0.0
         for p in open_pos:
             if p["sched"] and p["sched"][0][0] == t:
                 contrib += p["size"] * scale * p["sched"].popleft()[1]
+                if not p["sched"]:
+                    exit_notional += p["size"]        # position fully closes this bar -> exit cost
             if p["sched"]:
                 still.append(p)
         open_pos = still
-        # SPY hedge leg: short hedge_frac of (capped) gross on stress days
+        # SPY/QQQ hedge leg: short hedge_frac of (capped) gross on stress days
         if cfg.get("hedge_frac") and stressed and t in spybar:
             eff_gross = min(gross_now, gcap)
             contrib += -cfg["hedge_frac"] * eff_gross * spybar[t]
-        if contrib:
-            equity *= (1 + contrib)
+        # transaction costs: dip-buy exits this bar + hedge turnover when stress toggles (put on / take off)
+        cost = exit_notional * cost_rate
+        if cost_rate and cfg.get("hedge_frac") and (stressed != prev_stressed):
+            cost += cfg["hedge_frac"] * min(gross_now, gcap) * cost_rate
+        prev_stressed = stressed
+        if contrib or cost:
+            equity *= (1 + contrib - cost)
         peak = max(peak, equity)
         eq_ts.append(t); eq_val.append(equity)
         # new entries
@@ -186,6 +196,7 @@ def simulate(trades, daily, spybar, cfg):
             per = defaultdict(int)
             for p in open_pos:
                 per[p["sector"]] += 1
+        open_notional = 0.0
         for tr in news:
             w = _weight_of(tr, mode, wmap)
             if w <= 0:
@@ -195,9 +206,14 @@ def simulate(trades, daily, spybar, cfg):
                     continue
                 per[tr["sector"]] += 1
             h = hold.get(tr["bucket"], 3)
-            open_pos.append({"size": w * UNIT, "sched": deque(tr["sched"][:h]), "sector": tr["sector"]})
+            sz = w * UNIT
+            open_pos.append({"size": sz, "sched": deque(tr["sched"][:h]), "sector": tr["sector"]})
             taken_pnl.append((tr["entry_ts"], float(np.prod([1 + x for _, x in tr["sched"][:h]]) - 1)))
+            open_notional += sz
             n_taken += 1
+        if cost_rate and open_notional:               # entry cost of new positions
+            equity *= (1 - open_notional * cost_rate)
+            eq_val[-1] = equity
     eq = np.array(eq_val)
     rets = eq[1:] / eq[:-1] - 1
     total = round((eq[-1] - 1) * 100, 1)
