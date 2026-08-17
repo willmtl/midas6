@@ -1865,6 +1865,14 @@ class H4StudyView(_StudyResultView):
     json_path = "/app/.data/studies/h4_study.json"
 
 
+class H4OnSignalsView(_StudyResultView):
+    """H4-on-daily-signals: daily A/B/C selects the name, the H4 engine times a 0-3 day entry inside
+    the candidate window. GET reads BacktestResult[h4_on_signals]; POST recomputes (fetch may take a while)."""
+    kind = "h4_on_signals"
+    script = "h4_on_signals_study.py"
+    json_path = "/app/.data/studies/h4_on_signals.json"
+
+
 class SignalFiringView(APIView):
     """Names (stock/ETF/commodity) currently firing a given study signal (last N bars).
     GET ?signal=<key> -> the firing list for the Studies 'firing now' pane."""

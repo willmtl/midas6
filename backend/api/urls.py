@@ -66,6 +66,8 @@ urlpatterns = [
     path("rsi-intraday", views.RsiIntradayView.as_view(), name="rsi-intraday"),
     # H4 short-horizon studies engine (5 families × exit ladder, magnitude buckets, 0-3 day holds)
     path("h4-study", views.H4StudyView.as_view(), name="h4-study"),
+    # H4-on-daily-signals: daily A/B/C selects the name, H4 times the 0-3 day entry
+    path("h4-on-signals", views.H4OnSignalsView.as_view(), name="h4-on-signals"),
     # Per-signal live firing (names firing each study signal in the last N bars)
     path("signal-firing", views.SignalFiringView.as_view(), name="signal-firing"),
     # Live rotation-pick scanner (cheapest-P/B in each strengthening sector)
