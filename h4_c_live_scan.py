@@ -32,9 +32,11 @@ OVERSOLD_SIGS = ["mr_rsi_os", "mr_newlow60", "mr_ndown", "mr_gap_dn"]
 COMBO_SIG = "gap_dn__rsi_x"          # top dip->confirmation combo (h4_c_indicators)
 RECENT_BARS = 2                       # "firing now" = triggered within the last N 4h bars (~1 trading day)
 HIGH_3B, MED_3B = 0.8, 0.4            # conviction thresholds on the study's expected 3b return (%)
-# steep_2x position weight by analyst-upside bucket — the h4_c_conviction backtest winner (combined
-# oversold cluster: 2705% vs 1079% equal, better Sharpe + lower DD). Size the dip-buy by conviction.
-POSITION_WEIGHT = {"<0%": 0, "0-25%": 1, "25-50%": 2, "50-100%": 4, ">100%": 8, "no_target": 1}
+# steep_4x position weight by analyst-upside bucket — the FINAL backtest winner (C value-pick + H4 dip +
+# steep_4x conviction + QQQ hedge = +1823%/DD -20.1%/Sharpe 1.80; h4_c_enhance/h4_c_ema). Size by conviction:
+# a >100%-upside dip gets 64x a 0-25% dip; NEGATIVE-upside (value-trap) dips get 0 (not traded).
+POSITION_WEIGHT = {"<0%": 0, "0-25%": 1, "25-50%": 4, "50-100%": 16, ">100%": 64, "no_target": 1}
+HEDGE_PCT = 0.5                       # on a stress day: short QQQ ~50% of the deployed book (h4_c_ema: QQQ>SPY)
 
 
 def _refresh_4h(ticker, years=1):
@@ -95,10 +97,10 @@ def _fired(df, sig):
     return True, off
 
 
-SELLOFF_THR = 1.5      # gate: skip adds on a hard-down day (SPY 1-day <= -this %)
-STRESS3D_THR = 4.0     # gate: skip adds in an acute slide (SPY trailing 3-day <= -this %). h4_c_portfolio
-                       # winner "day1.5 OR stress3d<=-4%": best DD (-20.4) with return still up (+73pp).
-                       # NB: a COOLDOWN after the trigger HURTS (misses the bounce) — do NOT add one.
+SELLOFF_THR = 1.5      # stress day: SPY 1-day <= -this %  -> HEDGE (short QQQ), do NOT skip the add
+STRESS3D_THR = 4.0     # acute slide: SPY trailing 3-day <= -this %  -> HEDGE. Final config hedges through
+                       # the stress instead of sitting out (h4_c_ema: on C the hedge ADDS return by catching
+                       # the stress-day bounce; a cash gate / cooldown both LOSE — never sit out).
 
 
 def _spy_stress():
@@ -123,8 +125,8 @@ def build(refresh=True):
     store = load_targets()
     exp = _expected_lookup()
     all_sigs = OVERSOLD_SIGS + [COMBO_SIG]
-    spy_ret, spy_ret3d = _spy_stress()           # selloff gate: hold adds on a hard-down / acute-slide tape
-    market_gated = ((spy_ret is not None and spy_ret <= -SELLOFF_THR) or
+    spy_ret, spy_ret3d = _spy_stress()           # stress -> hedge (short QQQ), NOT skip
+    market_stress = ((spy_ret is not None and spy_ret <= -SELLOFF_THR) or
                     (spy_ret3d is not None and spy_ret3d <= -STRESS3D_THR))
 
     rows, firing = [], 0
@@ -170,7 +172,7 @@ def build(refresh=True):
         if is_firing:
             firing += 1
         conviction = "—"
-        gated = bool(is_firing and market_gated)   # selloff gate: dip fired but don't add into the crash
+        hedge_on = bool(is_firing and market_stress)   # stress day: add the dip AND hedge (short QQQ), don't skip
         if is_firing and best_exp is not None:
             conviction = "HIGH" if best_exp >= HIGH_3B else ("MED" if best_exp >= MED_3B else "LOW")
         elif is_firing:
@@ -181,9 +183,9 @@ def build(refresh=True):
             "upside_pct": round(upside, 1) if upside is not None else None,
             "upside_bucket": bucket, "fired_signals": fired_sigs, "is_firing": is_firing,
             "expected_3b": best_exp, "conviction": conviction,
-            "position_weight": POSITION_WEIGHT.get(bucket, 0),   # steep_2x sizing (backtest winner)
-            "market_gated": gated,
-            "state": ("DIP — WAIT (market selloff)" if gated else
+            "position_weight": POSITION_WEIGHT.get(bucket, 0),   # steep_4x sizing (final backtest winner)
+            "hedge_on": hedge_on,
+            "state": ("DIP FIRING — add + hedge QQQ" if hedge_on else
                       ("DIP FIRING — add" if is_firing else "no H4 dip (hold)")),
         })
         rows.append(row)
@@ -198,17 +200,20 @@ def build(refresh=True):
     return {
         "computed_at": pd.Timestamp.utcnow().isoformat(),
         "n_basket": len(rows), "n_firing": firing,
-        "spy_ret_1d": spy_ret, "spy_ret_3d": spy_ret3d, "market_gated": market_gated,
+        "spy_ret_1d": spy_ret, "spy_ret_3d": spy_ret3d, "market_stress": market_stress,
+        "hedge_index": "QQQ", "hedge_pct": HEDGE_PCT,
         "rows": rows,
         "params": {"oversold_signals": OVERSOLD_SIGS, "combo": COMBO_SIG, "recent_bars": RECENT_BARS,
                    "conviction": f"study expected 3b return: HIGH>= {HIGH_3B}% / MED>= {MED_3B}%",
+                   "sizing": "steep_4x by analyst-upside bucket (0/1/4/16/64) — final backtest winner",
+                   "hedge": f"on a stress day (SPY <= -{SELLOFF_THR}%/1d or -{STRESS3D_THR}%/3d), short QQQ ~{int(HEDGE_PCT*100)}% of the deployed book — add the dip, don't sit out",
                    "rule": ("live C basket (rotation_pick_scan div_2x) -> for each name, an H4 oversold dip "
                             "firing within the last %d 4h bars, ranked by the h4_c_upside study's expected 3b "
                             "return for that signal x analyst-upside bucket." % RECENT_BARS)},
-        "note": ("Live scan (not a backtest). C basket = current div_2x picks; H4 dip = 4h mean-reversion "
-                 "signal firing now; conviction = the h4_c_upside study's per-bucket expected 3b return "
-                 "(edge is monotone in analyst upside). Directional, gross of fees. Cached-4h fallback if "
-                 "no egress. The C basket itself is monthly-rebalance; this only times intraday adds."),
+        "note": ("Live scan (not a backtest). FINAL config: C div_2x picks -> H4 oversold dip -> steep_4x "
+                 "conviction sizing by analyst upside -> QQQ stress-hedge (backtest +1823%/DD -20.1%/Sharpe "
+                 "1.80). On a stress day you ADD the dip and short QQQ ~50% of the book (the hedge catches the "
+                 "bounce — sitting out loses). Directional, gross of fees; cached-4h fallback if no egress."),
     }
 
 
@@ -231,7 +236,9 @@ def main():
         print("Saved BacktestResult[h4_c_live]", flush=True)
     except Exception as e:
         print("DB save failed:", e, flush=True)
-    print(f"\n=== H4 DIP-BUY (live C basket) — {payload['n_firing']}/{payload['n_basket']} firing ===", flush=True)
+    hedge = (f"  ⚠ STRESS (SPY {payload['spy_ret_1d']}%/1d, {payload['spy_ret_3d']}%/3d) -> HEDGE: short QQQ ~{int(payload['hedge_pct']*100)}% of book"
+             if payload.get("market_stress") else "")
+    print(f"\n=== H4 DIP-BUY (live C basket) — {payload['n_firing']}/{payload['n_basket']} firing ==={hedge}", flush=True)
     for r in payload["rows"]:
         if not r.get("has_4h"):
             print(f"  {r['ticker']:8} {r['sector']:22} — {r['state']}", flush=True)
