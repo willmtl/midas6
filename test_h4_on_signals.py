@@ -42,7 +42,36 @@ def test_maskempty():
     print("test_maskempty OK")
 
 
-CHECKS = {"masknoop": test_masknoop, "maskempty": test_maskempty}
+def test_candwindows():
+    import os, datetime as dt
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings")
+    import django; django.setup()
+    from h4_on_signals_study import candidate_windows
+    # C: full (fast — reads saved rotation_history). B: capped universe for speed.
+    for sel, kw in (("C", {}), ("B", {"b_limit": 40})):
+        allowed, meta = candidate_windows(sel, **kw)
+        assert meta["n_names"] > 0 and meta["n_windows"] > 0, f"{sel} empty"
+        tk = next(iter(allowed))
+        assert isinstance(next(iter(allowed[tk])), dt.date), f"{sel} not date"
+    print("test_candwindows OK")
+
+
+def test_cwc():
+    """C-only diagnostic with step timing (C is the fast selector; isolates load_candles cost)."""
+    import os, time
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings")
+    import django; django.setup()
+    print("django ready", flush=True)
+    from h4_on_signals_study import candidate_windows
+    t = time.time()
+    allowed, meta = candidate_windows("C")
+    print(f"C done in {time.time()-t:.1f}s: {meta}", flush=True)
+    assert meta["n_names"] > 0
+    print("test_cwc OK")
+
+
+CHECKS = {"masknoop": test_masknoop, "maskempty": test_maskempty,
+          "candwindows": test_candwindows, "cwc": test_cwc}
 
 
 def main():
