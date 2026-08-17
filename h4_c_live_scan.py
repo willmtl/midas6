@@ -95,20 +95,25 @@ def _fired(df, sig):
     return True, off
 
 
-SELLOFF_THR = 1.5      # h4_c_portfolio winner: don't add on a hard-down market day (SPY down > this %)
+SELLOFF_THR = 1.5      # gate: skip adds on a hard-down day (SPY 1-day <= -this %)
+STRESS3D_THR = 4.0     # gate: skip adds in an acute slide (SPY trailing 3-day <= -this %). h4_c_portfolio
+                       # winner "day1.5 OR stress3d<=-4%": best DD (-20.4) with return still up (+73pp).
+                       # NB: a COOLDOWN after the trigger HURTS (misses the bounce) — do NOT add one.
 
 
-def _spy_today_ret():
-    """SPY's most-recent daily % return (the selloff-gate input). None if unavailable."""
+def _spy_stress():
+    """(spy_1d_ret, spy_3d_ret) most-recent SPY daily + trailing-3-day % return. (None, None) if unavailable."""
     try:
         from seq_fundamental_study import load_candles
         spy = load_candles(["SPY"]).get("SPY")
-        if spy is None or len(spy) < 2:
-            return None
+        if spy is None or len(spy) < 4:
+            return None, None
         c = spy["Close"]
-        return round(float(c.iloc[-1] / c.iloc[-2] - 1) * 100, 2)
+        r1 = round(float(c.iloc[-1] / c.iloc[-2] - 1) * 100, 2)
+        r3 = round(float(c.iloc[-1] / c.iloc[-4] - 1) * 100, 2)
+        return r1, r3
     except Exception:
-        return None
+        return None, None
 
 
 def build(refresh=True):
@@ -118,8 +123,9 @@ def build(refresh=True):
     store = load_targets()
     exp = _expected_lookup()
     all_sigs = OVERSOLD_SIGS + [COMBO_SIG]
-    spy_ret = _spy_today_ret()                   # selloff gate: hold new adds on a hard-down tape
-    market_gated = spy_ret is not None and spy_ret <= -SELLOFF_THR
+    spy_ret, spy_ret3d = _spy_stress()           # selloff gate: hold adds on a hard-down / acute-slide tape
+    market_gated = ((spy_ret is not None and spy_ret <= -SELLOFF_THR) or
+                    (spy_ret3d is not None and spy_ret3d <= -STRESS3D_THR))
 
     rows, firing = [], 0
     for p in picks:
@@ -192,7 +198,7 @@ def build(refresh=True):
     return {
         "computed_at": pd.Timestamp.utcnow().isoformat(),
         "n_basket": len(rows), "n_firing": firing,
-        "spy_ret_1d": spy_ret, "market_gated": market_gated,
+        "spy_ret_1d": spy_ret, "spy_ret_3d": spy_ret3d, "market_gated": market_gated,
         "rows": rows,
         "params": {"oversold_signals": OVERSOLD_SIGS, "combo": COMBO_SIG, "recent_bars": RECENT_BARS,
                    "conviction": f"study expected 3b return: HIGH>= {HIGH_3B}% / MED>= {MED_3B}%",

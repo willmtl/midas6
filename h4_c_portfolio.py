@@ -30,17 +30,22 @@ BREAKER_OFF = -8.0     # exit half-size mode when the book recovers to here (%)
 BREAKER_MULT = 0.5
 
 
-def _spy_daily_ret(years=5, allow_fetch=False):
-    """SPY daily % return keyed by date (from the DB; robust — no 4h-cache dependency). Macro air-pocket
-    days (e.g. -3.4% on 2022-08-26) are the correlated-cluster trigger the gate targets."""
+def _spy_daily(years=5, allow_fetch=False):
+    """SPY daily stress features keyed by date: 1-day return AND trailing 3-day return (the multi-day
+    cascade measure). Macro air-pockets (2022-08-26 -3.4%; the 5-day Powell grind) trigger the gate."""
     from seq_fundamental_study import load_candles
     spy = load_candles(["SPY"]).get("SPY")
-    if spy is None or len(spy) < 2:
+    if spy is None or len(spy) < 4:
         return {}
     c = spy["Close"]
-    r = (c / c.shift(1) - 1) * 100
+    r1 = (c / c.shift(1) - 1) * 100
+    r3 = (c / c.shift(3) - 1) * 100
     idx = pd.to_datetime(spy.index)
-    return {ts.date(): float(v) for ts, v in zip(idx, r.values) if pd.notna(v)}
+    out = {}
+    for ts, a, b in zip(idx, r1.values, r3.values):
+        out[ts.date()] = {"ret1d": float(a) if pd.notna(a) else 0.0,
+                          "ret3d": float(b) if pd.notna(b) else 0.0}
+    return out
 
 
 def collect(years, allow_fetch):
@@ -73,7 +78,14 @@ def collect(years, allow_fetch):
     return trades, cwmeta
 
 
-def simulate(trades, spy_ret, cap=False, gate=False, breaker=False):
+def simulate(trades, spy, cap=False, gate=None, breaker=False):
+    """gate: None, or a dict of stress rules — {day: %, stress3d: %, cooldown_days: int}. `day` skips new
+    adds when SPY's 1-day return <= -day; `stress3d` skips while the trailing 3-day return <= -stress3d
+    (the multi-day cascade); `cooldown_days` keeps the gate shut for N days AFTER a trigger (stops re-entering
+    into the aftermath). Any rule firing blocks adds that bar. Legacy: gate=True -> {day: SELLOFF_THR}."""
+    if gate is True:
+        gate = {"day": SELLOFF_THR}
+    import datetime as _dt
     entries_by_ts = defaultdict(list)
     all_ts = set()
     for tr in trades:
@@ -85,6 +97,8 @@ def simulate(trades, spy_ret, cap=False, gate=False, breaker=False):
     equity = 1.0; peak = 1.0; in_breaker = False
     open_pos = []
     eq_ts, eq_val, grosses = [], [], []
+    taken_pnl = []                 # (entry_ts, realized 3-bar return) for the loss-streak metric
+    cooldown_until = None
     n_taken = n_skipped_cap = n_skipped_gate = 0
     for t in timeline:
         # 1) realize this bar's returns from open positions, capping effective gross exposure at MAX_GROSS
@@ -111,8 +125,15 @@ def simulate(trades, spy_ret, cap=False, gate=False, breaker=False):
         mult = BREAKER_MULT if (breaker and in_breaker) else 1.0
         # 3) new entries at t, subject to controls
         news = entries_by_ts.get(t, [])
-        if gate and news and spy_ret.get(pd.Timestamp(t).date(), 0.0) <= -SELLOFF_THR:
-            n_skipped_gate += len(news); news = []
+        d = pd.Timestamp(t).date()
+        if gate and news:
+            info = spy.get(d, {})
+            trig = ((gate.get("day") and info.get("ret1d", 0.0) <= -gate["day"]) or
+                    (gate.get("stress3d") and info.get("ret3d", 0.0) <= -gate["stress3d"]))
+            if trig and gate.get("cooldown_days"):
+                cooldown_until = d + _dt.timedelta(days=int(gate["cooldown_days"]))
+            if trig or (cooldown_until is not None and d <= cooldown_until):
+                n_skipped_gate += len(news); news = []
         news = sorted(news, key=lambda x: -x["weight"])
         if cap:
             room = max(0, CAP_N - len(open_pos))
@@ -121,6 +142,7 @@ def simulate(trades, spy_ret, cap=False, gate=False, breaker=False):
                 news = news[:room]
         for tr in news:
             open_pos.append({"size": tr["weight"] * UNIT * mult, "sched": deque(tr["sched"])})
+            taken_pnl.append((tr["entry_ts"], float(np.prod([1 + x for _, x in tr["sched"]]) - 1)))
             n_taken += 1
         grosses.append(min(MAX_GROSS, sum(p["size"] for p in open_pos)))
     eq = np.array(eq_val)
@@ -134,8 +156,20 @@ def simulate(trades, spy_ret, cap=False, gate=False, breaker=False):
     peak_i = int(np.argmax(eq[:trough_i + 1])) if trough_i > 0 else 0
     maxdd = round(float(dd_series.min() * 100), 1)
     gr = np.array(grosses)
+    # longest run of consecutive LOSING taken trades (the sequential-cascade metric) + its date span
+    streak = best = 0; span = start = None
+    for (ets, r) in sorted(taken_pnl, key=lambda x: x[0]):
+        if r <= 0:
+            if streak == 0:
+                start = ets
+            streak += 1
+            if streak > best:
+                best = streak; span = (str(start)[:10], str(ets)[:10])
+        else:
+            streak = 0
     return {"total_return_pct": total, "sharpe": sharpe, "max_dd_pct": maxdd,
             "n_taken": n_taken, "n_skipped_cap": n_skipped_cap, "n_skipped_gate": n_skipped_gate,
+            "max_loss_streak": best, "streak_span": span,
             "avg_gross": round(float(gr[gr > 0].mean()) if (gr > 0).any() else 0.0, 2),
             "max_gross": round(float(gr.max()) if len(gr) else 0.0, 2),
             "dd_start": str(eq_ts[peak_i])[:10], "dd_end": str(eq_ts[trough_i])[:10]}
@@ -146,15 +180,32 @@ def main():
     import django; django.setup()
     from pathlib import Path
     trades, cwmeta = collect(5, False)
-    spy_ret = _spy_daily_ret(5, False)
+    spy = _spy_daily(5, False)
     variants = {
-        "baseline": simulate(trades, spy_ret),
-        "cap6": simulate(trades, spy_ret, cap=True),
-        "selloff_gate": simulate(trades, spy_ret, gate=True),
-        "breaker15": simulate(trades, spy_ret, breaker=True),
-        "all_three": simulate(trades, spy_ret, cap=True, gate=True, breaker=True),
+        "baseline": simulate(trades, spy),
+        "cap6": simulate(trades, spy, cap=True),
+        "selloff_gate": simulate(trades, spy, gate={"day": SELLOFF_THR}),
+        "breaker15": simulate(trades, spy, breaker=True),
+        "all_three": simulate(trades, spy, cap=True, gate={"day": SELLOFF_THR}, breaker=True),
     }
     base = variants["baseline"]
+    # STRESS-PERSISTENCE GATE SWEEP — the fix for SEQUENTIAL cascades: detect the multi-day slide and stop
+    # re-entering until it clears (fast re-engage, so calm-bear-market trades survive).
+    gate_defs = {
+        "day1.5 (winner so far)": {"day": 1.5},
+        "day1.5 + 3d cooldown": {"day": 1.5, "cooldown_days": 3},
+        "stress3d<=-4%": {"stress3d": 4.0},
+        "day1.5 OR stress3d<=-4%": {"day": 1.5, "stress3d": 4.0},
+        "day1.5 OR stress3d, +3d cooldown": {"day": 1.5, "stress3d": 4.0, "cooldown_days": 3},
+        "day1.5 OR stress3d<=-3%, +5d cooldown": {"day": 1.5, "stress3d": 3.0, "cooldown_days": 5},
+    }
+    gate_rows = [{"gate": "none (baseline)", **base,
+                  "ret_vs_base_pp": 0.0, "dd_vs_base_pp": 0.0}]
+    for nm, gd in gate_defs.items():
+        m = simulate(trades, spy, gate=gd)
+        gate_rows.append({"gate": nm, **m,
+                          "ret_vs_base_pp": round(m["total_return_pct"] - base["total_return_pct"], 1),
+                          "dd_vs_base_pp": round(m["max_dd_pct"] - base["max_dd_pct"], 1)})
     rows = []
     for name, m in variants.items():
         rows.append({"variant": name, **m,
@@ -165,7 +216,7 @@ def main():
         "scheme": "steep_2x", "signals": C.COMBINED, "hold_bars": C.HOLD_BARS,
         "params": {"unit": UNIT, "max_gross": MAX_GROSS, "cap_n": CAP_N, "selloff_thr_pct": SELLOFF_THR,
                    "breaker_on_pct": BREAKER_ON, "breaker_off_pct": BREAKER_OFF, "breaker_mult": BREAKER_MULT},
-        "n_eligible_trades": len(trades), "rows": rows,
+        "n_eligible_trades": len(trades), "rows": rows, "gate_sweep": gate_rows,
         "note": ("Portfolio-level drawdown controls on the H4-on-C dip-buy (steep_2x/combined), simulated "
                  "bar-by-bar with absolute cash-aware sizing (size = conviction weight x UNIT of capital, idle "
                  "= cash, gross capped at 1x — no leverage). CAP = max concurrent positions (highest-conviction "
@@ -193,6 +244,13 @@ def main():
               f"{r['n_taken']:>6} {r['avg_gross']:>6} {r['max_gross']:>6} {r['ret_vs_base_pp']:>+8} "
               f"{r['dd_vs_base_pp']:>+7}", flush=True)
         print(f"     skip cap/gate: {r['n_skipped_cap']}/{r['n_skipped_gate']}  worst DD {r['dd_start']}->{r['dd_end']}", flush=True)
+    print(f"\n=== STRESS-PERSISTENCE GATE SWEEP (the fix for sequential cascades) ===", flush=True)
+    print(f"  {'gate':38} {'total%':>9} {'maxDD%':>8} {'sharpe':>7} {'lossStrk':>8} {'skip':>6} {'Δret':>8} {'ΔDD':>7}", flush=True)
+    for r in gate_rows:
+        print(f"  {r['gate']:38} {r['total_return_pct']:>9} {r['max_dd_pct']:>8} {r['sharpe']:>7} "
+              f"{r['max_loss_streak']:>8} {r['n_skipped_gate']:>6} {r['ret_vs_base_pp']:>+8} {r['dd_vs_base_pp']:>+7}", flush=True)
+        if r.get("streak_span"):
+            print(f"     worst loss streak span: {r['streak_span'][0]}..{r['streak_span'][1]}  worst DD {r['dd_start']}->{r['dd_end']}", flush=True)
 
 
 if __name__ == "__main__":
