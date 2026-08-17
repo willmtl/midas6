@@ -1873,6 +1873,15 @@ class H4OnSignalsView(_StudyResultView):
     json_path = "/app/.data/studies/h4_on_signals.json"
 
 
+class H4CIndicatorsView(_StudyResultView):
+    """Full studies.py indicator library + dip->confirmation combos swept as H4 0-3 day entries inside
+    daily-C candidate windows, t-ranked with a Bonferroni guard. GET reads BacktestResult[h4_c_indicators];
+    POST recomputes (long — fetch)."""
+    kind = "h4_c_indicators"
+    script = "h4_c_indicators.py"
+    json_path = "/app/.data/studies/h4_c_indicators.json"
+
+
 class SignalFiringView(APIView):
     """Names (stock/ETF/commodity) currently firing a given study signal (last N bars).
     GET ?signal=<key> -> the firing list for the Studies 'firing now' pane."""

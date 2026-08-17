@@ -68,6 +68,8 @@ urlpatterns = [
     path("h4-study", views.H4StudyView.as_view(), name="h4-study"),
     # H4-on-daily-signals: daily A/B/C selects the name, H4 times the 0-3 day entry
     path("h4-on-signals", views.H4OnSignalsView.as_view(), name="h4-on-signals"),
+    # Full indicator library + combos swept as H4 entries on C candidates
+    path("h4-c-indicators", views.H4CIndicatorsView.as_view(), name="h4-c-indicators"),
     # Per-signal live firing (names firing each study signal in the last N bars)
     path("signal-firing", views.SignalFiringView.as_view(), name="signal-firing"),
     # Live rotation-pick scanner (cheapest-P/B in each strengthening sector)
