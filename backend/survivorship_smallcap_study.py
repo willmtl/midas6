@@ -26,6 +26,34 @@ from trend_stock_studies import _pit_monthly_panel, _available_at, _ret_delist, 
 from backtest_lowpb import _monthly_close, _tstat_from_returns, BENCH
 from api.tasks import _eodhd_get
 
+
+def _pit_ttm_panel(reports_map, field, midx):
+    """Point-in-time trailing-12-month panel for a FLOW field: rolling sum of the last 4 QUARTERLY values
+    (ordered by period_end), forward-filled by avail_date to the monthly index. FinancialReport stores
+    per-quarter flows, so a TTM sum is required for standard trailing P/E (=Price/TTM-EPS), P/S, EV/EBIT,
+    FCF-yield, ROE — single-quarter figures are ~4x mis-scaled and can't go negative properly."""
+    import pandas as pd
+    out = {}
+    for tk, r in reports_map.items():
+        if field not in r.columns:
+            continue
+        d = r[["period_end", "avail_date", field]].dropna(subset=[field]).copy()
+        if len(d) < 4:
+            continue
+        d = d.sort_values("period_end")
+        d["ttm"] = d[field].rolling(4).sum()
+        s = pd.Series(d["ttm"].values, index=pd.to_datetime(d["avail_date"])).dropna()
+        if s.empty:
+            continue
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        out[tk] = s.reindex(s.index.union(midx)).ffill().reindex(midx)
+    return pd.DataFrame(out)
+
+
+def _pit_ttm_ni(reports_map, midx):
+    """Back-compat alias: TTM net-income panel."""
+    return _pit_ttm_panel(reports_map, "net_income", midx)
+
 # exchange-suffix -> reporting/quote currency. Market cap is computed in the QUOTE currency (price*shares) then
 # converted to USD so the <$2B small-cap bucket is apples-to-apples. .L (London) quotes in PENCE -> ×0.01.
 SUF_CCY = {"SA": "BRL", "MX": "MXN", "KS": "KRW", "HK": "HKD", "WA": "PLN", "TO": "CAD", "V": "CAD",
@@ -111,6 +139,14 @@ GIC_TO_ETF = {
 }
 
 
+def _f(x):
+    """Safe float for the trace dump: NaN/None-tolerant -> Python float or None."""
+    try:
+        return float(x) if pd.notna(x) else None
+    except Exception:
+        return None
+
+
 def _perf(r, spy):
     r = np.asarray(r, float); n = len(r)
     tot = float(np.prod(1 + r) - 1) * 100
@@ -130,6 +166,16 @@ def build():
     with connection.cursor() as cur:
         cur.execute("SET max_parallel_workers_per_gather = 0")
     etfs = {n: e for n, e in config.SECTOR_ETFS.items() if e not in CRYPTO}
+    try:                                     # ticker -> company name, for the flagship-history trace (optional)
+        NAMEMAP = json.load(open("/app/.data/ticker_names.json"))
+    except Exception:
+        NAMEMAP = {}
+    # RUNTIME universe drop (A/B a sector removal with no config edit, nothing to revert): DROP_ETFS="ARKK,QTUM"
+    _drop = {x.strip() for x in os.environ.get("DROP_ETFS", "").split(",") if x.strip()}
+    if _drop:
+        etfs = {n: e for n, e in etfs.items() if e not in _drop}
+        print(f"DROP_ETFS active: removed {sorted(_drop)} -> {len(etfs)} sectors remain", flush=True)
+    etf_name = {e: n for n, e in etfs.items()}   # ETF ticker -> sector display name (for the trace)
     # survivor sector map + GICS map for survivors (via sector_holdings membership -> their ETF)
     surv_sector = {}                                  # ticker -> etf (survivor, by current ETF membership)
     all_holds = set()
@@ -179,6 +225,7 @@ def build():
     as_traded = price_basis.as_traded_close(px)
     mktcap = as_traded * sh                       # QUOTE-currency market cap -> used for P/B (ratio, currency cancels)
     pb = mktcap / eq.where(eq != 0)
+    de = dt / eq.where(eq != 0)                    # debt-to-equity (PIT) — for the flagship-history trace
     # POINT-IN-TIME FX: we trade in USD, so returns must include FX gain/loss. Convert the price series to USD at
     # each date's historical rate; returns are then computed on the USD series (local_return × fx_return).
     usd_factor_m, ccy_ser = _usd_factor_matrix(list(common), midx)
@@ -197,6 +244,24 @@ def build():
     # quality (mega-caps like GOOG never qualify). P/B÷ROE = cheapness PER UNIT of quality (lower = cheaper).
     roe = ni / eq.where(eq != 0)
     pb_roe = pb / roe.where(roe > 0)              # crude heuristic: only meaningful for positive-ROE names
+    # DISPLAY-ONLY standard trailing metrics for the flagship-history doc. ni above is a single QUARTER, so
+    # pb_roe is a ~4x-inflated quarterly P/E that is masked to NaN for loss-makers (hence blank, never negative).
+    # Here we build the STANDARD signed trailing P/E = MktCap / TTM-net-income (= Price / TTM-EPS), negative when
+    # loss-making. This does NOT feed any ranking (usca_small ranks on raw pb; pb_roe is unchanged).
+    ttm_ni = R(_pit_ttm_ni(reps, midx))
+    roe_ttm = ttm_ni / eq.where(eq != 0)                   # trailing-12m ROE (signed)
+    pe_ttm = mktcap / ttm_ni.where(ttm_ni != 0)            # signed trailing P/E = Price / TTM-EPS
+    # TTM flow panels for the flagship VALUE-METRIC bake-off (does raw P/B still win the small-cap pick vs
+    # properly-TTM P/E / P/S / EV-EBIT / FCF-yield? — audit finding #4 + "test everything"). All "lower=better".
+    ttm_rev = R(_pit_ttm_panel(reps, "revenue", midx))
+    ttm_opinc = R(_pit_ttm_panel(reps, "operating_income", midx))
+    ttm_fcf = R(_pit_ttm_panel(reps, "free_cash_flow", midx))
+    ttm_cash = R(_pit_monthly_panel(reps, "cash_and_equivalents", midx))   # cash = stock (point-in-time)
+    _ev = mktcap + dt.fillna(0) - ttm_cash.fillna(0)
+    pe_ttm_pos = pe_ttm.where(pe_ttm > 0)                   # cheapest POSITIVE trailing P/E (loss-makers excluded)
+    ps_ttm = mktcap / ttm_rev.where(ttm_rev > 0)            # cheapest P/S (TTM sales)
+    evebit_ttm = _ev / ttm_opinc.where(ttm_opinc > 0)      # cheapest EV/EBIT (TTM, positive EBIT)
+    fcfy_ttm = -(ttm_fcf / _ev.where(_ev > 0))             # highest FCF/EV -> negate so min = best
     # RIGOROUS #1 — justified P/B from the residual-income / Gordon model: P/B* = (ROE - g)/(r - g).
     # r = assumed cost of equity (fixed 9%); g = sustainable growth proxied by trailing YoY book-equity growth,
     # clamped < r (the model diverges as g->r). Signal = actual P/B / justified P/B  (<1 = cheaper than deserved).
@@ -358,21 +423,56 @@ def build():
         return pool5[0]
 
     def run(include_delisted, small_only, min_price=MIN_PRICE, country_ok=None, proxy_etf=False, value_key="pb",
-            top5=None, capaware=None):
+            top5=None, capaware=None, trace=None, ban_first_loss=False, pb_ceiling=None, drop_sectors=None,
+            exclude_tickers=None, start_date=None, end_date=None):
         rets, spies, dl_picks, mrets = [], [], 0, []
         proxy_hold = Counter()          # etf -> # months held as a no-value-stock proxy (the live fallback)
         proxy_contrib = 0.0             # sum of proxy monthly contributions to the basket (weighted)
         mega_picks = 0                  # picks with >$50B USD mktcap (does premium-normalization let mega-caps in?)
+        traded = set(); banned = set()  # ban_first_loss: names whose FIRST-ever trade lost -> never buy again
+        _sd = pd.Timestamp(start_date) if start_date else None
+        _ed = pd.Timestamp(end_date) if end_date else None
         for i in range(9, len(midx) - 1):
             date, ndate = midx[i], midx[i + 1]
+            if (_sd is not None and date < _sd) or (_ed is not None and date > _ed):
+                continue                # window restriction (apples-to-apples sub-period walk-forward)
             sp = spy_m.iloc[i + 1] / spy_m.iloc[i] - 1
             if not np.isfinite(sp):
                 continue
-            top = accel.loc[date].dropna().sort_values(ascending=False).head(TOP_N).index
+            _acc = accel.loc[date].dropna()
+            if drop_sectors:                      # "remove ARK" etc: drop these ETFs, backfill the slot from #11
+                _acc = _acc.drop(labels=[e for e in drop_sectors if e in _acc.index], errors="ignore")
+            top = _acc.sort_values(ascending=False).head(TOP_N).index
+
+            def pbceil_ok(h):
+                """P/B ceiling gate. pb_ceiling may be None (off), a flat float, or a cap-tiered dict with keys
+                'micro' (<$500M), 'small' (<$2B), 'large' (>=$2B) and optional 'default'."""
+                if pb_ceiling is None:
+                    return True
+                v = pb.loc[date, h]
+                if not pd.notna(v):
+                    return True
+                if isinstance(pb_ceiling, dict):
+                    mc = mktcap_usd.loc[date, h]
+                    key = ("large" if (pd.notna(mc) and mc >= 2e9) else
+                           "micro" if (pd.notna(mc) and mc < 5e8) else "small")
+                    cap = pb_ceiling.get(key, pb_ceiling.get("default"))
+                    return cap is None or v <= cap
+                return v <= pb_ceiling
+
             held = set(); wsum = rr = 0.0
+            tr = None
+            if trace is not None:
+                tr = {"date": str(pd.Timestamp(date).date()), "ndate": str(pd.Timestamp(ndate).date()),
+                      "top_sectors": [{"sector": etf_name.get(e, e), "etf": e, "accel": _f(accel.loc[date, e])}
+                                      for e in top],
+                      "picks": [], "skipped": []}
             for etf in top:
                 pharma = etf in PHARMA_ETFS
                 cands = [h for h in sector_cands(etf, include_delisted) if h not in held
+                         and (not ban_first_loss or h not in banned)
+                         and (exclude_tickers is None or h not in exclude_tickers)
+                         and pbceil_ok(h)
                          and (country_ok is None or country_ok(h))
                          and _available_at(px_usd[h], date) and pd.notna(pb.loc[date, h]) and pb.loc[date, h] > MIN_PB
                          and pd.notna(as_traded_usd.loc[date, h]) and as_traded_usd.loc[date, h] >= min_price
@@ -384,6 +484,22 @@ def build():
                 if not g:
                     # no qualifying value stock. usca_small SKIPS the slot; proxy_etf HOLDS the ETF itself
                     # (the live is_etf_proxy fallback: raw commodities, bonds, foreign/index markets).
+                    if tr is not None:
+                        raw = sector_cands(etf, include_delisted)
+                        n_country = sum(1 for h in raw if country_ok is None or country_ok(h))
+                        if not raw:
+                            reason = "ETF sleeve has no mapped equity holdings (raw commodity / bond / index)"
+                        elif n_country == 0:
+                            reason = "no US/Canada-listed holding — foreign / commodity / bond sleeve"
+                        elif not cands:
+                            reason = "holdings exist but none cleared the filters (P/B>0, price, $5M liquidity, value-trap)"
+                        elif small_only and not sm:
+                            reason = "only large-caps qualified — no small-cap (<$2B) value name in the sleeve"
+                        else:
+                            reason = "no qualifying value stock"
+                        tr["skipped"].append({"sector": etf_name.get(etf, etf), "etf": etf, "reason": reason,
+                                              "n_holdings": len(raw), "n_usca": n_country,
+                                              "accel": _f(accel.loc[date, etf]) if etf in accel.columns else None})
                     if proxy_etf:
                         re = etf_m[etf].iloc[i + 1] / etf_m[etf].iloc[i] - 1 if etf in etf_m.columns else np.nan
                         if np.isfinite(re):
@@ -395,22 +511,32 @@ def build():
                         pool5 = sorted(sm, key=lambda h: pb.loc[date, h])[:5]
                         prof = [x for x in pool5 if pd.notna(roe.loc[date, x]) and roe.loc[date, x] > 0]
                         if prof:
-                            p = min(prof, key=lambda h: (pb_roe.loc[date, h] if pd.notna(pb_roe.loc[date, h]) else 9e18))
+                            # ADAPT: rank profitable small-caps by TTM P/E (corrected); else the OLD quarterly pb_roe.
+                            _pe = pe_ttm_pos if capaware == "adapt" else pb_roe
+                            p = min(prof, key=lambda h: (_pe.loc[date, h] if pd.notna(_pe.loc[date, h]) else 9e18))
                         elif capaware == "prof_any":   # NO profitable small -> prefer cheapest-P/B PROFITABLE large-cap
                             profL = [x for x in g0 if pd.notna(roe.loc[date, x]) and roe.loc[date, x] > 0]
                             p = min(profL, key=lambda h: pb.loc[date, h]) if profL else pool5[0]
                         elif capaware == "skip":       # NO profitable small -> skip the sector entirely
                             continue
-                        else:                          # "loss_small" = current live rule: cheapest-P/B loss-making small
+                        else:                          # "loss_small"/"adapt" -> cheapest-P/B loss-making small (keep exposure)
                             p = pool5[0]
-                    else:                        # no small-cap in sector -> cheapest raw P/B large-cap (P/E loses large-cap)
-                        p = min(g0, key=lambda h: pb.loc[date, h])
+                    else:                        # no small-cap in sector -> the large-cap fallback
+                        if capaware == "adapt":  # ADAPT: raw P/B is a BAD large-cap selector -> use cheapest TTM P/E
+                            profL = [x for x in g0 if pd.notna(pe_ttm_pos.loc[date, x])]
+                            p = min(profL, key=lambda h: pe_ttm_pos.loc[date, h]) if profL else min(g0, key=lambda h: pb.loc[date, h])
+                        else:                    # current live rule: cheapest raw P/B large-cap
+                            p = min(g0, key=lambda h: pb.loc[date, h])
                 elif top5 is not None:          # TWO-STAGE: 5 cheapest raw P/B, then a secondary signal picks 1
                     pool5 = sorted(g, key=lambda h: pb.loc[date, h])[:5]
                     p = pick5(pool5, date, top5)
                 elif value_key == "pb_roe":     # crude heuristic
                     q = [x for x in g if pd.notna(pb_roe.loc[date, x])]
                     p = min(q, key=lambda h: pb_roe.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
+                elif value_key in ("pe_ttm", "ps_ttm", "evebit_ttm", "fcfy_ttm"):  # TTM value-metric bake-off
+                    _M = {"pe_ttm": pe_ttm_pos, "ps_ttm": ps_ttm, "evebit_ttm": evebit_ttm, "fcfy_ttm": fcfy_ttm}[value_key]
+                    q = [x for x in g if pd.notna(_M.loc[date, x])]
+                    p = min(q, key=lambda h: _M.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
                 elif value_key == "justified":  # rigorous #1: P/B vs (ROE-g)/(r-g)
                     q = [x for x in g if pd.notna(pb_vs_just.loc[date, x])]
                     p = min(q, key=lambda h: pb_vs_just.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
@@ -447,14 +573,38 @@ def build():
                     mega_picks += 1
                 r = _ret_delist(px_usd[p], date, ndate)      # return on the USD-translated series -> includes FX P&L
                 if r is None or not np.isfinite(r):
+                    if tr is not None:
+                        tr["picks"].append({"sector": etf_name.get(etf, etf), "etf": etf, "ticker": p,
+                                            "company": NAMEMAP.get(p), "pb": _f(pb.loc[date, p]),
+                                            "pe": _f(pe_ttm.loc[date, p]), "roe": _f(roe_ttm.loc[date, p]),
+                                            "de": _f(de.loc[date, p]), "gpa": _f(gpa.loc[date, p]),
+                                            "rev_g": _f(rev_g.loc[date, p]), "ni": _f(ttm_ni.loc[date, p]),
+                                            "revenue": _f(revp.loc[date, p]), "mktcap_usd": _f(mktcap_usd.loc[date, p]),
+                                            "weight": None, "ret": None, "delisted": p in delisted_sector,
+                                            "conviction": bool(accumulating(p, date))})
                     continue
                 if p in delisted_sector:
                     dl_picks += 1
                 w = CONV if accumulating(p, date) else 1.0
                 wsum += w; rr += w * float(r)
+                if ban_first_loss and p not in traded:   # record FIRST-ever trade; ban if it was a loss
+                    traded.add(p)
+                    if float(r) < 0:
+                        banned.add(p)
+                if tr is not None:
+                    tr["picks"].append({"sector": etf_name.get(etf, etf), "etf": etf, "ticker": p,
+                                        "company": NAMEMAP.get(p), "pb": _f(pb.loc[date, p]),
+                                        "pe": _f(pe_ttm.loc[date, p]), "roe": _f(roe_ttm.loc[date, p]),
+                                        "de": _f(de.loc[date, p]), "gpa": _f(gpa.loc[date, p]),
+                                        "rev_g": _f(rev_g.loc[date, p]), "ni": _f(ttm_ni.loc[date, p]),
+                                        "revenue": _f(revp.loc[date, p]), "mktcap_usd": _f(mktcap_usd.loc[date, p]),
+                                        "weight": float(w), "ret": float(r), "delisted": p in delisted_sector,
+                                        "conviction": bool(accumulating(p, date))})
             if wsum <= 0:
                 continue
             rets.append(rr / wsum); spies.append(float(sp)); mrets.append((str(pd.Timestamp(date).date()), float(rr / wsum)))
+            if tr is not None:
+                tr["basket_ret"] = float(rr / wsum); tr["spy_ret"] = float(sp); trace.append(tr)
         perf = _perf(rets, spies); perf["delisted_picks"] = dl_picks; perf["mega_picks"] = mega_picks
         perf["monthly"] = mrets
         if proxy_etf:
@@ -467,6 +617,226 @@ def build():
             perf["proxy_other"] = {"months": int(sum(other.values())), "etfs": dict(sorted(other.items(), key=lambda x: -x[1])[:12])}
         return perf
 
+    # ── FLAGSHIP HISTORY TRACE (opt-in): run ONLY the usca_small arm, recording every sector/stock pick per
+    # month, dump to flagship_history.json, and EXIT before the full sweep so the stored BacktestResult is
+    # untouched. Trigger: FLAGSHIP_TRACE=1 docker exec ... python /app/survivorship_smallcap_study.py ──
+    if os.environ.get("WEEKLY_ACCEL"):
+        # ── WEEKLY-BAR SECTOR RANKING test (no save): the live engine ranks sectors by ACCELERATION on
+        # MONTHLY bars (accel = pct_change(3) − shift(3), a 6mo two-sided window). Here we recompute the
+        # ranking on WEEKLY (W-FRI) bars at several lookbacks — both acceleration and pure momentum —
+        # reindexed to the SAME month-end rebalance dates (ffill = most recent weekly value as of the buy,
+        # so it stays point-in-time). Everything downstream (pick, weight, monthly hold) is IDENTICAL, so
+        # this isolates ONLY 'does measuring sector momentum on weekly bars change the picks / the return'.
+        import sys
+        etf_w = pd.DataFrame({t: etf_daily[t]["Close"].resample("W-FRI").last()
+                              for t in etf_tk if t in etf_daily})
+        variants = {"monthly_base 3-3 (6mo)": accel}          # the LIVE ranking (run same-universe for A/B)
+        for win, lab in [(4, "~2mo"), (8, "~4mo"), (13, "~6mo"), (26, "~12mo")]:
+            wa = etf_w.pct_change(win) - etf_w.pct_change(win).shift(win)   # two-sided accel on weekly bars
+            variants[f"wk_accel {win}w ({lab})"] = wa.reindex(midx, method="ffill")
+        for win, lab in [(13, "3mo"), (26, "6mo")]:
+            wm = etf_w.pct_change(win)                                       # pure momentum (no acceleration)
+            variants[f"wk_mom {win}w ({lab})"] = wm.reindex(midx, method="ffill")
+        base = {"usca_small": 790.4, "usca_small_norm": 1024.0, "usca_small_pbprof": 911.5}
+        arms = [("usca_small", dict(country_ok=_is_usca)),
+                ("usca_small_norm", dict(country_ok=_is_usca, value_key="pb_roe")),
+                ("usca_small_pbprof", dict(country_ok=_is_usca, value_key="pb_prof"))]
+        print("\n=== WEEKLY_ACCEL (no save): sector ranking on WEEKLY bars vs the live monthly accel ===", flush=True)
+        print(f"  stored monthly baselines -> small {base['usca_small']} / norm {base['usca_small_norm']} "
+              f"/ pbprof {base['usca_small_pbprof']}", flush=True)
+        for vname, acc in variants.items():
+            accel = acc                          # reassign enclosing var -> run()'s closure uses the weekly ranking
+            cells = []
+            for aname, kw in arms:
+                r = run(True, True, **kw)
+                tag = aname.split("_")[-1]
+                cells.append(f"{tag} {r['total']:7.1f}% (b{base[aname]:6.1f} {r['total']-base[aname]:+6.1f}) "
+                             f"Sh{r['sharpe']:.2f} DD{r['dd']:.0f}% t{r['t_stat']}")
+            print(f"  {vname:24} | " + "  ||  ".join(cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("ADAPT_TEST"):
+        # ── "adapt accordingly": cap-aware EARNINGS selector (small: cheapest TTM P/E among profitable in the
+        # top-5 cheapest-P/B; large fallback: cheapest TTM P/E, NOT raw P/B which loses all-cap). Walk-forward
+        # vs current flagship (raw pb) + pb_prof across windows — only believe it if it holds ex-2020 AND both halves. ──
+        import sys
+        wins = [("FULL 2019→now", None, None), ("ex-2020 (2021→now)", "2021-01-31", None),
+                ("H1 2019→2022", None, "2022-12-31"), ("H2 2023→2026", "2023-01-31", None)]
+        arms = [("pb (flagship)", dict(value_key="pb")), ("pb_prof", dict(value_key="pb_prof")),
+                ("ADAPT (cap-aware P/E)", dict(capaware="adapt"))]
+        print("\n=== ADAPT_TEST (no save): cap-aware earnings selector, walk-forward (total% / Sharpe) ===", flush=True)
+        print(f"  {'window':22}" + "".join(f"{a[0]:>24}" for a in arms), flush=True)
+        for lab, sd, ed in wins:
+            cells = []
+            for _, kw in arms:
+                r = run(True, True, country_ok=_is_usca, start_date=sd, end_date=ed, **kw)
+                cells.append(f"{r['total']:>10.0f}% Sh{r['sharpe']:.2f} t{r['t_stat']}")
+            print(f"  {lab:22}" + "".join(f"{c:>24}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("WINDOW_WF"):
+        # ── APPLES-TO-APPLES + WALK-FORWARD: raw pb vs pb_prof across sub-windows. The full window now spans
+        # 2019-06->2026-08 (candle backfill extended history); the OLD "790%" flagship started ~2021. Does the
+        # pb_prof edge hold on the SAME 2021-start window as before, and on each half — or only with 2020 in? ──
+        import sys
+        wins = [("FULL 2019-06→2026-08", None, None),
+                ("OLD window 2021-07→now", "2021-07-31", None),
+                ("H1 2019→2022-12", None, "2022-12-31"),
+                ("H2 2023→2026", "2023-01-31", None),
+                ("ex-2020 (2021→now)", "2021-01-31", None)]
+        print("\n=== WINDOW_WF (no save): raw pb vs pb_prof across sub-windows (apples-to-apples) ===", flush=True)
+        print(f"  {'window':26}{'pb':>12}{'pb_prof':>12}{'edge(pp)':>10}{'pb Sh':>7}{'prof Sh':>8}", flush=True)
+        for lab, sd, ed in wins:
+            a = run(True, True, country_ok=_is_usca, value_key="pb", start_date=sd, end_date=ed)
+            b = run(True, True, country_ok=_is_usca, value_key="pb_prof", start_date=sd, end_date=ed)
+            print(f"  {lab:26}{a['total']:>11.1f}%{b['total']:>11.1f}%{b['total']-a['total']:>+10.1f}"
+                  f"{a['sharpe']:>7.2f}{b['sharpe']:>8.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("FLAGSHIP_VALUE_TEST"):
+        # ── does raw cheapest-P/B still win the SMALL-CAP FLAGSHIP pick vs properly-TTM P/E / P/S / EV-EBIT /
+        # FCF-yield? (the all-cap value_ranking_lab now says P/B LOSES; re-test inside usca_small on current
+        # data with TTM-correct flows). Same usca_small harness, only value_key varies. No save. ──
+        import sys
+        B = 790.4
+        arms = [("pb (raw, FLAGSHIP)", "pb"), ("pe_ttm (cheapest +P/E)", "pe_ttm"),
+                ("pb_prof (P/B, profitable)", "pb_prof"), ("ps_ttm (P/S)", "ps_ttm"),
+                ("evebit_ttm (EV/EBIT)", "evebit_ttm"), ("fcfy_ttm (FCF yield)", "fcfy_ttm"),
+                ("pb_roe (OLD quarterly P/E)", "pb_roe")]
+        print("\n=== FLAGSHIP_VALUE_TEST (no save): value metric inside usca_small small-cap (baseline pb=790.4) ===", flush=True)
+        rows = []
+        for lab, vk in arms:
+            r = run(True, True, country_ok=_is_usca, value_key=vk)
+            rows.append((lab, r))
+            print(f"  {lab:28} {r['total']:8.1f}% ({r['total']-B:+7.1f} vs pb)  Sh{r['sharpe']:.2f}  DD{r['dd']:.0f}%  t{r['t_stat']}", flush=True)
+        best = max(rows, key=lambda x: x[1]['total'])
+        print(f"\n  BEST small-cap value metric = {best[0]} ({best[1]['total']:.1f}%). "
+              f"{'raw P/B still wins.' if best[1]=='pb' or 'pb (raw' in best[0] else 'raw P/B does NOT win the small-cap pick either.'}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("MISCAT_TEST"):
+        # ── does excluding the audited MISCATEGORIZED picks (RIO=iron in Lithium&Battery, etc.) help? A first
+        # proxy for a GICS-sector-consistency gate: exclude the tickers the audit flagged as sitting in a sleeve
+        # whose theme they don't match, and A/B vs baseline. Hindsight (like ARK removal), but it measures the
+        # cost of the mismatches and whether a real gate is worth building. ──
+        import sys
+        B = 790.4
+        # (ticker, why) from the miscategorization audit; RIO is the worst (iron-ore miner, 9 months held)
+        MISCAT = ["RIO", "PENN", "SIRI", "P", "HASI", "LRN", "TME", "FFIV", "TRIP"]
+        CLEAREST = ["RIO", "PENN", "SIRI", "P", "HASI"]  # the 5 most clearly wrong
+
+        def R1(label, **kw):
+            r = run(True, True, country_ok=_is_usca, **kw)
+            print(f"  {label:34} {r['total']:8.1f}% ({r['total']-B:+7.1f})  Sh{r['sharpe']:.2f}  DD{r['dd']:.0f}%  t{r['t_stat']}", flush=True)
+
+        print("\n=== MISCAT_TEST (no save): exclude audit-flagged miscategorized picks (baseline 790.4) ===", flush=True)
+        R1("baseline")
+        R1("exclude RIO only (worst, 9mo)", exclude_tickers={"RIO"})
+        R1("exclude 5 clearest mismatches", exclude_tickers=set(CLEAREST))
+        R1("exclude all 9 flagged", exclude_tickers=set(MISCAT))
+        sys.exit(0)
+
+    if os.environ.get("CEILING_TEST"):
+        # ── cap-tiered P/B ceiling sweep (no save). User: big-caps like GOOG legitimately trade at P/B>5, so
+        # the ceiling must be LOOSER for large-caps and TIGHTER for micro/small (where high P/B = junk/traps).
+        # dict keys micro(<$500M)/small(<$2B)/large(>=$2B); large=None means NO cap on big-caps. Paired with
+        # remove-ALL-ARK (the user's chosen combo). ──
+        import sys
+        B = 790.4
+        ARK = {"ARKK", "ARKG"}
+
+        def R1(label, **kw):
+            r = run(True, True, country_ok=_is_usca, **kw)
+            print(f"  {label:42} {r['total']:8.1f}% ({r['total']-B:+7.1f})  Sh{r['sharpe']:.2f}  DD{r['dd']:.0f}%  t{r['t_stat']}", flush=True)
+
+        tiers = [("3/5/6", {"micro": 3, "small": 5, "large": 6}),
+                 ("3/5/8", {"micro": 3, "small": 5, "large": 8}),
+                 ("3/5/10", {"micro": 3, "small": 5, "large": 10}),
+                 ("3/5/15", {"micro": 3, "small": 5, "large": 15}),
+                 ("3/5/none (no cap on big-caps)", {"micro": 3, "small": 5, "large": None}),
+                 ("4/6/10", {"micro": 4, "small": 6, "large": 10}),
+                 ("5/5/none", {"micro": 5, "small": 5, "large": None})]
+        print("\n=== CEILING_TEST (no save): cap-tiered P/B ceiling, big-caps loosened (baseline 790.4) ===", flush=True)
+        R1("reference baseline")
+        R1("reference remove ALL ARK", drop_sectors=ARK)
+        R1("reference flat pb<=5", pb_ceiling=5.0)
+        print("  -- cap-tiered (micro/small tight, large loose) --", flush=True)
+        for lab, cd in tiers:
+            R1(f"tiered {lab}", pb_ceiling=cd)
+        print("  -- same tiers + remove ALL ARK (your chosen combo) --", flush=True)
+        for lab, cd in tiers:
+            R1(f"ARKout + tiered {lab}", drop_sectors=ARK, pb_ceiling=cd)
+        sys.exit(0)
+
+    if os.environ.get("SELECTION_TEST"):
+        # ── user selection rules A/B (no save, no ranking change): ban names whose FIRST trade lost, remove
+        # ARK sleeves, and a P/B ceiling (flat + cap-tiered micro/small/large). All are candidate FILTERS on the
+        # usca_small flagship — picks/returns of the base arm unchanged; each rule only removes eligible names. ──
+        import sys
+        B = 790.4
+
+        def R1(label, **kw):
+            r = run(True, True, country_ok=_is_usca, **kw)
+            print(f"  {label:36} {r['total']:8.1f}% ({r['total']-B:+7.1f} vs base)  Sh{r['sharpe']:.2f}  "
+                  f"DD{r['dd']:.0f}%  t{r['t_stat']}  dl{r['delisted_picks']}", flush=True)
+
+        print("\n=== SELECTION_TEST (no save): user rules on the usca_small flagship (baseline 790.4) ===", flush=True)
+        R1("baseline (sanity=790.4)")
+        R1("ban_first_loss (loss on 1st trade -> banned)", ban_first_loss=True)
+        R1("remove ARKK (Ark Innovation)", drop_sectors={"ARKK"})
+        R1("remove ALL ARK (ARKK+ARKG)", drop_sectors={"ARKK", "ARKG"})
+        print("  -- P/B ceiling, flat --", flush=True)
+        for c in (3, 5, 8, 10):
+            R1(f"pb <= {c}", pb_ceiling=float(c))
+        print("  -- P/B ceiling, cap-tiered (micro<$500M / small<$2B / large>=$2B) --", flush=True)
+        R1("tiered hi-micro 8/5/3", pb_ceiling={"micro": 8, "small": 5, "large": 3})
+        R1("tiered lo-micro 3/5/8", pb_ceiling={"micro": 3, "small": 5, "large": 8})
+        R1("tiered 10/6/4", pb_ceiling={"micro": 10, "small": 6, "large": 4})
+        print("  -- stacked (the two winners, NO ban) --", flush=True)
+        R1("remove ALL ARK + pb<=5", drop_sectors={"ARKK", "ARKG"}, pb_ceiling=5.0)
+        R1("remove ALL ARK + pb<=10", drop_sectors={"ARKK", "ARKG"}, pb_ceiling=10.0)
+        R1("remove ALL ARK + tiered lo-micro 3/5/8", drop_sectors={"ARKK", "ARKG"},
+           pb_ceiling={"micro": 3, "small": 5, "large": 8})
+        R1("remove ALL ARK + pb<=5 + lo-micro floor {micro:3,small:5,large:5}",
+           drop_sectors={"ARKK", "ARKG"}, pb_ceiling={"micro": 3, "small": 5, "large": 5})
+        print("  -- with ban (ban is the poison) --", flush=True)
+        R1("ban + remove ARKK + pb<=5", ban_first_loss=True, drop_sectors={"ARKK"}, pb_ceiling=5.0)
+        sys.exit(0)
+
+    if os.environ.get("THEME_TEST"):
+        # Quick A/B: run the 4 headline small-cap arms, print, EXIT (no DB save). Pair with DROP_ETFS=... to
+        # measure a universe change vs the stored baseline (usca_small 790.4 / norm 1024.0 / pbprof 911.5 / all 723.0).
+        import sys
+        arms = [("usca_small", dict(country_ok=_is_usca)),
+                ("usca_small_norm", dict(country_ok=_is_usca, value_key="pb_roe")),
+                ("usca_small_pbprof", dict(country_ok=_is_usca, value_key="pb_prof")),
+                ("usca_all", dict(country_ok=_is_usca, _all=True))]
+        print(f"\n=== THEME_TEST (no save) DROP_ETFS={sorted(_drop) or 'none'} ===", flush=True)
+        base = {"usca_small": 790.4, "usca_small_norm": 1024.0, "usca_small_pbprof": 911.5, "usca_all": 723.0}
+        for name, kw in arms:
+            small = not kw.pop("_all", False)
+            r = run(True, small, **kw)
+            b = base[name]
+            print(f"  {name:20} {r['total']:8.1f}%  (baseline {b:7.1f}%  {r['total']-b:+7.1f}pp)  "
+                  f"Sharpe {r['sharpe']:.2f}  DD {r['dd']:.1f}%  t {r['t_stat']}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("FLAGSHIP_TRACE"):
+        import sys
+        tr = []
+        perf = run(True, True, country_ok=_is_usca, trace=tr)
+        out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": "usca_small",
+               "perf": {k: perf.get(k) for k in ("total", "annual", "vs_spy", "sharpe", "dd", "t_stat", "months",
+                                                 "delisted_picks")},
+               "params": {"top_n": TOP_N, "small_cap_max": SMALL, "min_dvol": MIN_DVOL, "conv_weight": CONV},
+               "months": tr}
+        fp = Path("/app/.data/studies/flagship_history.json")
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(json.dumps(out, indent=2, default=str))
+        print(f"FLAGSHIP_TRACE written: {fp}  months={len(tr)}  total={perf.get('total')}%  "
+              f"(matches stored 790.4% if identical)", flush=True)
+        sys.exit(0)
+
     results = {
         "survivors_only_all": run(False, False),
         "survivors_only_small": run(False, True),
@@ -474,6 +844,14 @@ def build():
         "with_delisted_small": run(True, True),
         "usca_all": run(True, False, country_ok=_is_usca),      # US + Canada only, all-cap
         "usca_small": run(True, True, country_ok=_is_usca),     # US + Canada only, small-cap (FLAGSHIP; skips non-equity sectors)
+        # USER-REQUESTED value-trap ceiling arms (2026-08-17): cap-tiered P/B ceiling (micro<=4 / small<=6 /
+        # large<=10 so big-caps like GOOG aren't wrongly capped) + remove both ARK sleeves. 4/6/10 tested best
+        # of the ceiling shapes; ARKout+4/6/10 = ~1044% in the no-save sweep (treat the +254pp as optimistic —
+        # the ARK+ceiling stack is non-monotonic/data-snoopy). Persisted so both the arm and its caveat are visible.
+        "usca_small_ceil": run(True, True, country_ok=_is_usca,
+                               pb_ceiling={"micro": 4, "small": 6, "large": 10}),
+        "usca_small_ceil_noark": run(True, True, country_ok=_is_usca, drop_sectors={"ARKK", "ARKG"},
+                                     pb_ceiling={"micro": 4, "small": 6, "large": 10}),
         # ETF-PROXY TEST: same flagship, but when a top-accel sector has NO qualifying value stock (raw
         # commodities like USO/UNG, bonds like TLT/IEF, foreign/index markets) HOLD THE ETF itself — the
         # live is_etf_proxy fallback. Does buying straight commodities/bonds when they accelerate ADD return?

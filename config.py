@@ -49,6 +49,10 @@ SECTOR_ETFS = {
     "3D Printing": "PRNT",
     "Gaming & Esports": "HERO",
     "Ark Innovation": "ARKK",
+    # NOTE (2026-08-16): ARKK is the worst sleeve in the flagship history (-75.6 weighted contrib over 18
+    # picks, 33% win) because cheapest-P/B inside an expensive-growth basket = a crashed growth value-trap
+    # (TWLO/TDOC). Dropping it A/B'd to +149pp. Kept IN per user (2026-08-16). The principled fix is a
+    # per-PICK filter (require ROE>0 + a P/B ceiling), not blacklisting the sleeve — see flagship_history doc.
     "Internet": "FDN",
     "Software": "IGV",
     "Medtech": "IHI",
@@ -79,6 +83,10 @@ SECTOR_ETFS = {
     "Lithium & Battery": "LIT",
     "Copper Miners": "COPX",
     "Steel": "SLX",
+    # NOTE (2026-08-16): tested adding 7 finviz-gap sleeves — GDX/GDXJ/XOP/OIH/IAI/KBE/IHF. It HURT:
+    # usca_small 790.4% -> 572.9% (-217.5pp), Sharpe 1.49 -> 1.34, every arm down. High-vol cyclical
+    # sleeves game the acceleration rank (volatile = high accel), steal top-10 slots from core-sector
+    # small-cap value picks, and pick weaker large-caps. Reverted. Do NOT re-add these to the accel universe.
 
     # ── Fixed Income ──
     "Bonds (20Y Treasury)": "TLT",
