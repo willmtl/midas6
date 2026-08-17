@@ -69,6 +69,8 @@ x-backend-volumes: &backend-volumes
   - ./test_h4_study.py:/app/test_h4_study.py
   - ./h4_on_signals_study.py:/app/h4_on_signals_study.py
   - ./test_h4_on_signals.py:/app/test_h4_on_signals.py
+  - ./h4_c_indicators.py:/app/h4_c_indicators.py
+  - ./test_h4_c_indicators.py:/app/test_h4_c_indicators.py
   - ./news_overreaction.py:/app/news_overreaction.py
   - ./ground_earnings.py:/app/ground_earnings.py
   - ./signal_firing_scan.py:/app/signal_firing_scan.py
