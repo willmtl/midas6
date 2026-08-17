@@ -1900,6 +1900,15 @@ class H4CLiveView(_StudyResultView):
     json_path = "/app/.data/studies/h4_c_live.json"
 
 
+class H4CConvictionView(_StudyResultView):
+    """Backtest of conviction-weighted position sizing on the H4-on-C dip-buy: size each oversold dip by
+    its analyst-upside bucket and compare the weighted portfolio's TOTAL RETURN to equal-weight.
+    GET reads BacktestResult[h4_c_conviction]; POST recomputes."""
+    kind = "h4_c_conviction"
+    script = "h4_c_conviction.py"
+    json_path = "/app/.data/studies/h4_c_conviction.json"
+
+
 class SignalFiringView(APIView):
     """Names (stock/ETF/commodity) currently firing a given study signal (last N bars).
     GET ?signal=<key> -> the firing list for the Studies 'firing now' pane."""

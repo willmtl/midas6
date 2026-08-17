@@ -32,6 +32,9 @@ OVERSOLD_SIGS = ["mr_rsi_os", "mr_newlow60", "mr_ndown", "mr_gap_dn"]
 COMBO_SIG = "gap_dn__rsi_x"          # top dip->confirmation combo (h4_c_indicators)
 RECENT_BARS = 2                       # "firing now" = triggered within the last N 4h bars (~1 trading day)
 HIGH_3B, MED_3B = 0.8, 0.4            # conviction thresholds on the study's expected 3b return (%)
+# steep_2x position weight by analyst-upside bucket — the h4_c_conviction backtest winner (combined
+# oversold cluster: 2705% vs 1079% equal, better Sharpe + lower DD). Size the dip-buy by conviction.
+POSITION_WEIGHT = {"<0%": 0, "0-25%": 1, "25-50%": 2, "50-100%": 4, ">100%": 8, "no_target": 1}
 
 
 def _refresh_4h(ticker, years=1):
@@ -153,6 +156,7 @@ def build(refresh=True):
             "upside_pct": round(upside, 1) if upside is not None else None,
             "upside_bucket": bucket, "fired_signals": fired_sigs, "is_firing": is_firing,
             "expected_3b": best_exp, "conviction": conviction,
+            "position_weight": POSITION_WEIGHT.get(bucket, 0),   # steep_2x sizing (backtest winner)
             "state": ("DIP FIRING — add" if is_firing else "no H4 dip (hold)"),
         })
         rows.append(row)
