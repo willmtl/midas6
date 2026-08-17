@@ -75,6 +75,7 @@ x-backend-volumes: &backend-volumes
   - ./test_h4_c_upside.py:/app/test_h4_c_upside.py
   - ./h4_c_live_scan.py:/app/h4_c_live_scan.py
   - ./h4_c_conviction.py:/app/h4_c_conviction.py
+  - ./h4_c_regime.py:/app/h4_c_regime.py
   - ./news_overreaction.py:/app/news_overreaction.py
   - ./ground_earnings.py:/app/ground_earnings.py
   - ./signal_firing_scan.py:/app/signal_firing_scan.py

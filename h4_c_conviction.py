@@ -120,16 +120,23 @@ def _replay(trades, wmap, stop):
     # metrics
     if bar_map:
         tsx = sorted(bar_map)
-        rets = np.array([bar_map[t][0] / bar_map[t][1] for t in tsx if bar_map[t][1] > 0])
+        pairs = [(t, bar_map[t][0] / bar_map[t][1]) for t in tsx if bar_map[t][1] > 0]
+        tsv = [t for t, _ in pairs]
+        rets = np.array([r for _, r in pairs])
     else:
-        rets = np.array([])
+        tsv, rets = [], np.array([])
+    dd_start = dd_end = None
     if len(rets):
         eq = np.cumprod(1 + rets)
         total = round((eq[-1] - 1) * 100, 1)
         sd = rets.std(ddof=1) if len(rets) > 1 else 0
         sharpe = round(float(rets.mean() / sd * np.sqrt(BARS_PER_YEAR)), 2) if sd > 0 else 0.0
         peak = np.maximum.accumulate(eq)
-        maxdd = round(float(((eq - peak) / peak).min() * 100), 1)
+        dd_series = (eq - peak) / peak
+        trough_i = int(dd_series.argmin())
+        peak_i = int(np.argmax(eq[:trough_i + 1])) if trough_i > 0 else 0
+        maxdd = round(float(dd_series.min() * 100), 1)
+        dd_start, dd_end = str(tsv[peak_i]), str(tsv[trough_i])
     else:
         total, sharpe, maxdd = 0.0, 0.0, 0.0
     wnum = sum(w * r for w, r in realized); wden = sum(w for w, _ in realized)
@@ -137,7 +144,7 @@ def _replay(trades, wmap, stop):
     pct_stopped = round(100 * n_stopped / n_used, 1) if n_used else 0.0
     return {"total_return_pct": total, "sharpe": sharpe, "max_dd_pct": maxdd,
             "n_trades": n_used, "n_active_bars": len(rets), "weighted_mean_3b": wmean,
-            "pct_stopped": pct_stopped}
+            "pct_stopped": pct_stopped, "dd_start": dd_start, "dd_end": dd_end}
 
 
 def _spy(years, allow_fetch, span_ts):
