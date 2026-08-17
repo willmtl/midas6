@@ -1909,6 +1909,14 @@ class H4CConvictionView(_StudyResultView):
     json_path = "/app/.data/studies/h4_c_conviction.json"
 
 
+class H4CPortfolioView(_StudyResultView):
+    """Portfolio-level drawdown controls on the H4-on-C dip-buy (concurrent cap / selloff gate / DD circuit
+    breaker), sequential cash-aware simulation. GET reads BacktestResult[h4_c_portfolio]; POST recomputes."""
+    kind = "h4_c_portfolio"
+    script = "h4_c_portfolio.py"
+    json_path = "/app/.data/studies/h4_c_portfolio.json"
+
+
 class SignalFiringView(APIView):
     """Names (stock/ETF/commodity) currently firing a given study signal (last N bars).
     GET ?signal=<key> -> the firing list for the Studies 'firing now' pane."""

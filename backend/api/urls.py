@@ -76,6 +76,8 @@ urlpatterns = [
     path("h4-c-live", views.H4CLiveView.as_view(), name="h4-c-live"),
     # Conviction-weighted position sizing backtest on the H4-on-C dip-buy
     path("h4-c-conviction", views.H4CConvictionView.as_view(), name="h4-c-conviction"),
+    # Portfolio-level drawdown controls (concurrent cap / selloff gate / DD circuit breaker)
+    path("h4-c-portfolio", views.H4CPortfolioView.as_view(), name="h4-c-portfolio"),
     # Per-signal live firing (names firing each study signal in the last N bars)
     path("signal-firing", views.SignalFiringView.as_view(), name="signal-firing"),
     # Live rotation-pick scanner (cheapest-P/B in each strengthening sector)

@@ -95,6 +95,22 @@ def _fired(df, sig):
     return True, off
 
 
+SELLOFF_THR = 1.5      # h4_c_portfolio winner: don't add on a hard-down market day (SPY down > this %)
+
+
+def _spy_today_ret():
+    """SPY's most-recent daily % return (the selloff-gate input). None if unavailable."""
+    try:
+        from seq_fundamental_study import load_candles
+        spy = load_candles(["SPY"]).get("SPY")
+        if spy is None or len(spy) < 2:
+            return None
+        c = spy["Close"]
+        return round(float(c.iloc[-1] / c.iloc[-2] - 1) * 100, 2)
+    except Exception:
+        return None
+
+
 def build(refresh=True):
     import rotation_pick_scan
     rp = rotation_pick_scan.build()             # current live C basket (div_2x picks)
@@ -102,6 +118,8 @@ def build(refresh=True):
     store = load_targets()
     exp = _expected_lookup()
     all_sigs = OVERSOLD_SIGS + [COMBO_SIG]
+    spy_ret = _spy_today_ret()                   # selloff gate: hold new adds on a hard-down tape
+    market_gated = spy_ret is not None and spy_ret <= -SELLOFF_THR
 
     rows, firing = [], 0
     for p in picks:
@@ -146,6 +164,7 @@ def build(refresh=True):
         if is_firing:
             firing += 1
         conviction = "—"
+        gated = bool(is_firing and market_gated)   # selloff gate: dip fired but don't add into the crash
         if is_firing and best_exp is not None:
             conviction = "HIGH" if best_exp >= HIGH_3B else ("MED" if best_exp >= MED_3B else "LOW")
         elif is_firing:
@@ -157,7 +176,9 @@ def build(refresh=True):
             "upside_bucket": bucket, "fired_signals": fired_sigs, "is_firing": is_firing,
             "expected_3b": best_exp, "conviction": conviction,
             "position_weight": POSITION_WEIGHT.get(bucket, 0),   # steep_2x sizing (backtest winner)
-            "state": ("DIP FIRING — add" if is_firing else "no H4 dip (hold)"),
+            "market_gated": gated,
+            "state": ("DIP — WAIT (market selloff)" if gated else
+                      ("DIP FIRING — add" if is_firing else "no H4 dip (hold)")),
         })
         rows.append(row)
 
@@ -171,6 +192,7 @@ def build(refresh=True):
     return {
         "computed_at": pd.Timestamp.utcnow().isoformat(),
         "n_basket": len(rows), "n_firing": firing,
+        "spy_ret_1d": spy_ret, "market_gated": market_gated,
         "rows": rows,
         "params": {"oversold_signals": OVERSOLD_SIGS, "combo": COMBO_SIG, "recent_bars": RECENT_BARS,
                    "conviction": f"study expected 3b return: HIGH>= {HIGH_3B}% / MED>= {MED_3B}%",
