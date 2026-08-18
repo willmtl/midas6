@@ -16,6 +16,8 @@ x-backend-env: &backend-env
   POLYGON_S3_ENDPOINT: ${POLYGON_S3_ENDPOINT:-https://files.massive.com}
   # ThetaData v3 API key (Python lib connects direct — no terminal). EODHD for fundamentals.
   THETADATA_API_KEY: ${THETADATA_API_KEY:-}
+  # Optional: REST via the thetaterminal service (set THETADATA_PASSWORD in .env to enable it).
+  THETA_REST_URL: http://thetaterminal:8080/v3
   EODHD_API_KEY: ${EODHD_API_KEY:-}
   # Anthropic key for cheap-LLM news classification (Haiku). Set in .env, never hardcoded.
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -132,6 +134,19 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+
+  # ThetaData v3 Terminal (REST API). Needs THETADATA_PASSWORD (thetadata.net account password) in .env;
+  # username = THETADATA_API_KEY. Exposes REST at http://thetaterminal:8080/v3/ on the compose network.
+  thetaterminal:
+    build:
+      context: .
+      dockerfile: Dockerfile.theta
+    environment:
+      THETADATA_API_KEY: ${THETADATA_API_KEY:-}
+      THETADATA_PASSWORD: ${THETADATA_PASSWORD:-}
+    ports:
+      - "25510:8080"
+    restart: unless-stopped
 
   backend:
     build:

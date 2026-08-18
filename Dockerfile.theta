@@ -1,0 +1,13 @@
+# ThetaData v3 Terminal as a Docker service — REST API on the compose network.
+# Auth: username = THETADATA_API_KEY (the td1_prod_... key), password = THETADATA_PASSWORD (thetadata.net
+# account password). Data hosts nj-a/nj-b.thetadata.us:12000/20000 are reachable from Docker (verified).
+FROM eclipse-temurin:21-jre
+RUN apt-get update && apt-get install -y --no-install-recommends curl socat ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/theta
+RUN curl -sSLO https://download-stable.thetadata.us/ThetaTerminal.jar
+COPY theta_entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+# 8080 = socat-exposed REST (forwards to the terminal's 127.0.0.1:25510 in case it binds loopback only)
+EXPOSE 8080
+ENTRYPOINT ["/entrypoint.sh"]
