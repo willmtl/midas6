@@ -28,11 +28,13 @@ SECTOR_ETFS = {
     # ── Thematic / Industry ──
     "Semiconductors": "SMH",
     "Biotech": "XBI",
-    "Genomics": "ARKG",
+    "Genomics": "IDNA",   # was ARKG (2026-08-17): retired the last ARK ACTIVE fund for iShares' passive genomics
+                          # index — A/B'd better in every window (FULL 5719% vs ARKG 5524, Sh 2.00) AND passive.
     "Cybersecurity": "CIBR",
     "AI & Robotics": "BOTZ",
     "Cloud Computing": "SKYY",
-    "Quantum Computing": "QTUM",
+    # REMOVED "Quantum Computing": "QTUM" (2026-08-17, user): thin/hype-driven single-theme sleeve,
+    # not a durable sector — high-vol names game the accel rank and pull weak picks into the top-10.
     "Aerospace & Defense": "ITA",
     "Space": "UFO",
     "Clean Energy": "ICLN",
@@ -48,11 +50,9 @@ SECTOR_ETFS = {
     "Electric Vehicles": "DRIV",
     "3D Printing": "PRNT",
     "Gaming & Esports": "HERO",
-    "Ark Innovation": "ARKK",
-    # NOTE (2026-08-16): ARKK is the worst sleeve in the flagship history (-75.6 weighted contrib over 18
-    # picks, 33% win) because cheapest-P/B inside an expensive-growth basket = a crashed growth value-trap
-    # (TWLO/TDOC). Dropping it A/B'd to +149pp. Kept IN per user (2026-08-16). The principled fix is a
-    # per-PICK filter (require ROE>0 + a P/B ceiling), not blacklisting the sleeve — see flagship_history doc.
+    # REMOVED "Ark Innovation": "ARKK" (2026-08-17, user): ARKK is an actively-managed MULTI-THEME FUND, not a
+    # sector — it doesn't belong in a sector-rotation universe. (It was also the worst sleeve: −75.6 contrib,
+    # 33% win — cheapest-P/B inside an expensive-growth basket = crashed growth value-trap like TWLO/TDOC.)
     "Internet": "FDN",
     "Software": "IGV",
     "Medtech": "IHI",
@@ -80,6 +80,10 @@ SECTOR_ETFS = {
     "Wheat": "WEAT",
     "Corn": "CORN",
     "Uranium": "URA",
+    # TESTED + REVERTED (2026-08-17): adding "Nuclear & SMR" (NLR) + "Grid & Electrification" (GRID) sleeves
+    # HURT the flagship blend −545pp (6804→6259% FULL, hurt in ex-2020/H2 too, only +0.03 Sharpe). Even hot
+    # thematic sleeves with real small-caps game the accel ranking and displace existing winners. See
+    # [[sector-adds-hurt]] — this is the 3rd confirmation. Do NOT re-add.
     "Lithium & Battery": "LIT",
     "Copper Miners": "COPX",
     "Steel": "SLX",
@@ -161,7 +165,8 @@ SECTOR_ETFS = {
     "Momentum": "MTUM",
     "Value": "VTV",
     "Growth": "VUG",
-    "Low Volatility": "SPLV",
+    # REMOVED "Low Volatility": "SPLV" (2026-08-17, user): a low-vol factor sleeve is the OPPOSITE of what
+    # the accel-ranked small-cap value system wants (its winners are volatile beaten-down names).
 
     # ── Crypto (Bitcoin only) ──
     "Bitcoin ETF": "IBIT",

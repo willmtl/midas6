@@ -527,6 +527,37 @@ def run_vol_shock_study():
 
 
 @shared_task
+def refresh_analyst_ratings():
+    """Nightly (BEFORE run_rotation_picks): re-pull the Benzinga analyst-ratings archive (Polygon) so the live
+    blend selector uses CURRENT price targets. Without this the implied-upside decays to stale/empty in ~90d
+    and the blend silently reverts to cheapest-P/B. --refresh re-fetches all (~1-2min)."""
+    import subprocess, os
+    if not os.path.exists("/app/backfill_analyst_ratings.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/backfill_analyst_ratings.py", "--refresh", "--workers", "10"],
+                          cwd="/app", env={**os.environ}, capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("analyst-ratings refresh failed (rc=%s): %s", proc.returncode, (proc.stderr or "")[-1500:])
+    else:
+        logger.info("analyst-ratings refresh: %s", (proc.stdout or "").strip().splitlines()[-1:])
+    return proc.returncode
+
+
+@shared_task
+def refresh_short_interest():
+    """Nightly (BEFORE run_rotation_picks): re-pull historical short interest (Polygon/FINRA) so the live SI
+    signal stays current. --refresh re-fetches all (~1min)."""
+    import subprocess, os
+    if not os.path.exists("/app/backfill_short_interest.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/backfill_short_interest.py", "--refresh", "--workers", "10"],
+                          cwd="/app", env={**os.environ}, capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("short-interest refresh failed (rc=%s): %s", proc.returncode, (proc.stderr or "")[-1500:])
+    return proc.returncode
+
+
+@shared_task
 def run_rotation_picks():
     """Nightly: live rotation-pick basket (cheapest-P/B in each top-momentum sector) → BacktestResult."""
     import subprocess, os
@@ -553,6 +584,117 @@ def run_rotation_call():
     if proc.returncode != 0:
         logger.error("rotation_call_scan failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
     return proc.returncode
+
+
+@shared_task
+def refresh_expanded_universe():
+    """Weekly: pull the full current ETF constituents (EODHD ETF_Data.Holdings) → expanded_holdings.json, so
+    the LIVE scanner's universe (top-20 + real constituents) grows automatically as ETF membership changes.
+    Backtests are unaffected — they deliberately stay on the frozen top-20. Read-only vs the DB."""
+    import subprocess, os
+    if not os.path.exists("/app/expand_holdings.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/expand_holdings.py"], cwd="/app", env={**os.environ},
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("expand_holdings failed (rc=%s): %s", proc.returncode, (proc.stderr or "")[-1500:])
+    return proc.returncode
+
+
+@shared_task
+def refresh_finviz_universe():
+    """Weekly: re-scrape the Finviz taxonomy (11 sectors → 149 industries → all US/CA names) so the
+    Finviz-version engine's membership stays current. urllib GET (Cloudflare-ok from the worker) →
+    .data/finviz_universe.json. Idempotent, ~6min."""
+    import subprocess, os
+    if not os.path.exists("/app/scrape_finviz_universe.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/scrape_finviz_universe.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("finviz-universe scrape failed (rc=%s): %s", proc.returncode, (proc.stderr or "")[-1500:])
+    return proc.returncode
+
+
+@shared_task
+def refresh_finviz_fundamentals():
+    """Weekly (after refresh_finviz_universe): backfill quarterly fundamentals (SEC EDGAR) for any Finviz
+    US names still missing them, so the industry engine's coverage keeps growing. Idempotent (only fetches
+    the missing set); brand-new listings each week are small/fast."""
+    import subprocess, os
+    if not os.path.exists("/app/backfill_finviz_fundamentals.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/backfill_finviz_fundamentals.py", "--jobs", "5"],
+                          cwd="/app", env={**os.environ}, capture_output=True, text=True, timeout=7200)
+    if proc.returncode != 0:
+        logger.error("finviz-fundamentals backfill failed (rc=%s): %s", proc.returncode, (proc.stderr or "")[-1500:])
+    return proc.returncode
+
+
+@shared_task
+def refresh_finviz_candles():
+    """Weekly (after refresh_finviz_fundamentals): backfill daily candles (EODHD) for any Finviz US/CA name
+    still missing price history — the actual breadth constraint for the industry engine. Non-destructive,
+    only the missing set. No-op without EODHD_API_KEY."""
+    import subprocess, os
+    if not os.path.exists("/app/backfill_finviz_candles.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/backfill_finviz_candles.py", "--jobs", "8"],
+                          cwd="/app", env={**os.environ}, capture_output=True, text=True, timeout=7200)
+    if proc.returncode != 0:
+        logger.error("finviz-candles backfill failed (rc=%s): %s", proc.returncode, (proc.stderr or "")[-1500:])
+    return proc.returncode
+
+
+@shared_task
+def recompute_finviz_rotation():
+    """Nightly: re-run the SEPARATE Finviz industry-rotation engine → BacktestResult[finviz_rotation]
+    (feeds the Finviz tab of the flagship doc). The parallel version to the ETF flagship."""
+    import subprocess, os
+    if not os.path.exists("/app/finviz_rotation_study.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/finviz_rotation_study.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        logger.error("finviz_rotation recompute failed (rc=%s): %s", proc.returncode, (proc.stderr or "")[-1500:])
+    return proc.returncode
+
+
+@shared_task
+def recompute_survivorship_flagship():
+    """Weekly: re-run the ETF flagship survivorship study (all arms) → BacktestResult[survivorship_smallcap]
+    so the dashboard + the flagship-doc head-to-head stay current. Heavy (~10min), slow-moving (monthly
+    rebalance) → weekly."""
+    import subprocess, os
+    if not os.path.exists("/app/survivorship_smallcap_study.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/survivorship_smallcap_study.py"], cwd="/app",
+                          capture_output=True, text=True, timeout=5400)
+    if proc.returncode != 0:
+        logger.error("survivorship flagship recompute failed (rc=%s): %s", proc.returncode, (proc.stderr or "")[-1500:])
+    return proc.returncode
+
+
+@shared_task
+def rebuild_flagship_doc():
+    """Nightly: regenerate the flagship tearsheet HTML (both method tabs). 3-step chain —
+    FLAGSHIP_TRACE run → enrich → doc build. Reads BacktestResult[finviz_rotation] + [survivorship_smallcap]
+    for the Finviz tab, so run AFTER recompute_finviz_rotation. Writes .data/studies/flagship_history.html."""
+    import subprocess, os
+    if not os.path.exists("/app/flagship_doc_build.py"):
+        return {"error": "not mounted"}
+    steps = [
+        (["python", "-u", "/app/survivorship_smallcap_study.py"], {**os.environ, "FLAGSHIP_TRACE": "1"}, 5400),
+        (["python", "-u", "/app/flagship_history_enrich.py"], {**os.environ}, 900),
+        (["python", "-u", "/app/flagship_doc_build.py"], {**os.environ}, 600),
+    ]
+    for cmd, env, to in steps:
+        proc = subprocess.run(cmd, cwd="/app", env=env, capture_output=True, text=True, timeout=to)
+        if proc.returncode != 0:
+            logger.error("flagship-doc step %s failed (rc=%s): %s", cmd[-1], proc.returncode, (proc.stderr or "")[-1500:])
+            return proc.returncode
+    logger.info("flagship doc rebuilt")
+    return 0
 
 
 @shared_task

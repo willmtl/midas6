@@ -96,6 +96,9 @@ HOLDINGS = {
             "NEE", "SO", "DUK", "CEG", "AEP", "SRE", "D", "VST",
             "ETR", "XEL", "EXC", "WEC", "ES", "AWK", "PPL", "ED",
             "EIX", "AES", "DTE", "FE",
+            # 2026-08-17: absorbed the regulated utilities that were only reachable via the retired
+            # Low Volatility (SPLV) sleeve, so removing SPLV doesn't drop them from the universe.
+            "AEE", "LNT", "CNP", "EVRG", "CMS", "PEG", "ATO", "NI",
         ],
     },
 
@@ -116,6 +119,7 @@ HOLDINGS = {
             "NVDA", "TSM", "MU", "AMD", "INTC", "AVGO", "QCOM", "TXN",
             "LRCX", "KLAC", "AMAT", "MRVL", "ADI", "SNPS", "CDNS",
             "ON", "MCHP", "NXPI", "ASML", "SWKS",
+            "STM", "MKSI",   # 2026-08-17: absorbed from the retired Quantum Computing (QTUM) sleeve
         ],
     },
     "Biotech": {
@@ -159,14 +163,8 @@ HOLDINGS = {
             "DDOG", "NET", "ZS", "ESTC", "CFLT", "HUBS",
         ],
     },
-    "Quantum Computing": {
-        "etf": "QTUM",
-        "holdings": [
-            "MU", "2454.TW", "INTC", "STM", "ARM", "NOK", "AMD",
-            "MRVL", "IFX.DE", "ON", "IONQ", "RGTI", "QUBT", "ARQQ",
-            "QBTS", "FORM", "ACLS", "BRKS", "MKSI", "CEVA",
-        ],
-    },
+    # REMOVED "Quantum Computing" (QTUM) 2026-08-17: hype-driven single-theme sleeve. Real semis (STM/MKSI)
+    # folded into Semiconductors; pure-quantum names (IONQ/RGTI/QUBT/ARQQ/QBTS) intentionally dropped.
     "Aerospace & Defense": {
         "etf": "ITA",
         "holdings": [
@@ -486,6 +484,8 @@ HOLDINGS = {
             "HAM.AX", "AGE.AX",
         ],
     },
+    # TESTED + REVERTED 2026-08-17: "Nuclear & SMR" (NLR) + "Grid & Electrification" (GRID) HURT the flagship
+    # −545pp (see config.py note + [[sector-adds-hurt]]). Holdings removed with the sleeves.
     "Lithium & Battery": {
         "etf": "LIT",
         "holdings": [
@@ -566,14 +566,8 @@ HOLDINGS = {
             "NFLX", "PLTR", "INTU", "ISRG", "SNPS", "CDNS",
         ],
     },
-    "Low Volatility": {
-        "etf": "SPLV",
-        "holdings": [
-            "FE", "L", "BRK-B", "DUK", "AEE", "WEC", "LNT", "CNP",
-            "DTE", "EVRG", "ED", "XEL", "ES", "PPL", "AEP", "SO",
-            "CMS", "PEG", "ATO", "NI",
-        ],
-    },
+    # REMOVED "Low Volatility" (SPLV) 2026-08-17: a low-vol factor is the opposite of the accel-ranked
+    # small-cap value system. Its regulated utilities were folded into Utilities (see above).
 
     # ── Crypto ETFs (stock-based) ──
 

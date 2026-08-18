@@ -247,7 +247,17 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_sector_acceleration",
         "schedule": crontab(hour=22, minute=3),
     },
-    "rotation-picks-nightly": {         # live rotation-pick basket (cheapest-P/B in strong sectors)
+    # refresh the live blend's data BEFORE the rotation-pick scan (else implied-upside decays to stale/empty
+    # and the blend reverts to cheapest-P/B). Fast (~1-2min each); Polygon egress.
+    "refresh-analyst-ratings-nightly": {
+        "task": "api.celery_tasks.refresh_analyst_ratings",
+        "schedule": crontab(hour=21, minute=50),
+    },
+    "refresh-short-interest-nightly": {
+        "task": "api.celery_tasks.refresh_short_interest",
+        "schedule": crontab(hour=21, minute=55),
+    },
+    "rotation-picks-nightly": {         # live rotation-pick basket (blend: cheap-P/B × analyst-upside; bear->FCF)
         "task": "api.celery_tasks.run_rotation_picks",
         "schedule": crontab(hour=22, minute=5),
     },
@@ -302,5 +312,42 @@ app.conf.beat_schedule = {
     "walk-forward-weekly": {            # subperiod validation — Sat 23:22 UTC
         "task": "api.celery_tasks.run_walk_forward",
         "schedule": crontab(hour=23, minute=22, day_of_week=6),
+    },
+
+    # Live ETF universe growth: refresh the EODHD-expanded constituents so the live scanner's pool tracks
+    # current ETF membership (backtests stay on the frozen top-20). Weekly Sun 20:05, before the recomputes.
+    "expanded-universe-weekly": {
+        "task": "api.celery_tasks.refresh_expanded_universe",
+        "schedule": crontab(hour=20, minute=5, day_of_week=0),
+    },
+
+    # ── FINVIZ VERSION pipeline (separate industry-rotation engine) + flagship tearsheet, self-maintaining ──
+    # Weekly data refresh (Sun, before the nightly recomputes use it). Universe → fundamentals → candles,
+    # in order; each only fetches what's missing so weeks after the first are fast.
+    "finviz-universe-weekly": {         # re-scrape 11 sectors → 149 industries → all names
+        "task": "api.celery_tasks.refresh_finviz_universe",
+        "schedule": crontab(hour=20, minute=15, day_of_week=0),
+    },
+    "finviz-fundamentals-weekly": {     # EDGAR fundamentals for newly-missing Finviz names
+        "task": "api.celery_tasks.refresh_finviz_fundamentals",
+        "schedule": crontab(hour=20, minute=25, day_of_week=0),
+    },
+    "finviz-candles-weekly": {          # EODHD daily candles for newly-missing Finviz names (breadth unlock)
+        "task": "api.celery_tasks.refresh_finviz_candles",
+        "schedule": crontab(hour=20, minute=40, day_of_week=0),
+    },
+    "survivorship-flagship-weekly": {   # ETF flagship arms → BacktestResult[survivorship_smallcap] (dashboard)
+        "task": "api.celery_tasks.recompute_survivorship_flagship",
+        "schedule": crontab(hour=21, minute=10, day_of_week=0),
+    },
+    # Nightly: recompute the Finviz engine, then rebuild the flagship tearsheet (both tabs). Ordered so the
+    # Finviz tab reads a fresh BacktestResult[finviz_rotation].
+    "finviz-rotation-nightly": {
+        "task": "api.celery_tasks.recompute_finviz_rotation",
+        "schedule": crontab(hour=22, minute=40),
+    },
+    "flagship-doc-nightly": {           # FLAGSHIP_TRACE → enrich → HTML (after finviz recompute)
+        "task": "api.celery_tasks.rebuild_flagship_doc",
+        "schedule": crontab(hour=22, minute=55),
     },
 }

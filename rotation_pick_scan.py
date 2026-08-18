@@ -198,7 +198,42 @@ def build():
     # not improving); keep turnarounds. Backtested +231.7% vs +214.7% baseline, better t/Sharpe/DD.
     from profitability_guard import guard_flags
     gflags = guard_flags(univ)
+
+    # REMOVED the SPY-200MA→FCF bear-regime switch (2026-08-17, user): it was the least-trustworthy lever —
+    # small ~17-month bear sample, DID NOT cross-validate (regime/options work generally didn't generalize),
+    # and its +320pp is inside the ~500pp run-to-run noise. Production now runs the PURE BLEND regardless of
+    # regime; we set forward expectations on the robust core (raw cheapest-P/B) + blend tilt, not the switch.
     alt = _alt_signals(univ)          # insider / congress buying confirmation flags
+
+    # LIVE analyst implied-upside (Benzinga): most-recent price target within 90d ÷ latest close − 1. Feeds the
+    # FLAGSHIP blend selector (60% analyst implied-upside + 40% cheap-P/B). ⚠️ reads .data/analyst_ratings.jsonl,
+    # a backfill SNAPSHOT — re-run backfill_analyst_ratings.py on a schedule to keep live targets fresh.
+    from pathlib import Path as _Path
+    upside_by_ticker = {}
+    _rp = _Path("/app/.data/analyst_ratings.jsonl")
+    if _rp.exists():
+        _lat = {}
+        for _line in _rp.read_text(encoding="utf-8").splitlines():
+            if not _line.strip():
+                continue
+            try:
+                _r = json.loads(_line)
+            except Exception:
+                continue
+            if _r.get("price_target") and _r.get("date") and _r.get("ticker") in funds:
+                tk = _r["ticker"]
+                if tk not in _lat or _r["date"] > _lat[tk][0]:
+                    _lat[tk] = (_r["date"], float(_r["price_target"]))
+        for tk, (d, tgt) in _lat.items():
+            dfp = px.get(tk)
+            if dfp is None or not len(dfp):
+                continue
+            if (dfp.index.max() - pd.Timestamp(d)).days > 90:
+                continue
+            close = float(dfp["Close"].iloc[-1])
+            if close > 0 and tgt > 0:
+                upside_by_ticker[tk] = tgt / close - 1
+    print(f"live analyst implied-upside: {len(upside_by_ticker)} names covered (target within 90d)", flush=True)
 
     picks = []
     held = set()          # cross-sector dedup: a name can sit in multiple GICS/ETF pools (e.g. INSP in Medtech
@@ -233,14 +268,20 @@ def build():
             # survivorship + walk-forward robust (survivors-only-small = live universe: P/E +302pp). LARGE-CAP
             # fallback keeps cheapest raw P/B (P/E LOSES in large-cap: cheap-P/E = cyclical earnings peak).
             if is_small_tier:
-                top5 = sorted(use, key=lambda x: x[1])[:5]
-                prof = [(tk, pbv) for tk, pbv in top5 if (funds.get(tk, {}).get("pe_ratio") or 0) > 0]
-                if prof:
-                    t, pb = min(prof, key=lambda x: funds.get(x[0], {}).get("pe_ratio"))
-                    sel_basis = "pe_smallcap"
+                # FLAGSHIP blend (2026-08-17): rank small-caps by 60% analyst implied-upside + 40% cheap-P/B
+                # (both pct-rank), among names with a recent analyst target (>=3 covered); else cheapest raw P/B.
+                # The one additive lever that beat raw-P/B in both halves + across weights + 4/6 years.
+                covered = [(tk, pbv) for tk, pbv in use if upside_by_ticker.get(tk) is not None]
+                if len(covered) >= 3:
+                    _tks = [tk for tk, _ in covered]
+                    _pbs = pd.Series({tk: pbv for tk, pbv in covered})
+                    _ups = pd.Series({tk: upside_by_ticker[tk] for tk in _tks})
+                    _blend = 0.6 * _ups.rank(pct=True, ascending=False) + 0.4 * _pbs.rank(pct=True)
+                    t = _blend.idxmin(); pb = float(_pbs[t])
+                    sel_basis = "blend_upside_pb"
                 else:
-                    t, pb = top5[0]
-                    sel_basis = "pb_smallcap_noprofit"
+                    t, pb = min(use, key=lambda x: x[1])
+                    sel_basis = "pb_smallcap_nocover"
             else:
                 t, pb = min(use, key=lambda x: x[1])
                 sel_basis = "pb_largecap"
@@ -252,6 +293,7 @@ def build():
             row.update({
                 "pick": t, "is_etf_proxy": False, "pb_ratio": round(pb, 2),
                 "selection_basis": sel_basis,
+                "implied_upside_pct": (round(upside_by_ticker[t] * 100, 1) if upside_by_ticker.get(t) is not None else None),
                 "guard_status": g.get("status"), "margin_pct": g.get("margin"),
                 "debt_to_equity": g.get("debt_to_equity"),
                 "net_income": g.get("net_income"), "improving": g.get("improving"),

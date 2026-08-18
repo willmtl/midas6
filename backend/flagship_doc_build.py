@@ -13,6 +13,118 @@ OUT = Path("/app/.data/studies/flagship_history.html")
 D = json.load(open(IN))
 S, P = D["summary"], D["perf"]
 
+# ── METHOD-TABS data: pull the Finviz engine result + ETF arms so the doc can show a tab per method.
+# Optional/defensive — if the DB isn't reachable the Finviz tab just shows a "pending" note.
+FINVIZ = None
+ETF_ARMS = {}
+try:
+    import os as _os, django as _dj
+    _os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings")
+    _dj.setup()
+    from core.models import BacktestResult as _BR
+    _fr = _BR.objects.filter(kind="finviz_rotation").order_by("-computed_at").first()
+    if _fr:
+        FINVIZ = _fr.payload
+    _sr = _BR.objects.filter(kind="survivorship_smallcap").order_by("-computed_at").first()
+    if _sr:
+        _res = _sr.payload.get("results", {})
+        for _k in ("usca_small", "usca_small_upside_pb", "usca_small_bear_fcf", "usca_small_proxy"):
+            if isinstance(_res.get(_k), dict):
+                ETF_ARMS[_k] = _res[_k]
+except Exception as _e:
+    print("method-compare data unavailable:", _e)
+
+
+def _build_finviz_pane():
+    """The Finviz-version tab: separate engine, head-to-head vs the ETF arms, status = iterating."""
+    _armlab = [("usca_small_bear_fcf", "ETF · blend + 200-MA regime", False),
+               ("usca_small_upside_pb", "ETF · analyst-upside × P/B blend", False),
+               ("usca_small", "ETF · raw cheapest-P/B (apples-to-apples)", False),
+               ("usca_small_proxy", "ETF · buy-the-skipped-ETF (refuted)", False)]
+    rows = ""
+    for k, lab, _ in _armlab:
+        v = ETF_ARMS.get(k)
+        if v:
+            rows += (f'<tr><td class="l sec" style="max-width:none">{lab}</td>'
+                     f'<td class="num">{v.get("total", 0):,.0f}%</td>'
+                     f'<td class="num">{v.get("sharpe", "—")}</td></tr>')
+    if FINVIZ:
+        f = FINVIZ["full"]
+        u = FINVIZ.get("universe", {})
+        rows += (f'<tr style="background:color-mix(in srgb,var(--gold) 12%,transparent)">'
+                 f'<td class="l sec strong" style="max-width:none">Finviz · industry rotation (v1)</td>'
+                 f'<td class="num strong">{f["total"]:,.0f}%</td>'
+                 f'<td class="num strong">{f["sharpe"]}</td></tr>')
+        kpis = [("Total return", f'{f["total"]:,.0f}%', "raw P/B, v1"),
+                ("Sharpe", f'{f["sharpe"]}', f'{f["months"]} months'),
+                ("Industries used", f'{u.get("industries", "—")}', "of 149 (≥3 members)"),
+                ("Names w/ fundamentals", f'{u.get("with_fundamentals", "—")}', f'of {u.get("tickers", "—"):,} US/CA')]
+        picks = FINVIZ.get("picks_log", [])[-12:]
+
+        def _prow(p):
+            spy = "—" if p.get("spy") is None else f'{p["spy"]:+.1f}%'
+            cls = "pos" if (p["ret"] or 0) >= 0 else "neg"
+            return (f'<tr><td class="l mono">{esc(p["date"])}</td><td class="num">{p["n"]}</td>'
+                    f'<td class="l sec" style="max-width:none">{esc(", ".join(p["picks"]))}</td>'
+                    f'<td class="num {cls}">{p["ret"]:+.1f}%</td>'
+                    f'<td class="num mut">{spy}</td></tr>')
+        prows = "".join(_prow(p) for p in picks)
+    else:
+        kpis = [("Status", "pending", "run finviz_rotation_study.py")]
+        prows = ""
+    kpi_html = "".join(f'<div class="kpi"><div class="k">{esc(k)}</div><div class="v">{v}</div>'
+                       f'<div class="d">{esc(dd)}</div></div>' for k, v, dd in kpis)
+    sweep = FINVIZ.get("tightening_sweep") if FINVIZ else None
+    sweep_block = ""
+    if sweep:
+        srows = ""
+        for s in sweep:
+            hot = "font-weight:700;background:color-mix(in srgb,var(--gold) 12%,transparent)" if s["variant"].startswith("size floor $300M") else ""
+            srows += (f'<tr style="{hot}"><td class="l sec" style="max-width:none">{esc(s["variant"])}</td>'
+                      f'<td class="num">{s["full"]:,.0f}%</td><td class="num">{s["h1"]:,.0f}%</td>'
+                      f'<td class="num">{s["h2"]:,.0f}%</td><td class="num">{s["sharpe"]}</td></tr>')
+        sweep_block = (f'<section><div class="shead"><h2>Rebuilding the ETF’s implicit filter</h2>'
+                       f'<span class="cnt">walk-forward: FULL / H1 / H2</span></div>'
+                       f'<p class="lede">The ETF version gets quality screening for free (index-inclusion rules drop nano-caps, '
+                       f'shells, illiquid junk). Finviz has no gatekeeper, so we rebuild it explicitly. The winner is a '
+                       f'<b>$300M minimum-size floor</b> (nano-caps were the value traps); a profitability gate and a liquidity '
+                       f'gate both <b>hurt</b> — the small-cap value winners are often cash-burning growth.</p>'
+                       f'<div class="tablecard"><div class="scrollx"><table>'
+                       f'<thead><tr><th class="l">Selection rule</th><th>FULL</th><th>H1</th><th>H2</th><th>Sharpe</th></tr></thead>'
+                       f'<tbody>{srows}</tbody></table></div></div></section>')
+    picks_block = (f'<section><div class="shead"><h2>Recent monthly picks</h2>'
+                   f'<span class="cnt">last {len(FINVIZ.get("picks_log", [])[-12:])} rebalances</span></div>'
+                   f'<div class="tablecard"><div class="scrollx"><table>'
+                   f'<thead><tr><th class="l">Month</th><th>N</th><th class="l">Picks (cheapest-P/B per top industry)</th>'
+                   f'<th>Basket</th><th>SPY</th></tr></thead><tbody>{prows}</tbody></table></div></div></section>'
+                   ) if prows else ""
+    return f"""
+  <div class="mpane" id="mpane-finviz" hidden>
+    <header class="mast">
+      <p class="eyebrow">Finviz Version · Industry Rotation <span class="statuspill">v1 · iterating</span></p>
+      <h1>Rotating the Finviz Industry Map</h1>
+      <p class="sub">A separate engine that ranks all <b>149 Finviz industries</b> (11 sectors, 11,574 scraped names) by the same momentum acceleration, then buys the cheapest-P/B small-cap inside the hottest ones. Shares only the point-in-time data library with the ETF version — never its logic.</p>
+    </header>
+    <div class="banner">
+      <b>Work in progress — kept intentionally.</b> This v1 sees only the ~{FINVIZ["universe"]["with_fundamentals"] if FINVIZ else 645} names that already have fundamentals; a backfill is loading the other ~9,000 US names so the industry breadth becomes real. v1 is also survivorship-optimistic (no delisted handling yet) and raw-P/B only (the analyst-upside blend + regime levers aren't ported yet). Numbers will move.
+    </div>
+    <div class="kpis" style="grid-template-columns:repeat({len(kpis)},1fr)">{kpi_html}</div>
+    <section>
+      <div class="shead"><h2>Head-to-head — same window, same rules</h2><span class="cnt">total return · Sharpe</span></div>
+      <p class="lede">Both engines: rank momentum acceleration → buy the cheapest-P/B small-cap US/CA in the top sleeves, monthly. The only difference is the <b>rotation map</b> — 91 hand-picked ETFs vs 149 Finviz industries. Apples-to-apples is <b>ETF raw-P/B vs Finviz v1</b>; the ETF blend/regime rows show the tuned levers not yet ported.</p>
+      <div class="tablecard"><div class="scrollx"><table>
+        <thead><tr><th class="l">Method</th><th>Total</th><th>Sharpe</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table></div></div>
+    </section>
+    {sweep_block}
+    {picks_block}
+    <footer class="foot">
+      <p><b>Finviz engine.</b> <span class="mono">finviz_rotation_study.py</span> + <span class="mono">finviz_config.py</span>, fed by <span class="mono">scrape_finviz_universe.py</span> (11 sectors → 149 industries → 11,574 US/CA-inclusive names, scraped from the Finviz screener, all pages). Industry momentum = equal-weight constituent index; pick = cheapest point-in-time P/B small-cap (&lt;$2B), $50M market-cap floor, monthly rebalance. v1 caveats: survivorship-optimistic (no delisted exits), FX unadjusted, fundamentals coverage still filling in. This tab will be enriched as the engine matures.</p>
+    </footer>
+  </div>
+"""
+
 
 def esc(x):
     return html.escape(str(x)) if x is not None else ""
@@ -303,7 +415,7 @@ for m in D["months"]:
         conv = ' <span class="conv" title="A/D-conviction 2× weight">2×</span>' if p["conviction"] else ""
         rr = pct(p["ret"]) if p["ret"] is not None else '<span class="mut">n/a</span>'
         wt = f'{p["weight"]:.0f}×' if p.get("weight") else '1×'
-        why = (f'Cheapest positive-P/B value name (P/B {p.get("pb") and round(p["pb"],2)}) among the '
+        why = (f'Best cheap-P/B × analyst-upside blend (P/B {p.get("pb") and round(p["pb"],2)}) among the '
                f'{"small-caps" if (p.get("mktcap_usd") or 0) < 2e9 else "holdings"} of {esc(p["sector"])}, '
                f'which accelerated into the momentum top-10.')
         blotter.append(f"""<tr title="{why}">
@@ -321,6 +433,8 @@ for m in D["months"]:
           <td class="num">{wt}</td>
           <td class="num strong">{rr}</td>
         </tr>""")
+
+finviz_pane = _build_finviz_pane()
 
 HTML = f"""<title>usca_small — Flagship Trade History</title>
 <style>
@@ -468,11 +582,27 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 .tog:hover{{color:var(--ink)}} .tog:focus-visible{{outline:2px solid var(--accent); outline-offset:2px}}
 @media (max-width:720px){{ .kpis{{grid-template-columns:repeat(2,1fr)}} .funda{{grid-template-columns:repeat(2,1fr)}} .doc{{padding:0 14px 80px}} .mast{{padding-top:40px}} }}
 @media (prefers-reduced-motion:reduce){{*{{scroll-behavior:auto!important}}}}
+.mtabs{{position:sticky; top:0; z-index:30; display:flex; gap:4px; padding:14px 0 0; background:var(--paper); border-bottom:2px solid var(--ink)}}
+.mtab{{font-family:var(--mono); font-size:12px; letter-spacing:.03em; color:var(--ink2); background:var(--band); border:1px solid var(--line); border-bottom:none; border-radius:9px 9px 0 0; padding:10px 18px; cursor:pointer; display:flex; align-items:center; gap:8px; margin-bottom:-2px}}
+.mtab:hover{{color:var(--ink)}}
+.mtab[aria-selected="true"]{{background:var(--card); color:var(--ink); font-weight:700; border-color:var(--ink); border-bottom:2px solid var(--card)}}
+.mtab .mpill{{font-size:9.5px; padding:1px 6px; border-radius:10px; background:color-mix(in srgb,var(--accent) 18%,transparent); color:var(--accent); font-weight:700}}
+.mtab .mpill.wip{{background:color-mix(in srgb,var(--gold) 20%,transparent); color:var(--gold)}}
+.mpane[hidden]{{display:none}}
+.statuspill{{font-family:var(--mono); font-size:10px; letter-spacing:.05em; padding:2px 8px; border-radius:10px; background:color-mix(in srgb,var(--gold) 20%,transparent); color:var(--gold); margin-left:8px; vertical-align:middle}}
+.banner{{background:color-mix(in srgb,var(--gold) 9%,var(--card)); border:1px solid color-mix(in srgb,var(--gold) 35%,var(--line)); border-radius:10px; padding:14px 16px; font-size:13.5px; color:var(--ink2); margin:26px 0 4px}}
+.banner b{{color:var(--ink)}}
 </style>
 
 <div class="doc">
 <div class="wrap">
 
+  <div class="mtabs" role="tablist" aria-label="Rotation method">
+    <button class="mtab" id="tab-etf" role="tab" aria-selected="true" data-pane="mpane-etf">ETF Flagship <span class="mpill">live</span></button>
+    <button class="mtab" id="tab-finviz" role="tab" aria-selected="false" data-pane="mpane-finviz">Finviz Industry <span class="mpill wip">v1</span></button>
+  </div>
+
+  <div class="mpane" id="mpane-etf">
   <header class="mast">
     <p class="eyebrow">Flagship Strategy · Full Trade History</p>
     <h1>Small-Cap Value, Bought in Accelerating Sectors</h1>
@@ -584,10 +714,11 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 
   <footer class="foot">
     <p><b>Fundamentals are point-in-time.</b> Every P/B, P/E, ROE and D/E shown is the value as filed and public on the purchase date (45-day report lag) — the price component is the purchase-month close, never a later close or a current value. <b>There is deliberately no forward P/E:</b> our data providers expose only today's forward estimate, and pasting that onto a 2022 buy would be look-ahead. <b>P/E is the standard trailing multiple</b> — Price ÷ trailing-12-month EPS (market cap ÷ TTM net income, four quarters summed point-in-time); a negative P/E means the company was loss-making over the trailing year, and blank means fewer than four quarters had been filed by the trade date. ROE is likewise trailing-12-month.</p>
-    <p><b>Method.</b> usca_small arm of the survivorship-free small-cap study. Universe: current sector-ETF membership (survivors) plus 1,973 major-exchange delisted names mapped by GICS, held during their live window. Returns are USD-translated (include FX P&amp;L on foreign lines), monthly rebalance, no transaction costs or slippage. Acquired/delisted names (†) exit at last/deal price via the delisting-exit mechanism — an M&amp;A announcement-exit overlay is a separate study.</p>
+    <p><b>Method.</b> usca_small blend arm of the survivorship-free small-cap study. <b>Selector:</b> in each accelerating sector, pick the small-cap that ranks best on a 60/40 blend of <b>analyst implied-upside</b> (Benzinga price-target ÷ price − 1, point-in-time within 90 days) and <b>cheapest P/B</b>; falls back to cheapest-P/B when no recent analyst target exists (~⅓ of picks). ARK funds are excluded (active multi-theme funds, not sectors). Universe: current sector-ETF membership (survivors) plus 1,973 major-exchange delisted names mapped by GICS, held during their live window. Returns are USD-translated (include FX P&amp;L on foreign lines), monthly rebalance, no transaction costs or slippage. Acquired/delisted names (†) exit at last/deal price via the delisting-exit mechanism — an M&amp;A announcement-exit overlay is a separate study.</p>
     <p><b>Caveats.</b> The GICS-mapped universe differs from the live ETF-membership universe, so absolutes are internally consistent but not identical to the live scanner. Delisted coverage misses pre-2020 deaths and OTC names. Simulated past performance is not a forecast. Computed {esc(D.get('computed_at',''))[:19]}.</p>
   </footer>
-
+  </div>
+{finviz_pane}
 </div>
 </div>
 
@@ -692,6 +823,18 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
   document.getElementById('paneBd').addEventListener('click',closePane);
   document.addEventListener('keydown',function(e){{ if(e.key==='Escape' && !pane.hidden) closePane(); }});
   document.querySelectorAll('tr.clk').forEach(function(r){{ r.addEventListener('click',function(){{ openPane(r.getAttribute('data-ticker')); }}); }});
+
+  // ---- method tabs (ETF flagship / Finviz industry) ----
+  var mtabs=document.querySelectorAll('.mtab');
+  function showPane(id){{
+    document.querySelectorAll('.mpane').forEach(function(p){{ p.hidden = (p.id!==id); }});
+    mtabs.forEach(function(t){{ t.setAttribute('aria-selected', t.getAttribute('data-pane')===id ? 'true':'false'); }});
+    if(id==='mpane-etf'){{ try{{draw();}}catch(e){{}} }}
+    if(location.hash!=='#'+id) history.replaceState(null,'','#'+id);
+    window.scrollTo(0,0);
+  }}
+  mtabs.forEach(function(t){{ t.addEventListener('click',function(){{ showPane(t.getAttribute('data-pane')); }}); }});
+  if(location.hash==='#mpane-finviz') showPane('mpane-finviz');
 }})();
 </script>
 """

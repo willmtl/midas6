@@ -26,13 +26,20 @@ from api.tasks import _polygon_paginate
 
 
 def analyst_universe():
-    """Stocks that have fundamentals, minus ETFs/benchmarks. Avoids build_universe()'s DISTINCT over the
-    Candle hypertable (which hangs on the worker without max_parallel_workers_per_gather=0). Analyst
-    ratings only make sense for individual equities anyway, so the Fundamental set is the right universe."""
+    """Stocks that have fundamentals, minus ETFs/benchmarks, UNION the Finviz US/CA universe (so the Finviz
+    industry engine's analyst-upside blend has coverage too). Avoids build_universe()'s DISTINCT over the
+    Candle hypertable (which hangs on the worker without max_parallel_workers_per_gather=0)."""
     from core.models import Fundamental, Sector
     etfs = set(Sector.objects.values_list("etf", flat=True)) | {"SPY", "QQQ"}
     have_fund = set(Fundamental.objects.values_list("ticker", flat=True))
-    return sorted(have_fund - etfs)
+    fv = set()
+    try:                                             # add Finviz US/CA names (Benzinga is US-listed)
+        import json as _j
+        _d = _j.load(open("/app/.data/finviz_universe.json"))
+        fv = {t for t, m in _d["by_ticker"].items() if m.get("country") in ("USA", "Canada")}
+    except Exception:
+        pass
+    return sorted((have_fund | fv) - etfs)
 
 OUT = Path("/app/.data/analyst_ratings.jsonl")
 KEEP = ("date", "time", "firm", "analyst", "rating", "previous_rating", "rating_action",

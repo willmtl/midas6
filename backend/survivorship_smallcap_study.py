@@ -54,6 +54,89 @@ def _pit_ttm_ni(reports_map, midx):
     """Back-compat alias: TTM net-income panel."""
     return _pit_ttm_panel(reports_map, "net_income", midx)
 
+
+def _option_panels(midx, cols):
+    """Monthly PIT panels of option-derived signals from core.OptionSnapshot (daily; 2022-09->now): ATM IV,
+    IV skew (put-call), put/call OI & volume ratios, dealer GEX. Resampled to month-end (last)."""
+    from core.models import OptionSnapshot
+    metrics = ["atm_iv", "iv_skew", "pc_oi", "pc_vol", "gex"]
+    qs = OptionSnapshot.objects.filter(ticker__in=list(cols)).values_list("ticker", "date", *metrics)
+    df = pd.DataFrame.from_records(list(qs), columns=["ticker", "date"] + metrics)
+    out = {m: pd.DataFrame(index=midx, columns=cols) for m in metrics}
+    if df.empty:
+        return out
+    df["date"] = pd.to_datetime(df["date"])
+    for m in metrics:
+        piv = df.pivot_table(index="date", columns="ticker", values=m, aggfunc="last")
+        mm = piv.resample("ME").last()
+        mm = mm.reindex(mm.index.union(midx)).sort_index().ffill(limit=2).reindex(midx)
+        out[m] = mm.reindex(columns=cols)
+    return out
+
+
+def _short_interest_panel(midx, cols, stale_days=45):
+    """PIT monthly short-interest (days-to-cover) panel from .data/short_interest.jsonl (Polygon/FINRA bi-monthly,
+    dated by settlement_date). Value = latest days_to_cover as of each month-end, if within `stale_days`."""
+    import json
+    from collections import defaultdict
+    p = Path("/app/.data/short_interest.jsonl")
+    if not p.exists():
+        return pd.DataFrame(index=midx, columns=cols)
+    byt = defaultdict(list)
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("days_to_cover") is not None and r.get("settlement_date") and r.get("ticker") in cols:
+            byt[r["ticker"]].append((pd.Timestamp(r["settlement_date"]), float(r["days_to_cover"])))
+    out = {}
+    midx_ser = pd.Series(midx, index=midx)
+    for tk, pts in byt.items():
+        s = pd.Series({d: v for d, v in pts}).sort_index()
+        s = s[~s.index.duplicated(keep="last")]
+        val = s.reindex(s.index.union(midx)).sort_index().ffill().reindex(midx)
+        li = s.index
+        last_date = pd.Series([li[li <= d][-1] if len(li[li <= d]) else pd.NaT for d in midx], index=midx)
+        age = (midx_ser - last_date).dt.days
+        out[tk] = val.where(age <= stale_days)
+    return pd.DataFrame(out).reindex(index=midx, columns=cols)
+
+
+def _analyst_upside_panel(midx, px_panel, stale_days=90):
+    """PIT monthly analyst implied-upside panel = (latest price_target within `stale_days` as of month-end) /
+    (month-end close) − 1, per ticker. Source: .data/analyst_ratings.jsonl (Benzinga, backfilled). Targets
+    older than stale_days are dropped (not 'current'). Ratio cancels currency (both quote-ccy)."""
+    import json
+    from collections import defaultdict
+    p = Path("/app/.data/analyst_ratings.jsonl")
+    if not p.exists():
+        return pd.DataFrame(index=midx, columns=px_panel.columns)
+    byt = defaultdict(list)
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("price_target") and r.get("date") and r.get("ticker") in px_panel.columns:
+            byt[r["ticker"]].append((pd.Timestamp(r["date"]), float(r["price_target"])))
+    out = {}
+    midx_ser = pd.Series(midx, index=midx)
+    for tk, pts in byt.items():
+        s = pd.Series({d: v for d, v in pts}).sort_index()
+        s = s[~s.index.duplicated(keep="last")]
+        tgt = s.reindex(s.index.union(midx)).sort_index().ffill().reindex(midx)
+        li = s.index
+        last_date = pd.Series([li[li <= d][-1] if len(li[li <= d]) else pd.NaT for d in midx], index=midx)
+        age = (midx_ser - last_date).dt.days
+        out[tk] = tgt.where(age <= stale_days)
+    tgt_panel = pd.DataFrame(out).reindex(index=midx, columns=px_panel.columns)
+    return (tgt_panel / px_panel.where(px_panel > 0)) - 1
+
 # exchange-suffix -> reporting/quote currency. Market cap is computed in the QUOTE currency (price*shares) then
 # converted to USD so the <$2B small-cap bucket is apples-to-apples. .L (London) quotes in PENCE -> ×0.01.
 SUF_CCY = {"SA": "BRL", "MX": "MXN", "KS": "KRW", "HK": "HKD", "WA": "PLN", "TO": "CAD", "V": "CAD",
@@ -175,6 +258,10 @@ def build():
     if _drop:
         etfs = {n: e for n, e in etfs.items() if e not in _drop}
         print(f"DROP_ETFS active: removed {sorted(_drop)} -> {len(etfs)} sectors remain", flush=True)
+    _geno = os.environ.get("GENO_ETF")           # swap the Genomics sleeve's accel-driving ETF (ARKG/GNOM/IDNA);
+    if _geno and "Genomics" in etfs:             # holdings are keyed by the sector NAME, so the candidate pool is unchanged
+        etfs["Genomics"] = _geno
+        print(f"GENO_ETF: Genomics sleeve accel now driven by {_geno}", flush=True)
     etf_name = {e: n for n, e in etfs.items()}   # ETF ticker -> sector display name (for the trace)
     # survivor sector map + GICS map for survivors (via sector_holdings membership -> their ETF)
     surv_sector = {}                                  # ticker -> etf (survivor, by current ETF membership)
@@ -211,7 +298,18 @@ def build():
     etf_m = _monthly_close({t: d for t, d in etf_daily.items() if t in etf_tk})
     midx = etf_m.index
     accel = etf_m.pct_change(3) - etf_m.pct_change(3).shift(3)
+    mom6 = etf_m.pct_change(6)          # 6-month momentum LEVEL (trend), for sector-state scenarios
+    mom3 = etf_m.pct_change(3)          # 3-month momentum LEVEL
     spy_m = etf_daily[BENCH]["Close"].resample("ME").last().reindex(midx)
+    # PIT market-stress regime: SPY drawdown from its trailing-12-month high (past-only). Deep drawdown = stressed
+    # -> deep-value/junk names rip on the recovery (raw P/B best, H1/2020); near highs = calm -> quality screen wins.
+    spy_dd = (spy_m / spy_m.rolling(12, min_periods=3).max() - 1)
+    # SPY 200-DAY MA regime (PIT): bull if month-end SPY >= its trailing 200-trading-day mean, else bear/risk-off.
+    _spy_d = etf_daily[BENCH]["Close"]
+    _spy200 = _spy_d.rolling(200).mean().resample("ME").last().reindex(midx)
+    bull_200 = (spy_m >= _spy200)          # True = above 200d MA (bull); the classic trend filter
+    _qqq_d = load_candles(["QQQ"]).get("QQQ")   # for the risk-off QQQ hedge (short growth when value holds up)
+    qqq_close_m = (_qqq_d["Close"].resample("ME").last().reindex(midx) if _qqq_d is not None else spy_m)
 
     universe = sorted(all_holds | set(delisted_sector))
     stock_daily = load_candles(universe)
@@ -262,6 +360,43 @@ def build():
     ps_ttm = mktcap / ttm_rev.where(ttm_rev > 0)            # cheapest P/S (TTM sales)
     evebit_ttm = _ev / ttm_opinc.where(ttm_opinc > 0)      # cheapest EV/EBIT (TTM, positive EBIT)
     fcfy_ttm = -(ttm_fcf / _ev.where(_ev > 0))             # highest FCF/EV -> negate so min = best
+    # ANALYST implied-upside panel (PIT): (latest target within 90d) / month-close − 1. For mixing the Benzinga
+    # signal into the flagship pick (tie-breaker / gate). Higher = more analyst upside.
+    upside_m = _analyst_upside_panel(midx, px).reindex(index=midx, columns=common)
+    _up_cov = float(upside_m.notna().mean().mean())
+    print(f"analyst implied-upside panel: {upside_m.notna().any().sum()} names ever covered, "
+          f"{100*_up_cov:.0f}% cell coverage", flush=True)
+    # ── UNTESTED FUNDAMENTAL FACTORS (quality gates for the blend). TTM flows + PIT balance-sheet; all "higher=better". ──
+    _ttm_ocf = R(_pit_ttm_panel(reps, "operating_cash_flow", midx))
+    _ttm_rd = R(_pit_ttm_panel(reps, "rd_expense", midx))
+    _ttm_cogs = R(_pit_ttm_panel(reps, "cost_of_revenue", midx))
+    _ca = R(_pit_monthly_panel(reps, "current_assets", midx))
+    _cl = R(_pit_monthly_panel(reps, "current_liabilities", midx))
+    _inv = R(_pit_monthly_panel(reps, "inventory", midx))
+    _cashbs = R(_pit_monthly_panel(reps, "cash_and_equivalents", midx))
+    _ta = R(_pit_monthly_panel(reps, "total_assets", midx))
+    # trailing realized VOLATILITY of each stock (6-month daily-return std, PIT), for the low/high-vol criterion
+    _svol = {}
+    for tk in common:
+        dd = stock_daily.get(tk)
+        if dd is not None and len(dd) > 60:
+            _svol[tk] = dd["Close"].pct_change().rolling(126).std().resample("ME").last().reindex(midx)
+    stock_vol = pd.DataFrame(_svol).reindex(index=midx, columns=common)
+    si_days = _short_interest_panel(midx, common)                      # PIT short interest (days-to-cover)
+    print(f"short-interest panel: {si_days.notna().any().sum()} names covered, "
+          f"{100*float(si_days.notna().mean().mean()):.0f}% cell coverage", flush=True)
+    QFACTORS = {
+        "stock_vol": stock_vol,                                        # trailing 6mo realized vol (higher = more volatile)
+        "si_days": si_days,                                            # days-to-cover (higher = more shorted)
+        "accruals": (_ttm_ocf - ttm_ni) / _ta.where(_ta != 0),          # OCF exceeds earnings = high earnings quality
+        "op_margin": ttm_opinc / ttm_rev.where(ttm_rev != 0),
+        "asset_turn": ttm_rev / _ta.where(_ta != 0),
+        "current_ratio": _ca / _cl.where(_cl != 0),
+        "net_cash": (_cashbs - dt) / mktcap.where(mktcap != 0),         # net cash / market cap
+        "inv_turn": _ttm_cogs / _inv.where(_inv != 0),
+        "fcf_margin": ttm_fcf / ttm_rev.where(ttm_rev != 0),
+        "rd_intensity": _ttm_rd / ttm_rev.where(ttm_rev != 0),
+    }
     # RIGOROUS #1 — justified P/B from the residual-income / Gordon model: P/B* = (ROE - g)/(r - g).
     # r = assumed cost of equity (fixed 9%); g = sustainable growth proxied by trailing YoY book-equity growth,
     # clamped < r (the model diverges as g->r). Signal = actual P/B / justified P/B  (<1 = cheaper than deserved).
@@ -420,11 +555,19 @@ def build():
         if method == "ad_div":                               # first (cheapest) accumulating into weakness
             q = [h for h in pool5 if accumulating(h, date)]
             return q[0] if q else pool5[0]
+        if method == "upside":       # highest analyst implied-upside among the 5 cheapest-P/B (covered names)
+            return _max(upside_m)
+        if method == "upside_lo":    # control: LOWEST analyst upside (should underperform if signal is real)
+            return _min(upside_m)
+        if method == "upside_gate":  # first (cheapest-P/B) name with >20% analyst upside; else cheapest-P/B
+            q = [h for h in pool5 if pd.notna(upside_m.loc[date, h]) and upside_m.loc[date, h] > 0.20]
+            return q[0] if q else pool5[0]
         return pool5[0]
 
     def run(include_delisted, small_only, min_price=MIN_PRICE, country_ok=None, proxy_etf=False, value_key="pb",
             top5=None, capaware=None, trace=None, ban_first_loss=False, pb_ceiling=None, drop_sectors=None,
-            exclude_tickers=None, start_date=None, end_date=None):
+            exclude_tickers=None, start_date=None, end_date=None, warmup=9, sector_rule=None, quality_gate=None,
+            include_months=None, spy200=None, bear_gate=None, hedge=None):
         rets, spies, dl_picks, mrets = [], [], 0, []
         proxy_hold = Counter()          # etf -> # months held as a no-value-stock proxy (the live fallback)
         proxy_contrib = 0.0             # sum of proxy monthly contributions to the basket (weighted)
@@ -432,17 +575,41 @@ def build():
         traded = set(); banned = set()  # ban_first_loss: names whose FIRST-ever trade lost -> never buy again
         _sd = pd.Timestamp(start_date) if start_date else None
         _ed = pd.Timestamp(end_date) if end_date else None
-        for i in range(9, len(midx) - 1):
+        for i in range(max(6, warmup), len(midx) - 1):
             date, ndate = midx[i], midx[i + 1]
             if (_sd is not None and date < _sd) or (_ed is not None and date > _ed):
                 continue                # window restriction (apples-to-apples sub-period walk-forward)
+            if include_months is not None and date not in include_months:
+                continue                # regime-conditional: only accumulate months in this regime
             sp = spy_m.iloc[i + 1] / spy_m.iloc[i] - 1
             if not np.isfinite(sp):
                 continue
-            _acc = accel.loc[date].dropna()
-            if drop_sectors:                      # "remove ARK" etc: drop these ETFs, backfill the slot from #11
-                _acc = _acc.drop(labels=[e for e in drop_sectors if e in _acc.index], errors="ignore")
-            top = _acc.sort_values(ascending=False).head(TOP_N).index
+            a = accel.loc[date]; m6 = mom6.loc[date]; m3 = mom3.loc[date]
+            if drop_sectors:
+                for e in drop_sectors:
+                    if e in a.index:
+                        a = a.drop(e); m6 = m6.drop(e, errors="ignore"); m3 = m3.drop(e, errors="ignore")
+            # SECTOR-STATE scenarios (2-D: momentum LEVEL × ACCELERATION). Default 'accel' = current flagship.
+            _sr = sector_rule
+            if _sr == "accel" or _sr is None:          # top-10 by acceleration (CURRENT)
+                top = a.dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "mom6":                        # top-10 by 6mo momentum LEVEL (trend-following)
+                top = m6.dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "up_and_accel":                # up AND accelerating (mom>0 & accel>0), by accel
+                top = a[(m6 > 0) & (a > 0)].dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "up_decel":                    # UP but DECELERATING (mom>0 & accel<0), by momentum
+                top = m6[(m6 > 0) & (a < 0)].dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "up_any":                      # anything still UP (mom>0), by momentum (ignore accel)
+                top = m6[m6 > 0].dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "down_turning":                # DOWN but turning up (mom<0 & accel>0), by accel — early reversal
+                top = a[(m6 < 0) & (a > 0)].dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "accel_pos":                   # accel>0 filter then by accel (drops decel Q even if top-10)
+                top = a[a > 0].dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "mom_x_accel":                 # rank blend: momentum-rank + accel-rank
+                mr = m6.rank(pct=True); ar = a.rank(pct=True)
+                top = (mr + ar).dropna().sort_values(ascending=False).head(TOP_N).index
+            else:
+                top = a.dropna().sort_values(ascending=False).head(TOP_N).index
 
             def pbceil_ok(h):
                 """P/B ceiling gate. pb_ceiling may be None (off), a flat float, or a cap-tiered dict with keys
@@ -481,6 +648,20 @@ def build():
                 g0 = [x for x in cands if bool(low.loc[date, x])] or cands
                 sm = [x for x in g0 if pd.notna(mktcap_usd.loc[date, x]) and mktcap_usd.loc[date, x] < SMALL]
                 g = (sm or g0) if (small_only or capaware is not None) else g0
+                # active quality gate: bear_gate ONLY when SPY<200d MA (switch selection factor in risk-off); else quality_gate
+                _ag = quality_gate
+                if bear_gate is not None:
+                    _ag = bear_gate if not bool(bull_200.get(date, True)) else None
+                if _ag is not None and g:               # keep only the top-half by the factor, then pick within
+                    _neg = _ag.startswith("-")
+                    _qf = QFACTORS.get(_ag.lstrip("-"))
+                    if _qf is not None:
+                        vals = [(x, _qf.loc[date, x]) for x in g if pd.notna(_qf.loc[date, x])]
+                        if len(vals) >= 4:
+                            med = float(np.median([v for _, v in vals]))
+                            keep = [x for x, v in vals if (v <= med if _neg else v >= med)]
+                            if keep:
+                                g = keep
                 if not g:
                     # no qualifying value stock. usca_small SKIPS the slot; proxy_etf HOLDS the ETF itself
                     # (the live is_etf_proxy fallback: raw commodities, bonds, foreign/index markets).
@@ -501,10 +682,13 @@ def build():
                                               "n_holdings": len(raw), "n_usca": n_country,
                                               "accel": _f(accel.loc[date, etf]) if etf in accel.columns else None})
                     if proxy_etf:
-                        re = etf_m[etf].iloc[i + 1] / etf_m[etf].iloc[i] - 1 if etf in etf_m.columns else np.nan
-                        if np.isfinite(re):
-                            proxy_hold[etf] += 1; proxy_contrib += float(re)
-                            wsum += 1.0; rr += 1.0 * float(re)
+                        # proxy_etf True = hold ANY skipped ETF; or a set of types {"commodity","bond","foreign"}
+                        _typ = "commodity" if etf in COMMODITY_ETFS else ("bond" if etf in BOND_ETFS else "foreign")
+                        if (proxy_etf is True) or (_typ in proxy_etf):
+                            re = etf_m[etf].iloc[i + 1] / etf_m[etf].iloc[i] - 1 if etf in etf_m.columns else np.nan
+                            if np.isfinite(re):
+                                proxy_hold[etf] += 1; proxy_contrib += float(re)
+                                wsum += 1.0; rr += 1.0 * float(re)
                     continue
                 if capaware is not None:        # LIVE cap-aware rule + configurable no-profitable-small-cap fallback
                     if sm:                       # small-cap tier: top-5 cheapest P/B -> cheapest P/E among profitable
@@ -530,6 +714,18 @@ def build():
                 elif top5 is not None:          # TWO-STAGE: 5 cheapest raw P/B, then a secondary signal picks 1
                     pool5 = sorted(g, key=lambda h: pb.loc[date, h])[:5]
                     p = pick5(pool5, date, top5)
+                elif value_key == "upside":     # PRIMARY selector: HIGHEST analyst implied-upside % (target/price−1)
+                    q = [x for x in g if pd.notna(upside_m.loc[date, x])]
+                    p = max(q, key=lambda h: upside_m.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
+                elif value_key.startswith("upside_pb"):  # rank blend: w·upside + (1−w)·pb; w from suffix (_60=0.6), default 0.5
+                    _w = (float(value_key.split("_")[2]) / 100) if value_key.count("_") >= 2 else 0.5
+                    q = [x for x in g if pd.notna(upside_m.loc[date, x])]
+                    if len(q) >= 3:
+                        pr = pd.Series({h: pb.loc[date, h] for h in q}).rank(pct=True)          # low P/B = low rank = good
+                        ur = pd.Series({h: upside_m.loc[date, h] for h in q}).rank(pct=True, ascending=False)  # high upside = low rank
+                        p = (_w * ur + (1 - _w) * pr).idxmin()
+                    else:
+                        p = min(g, key=lambda h: pb.loc[date, h])
                 elif value_key == "pb_roe":     # crude heuristic
                     q = [x for x in g if pd.notna(pb_roe.loc[date, x])]
                     p = min(q, key=lambda h: pb_roe.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
@@ -566,6 +762,16 @@ def build():
                         p = min(keep, key=lambda h: pb.loc[date, h])
                     else:
                         p = min(g, key=lambda h: pb.loc[date, h])
+                elif value_key.startswith("regime"):   # MARKET-CONDITION SWITCH (PIT): stressed -> raw cheapest-P/B
+                    # (deep-value/junk rips off the bottom); calm -> cheapest-P/B among PROFITABLE (quality). Threshold
+                    # after underscore, e.g. "regime_10" = -10% SPY drawdown from trailing-12m high. Default -10%.
+                    _thr = -(float(value_key.split("_")[1]) / 100) if "_" in value_key else -0.10
+                    _dd = spy_dd.loc[date]
+                    if pd.notna(_dd) and _dd < _thr:          # STRESSED regime -> raw cheapest P/B
+                        p = min(g, key=lambda h: pb.loc[date, h])
+                    else:                                      # CALM regime -> cheapest P/B among profitable
+                        q = [x for x in g if pd.notna(roe_ttm.loc[date, x]) and roe_ttm.loc[date, x] > 0]
+                        p = min(q, key=lambda h: pb.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
                 else:
                     p = min(g, key=lambda h: pb.loc[date, h])
                 held.add(p)
@@ -602,7 +808,17 @@ def build():
                                         "conviction": bool(accumulating(p, date))})
             if wsum <= 0:
                 continue
-            rets.append(rr / wsum); spies.append(float(sp)); mrets.append((str(pd.Timestamp(date).date()), float(rr / wsum)))
+            _mret = rr / wsum
+            if not bool(bull_200.get(date, True)):       # SPY below 200d MA -> risk-off overlays
+                if spy200 == "cash":
+                    _mret = 0.0                          # sit in cash this month
+                elif spy200 == "half":
+                    _mret *= 0.5                         # de-risk to half exposure
+                if hedge is not None:                    # short `hedge` fraction of QQQ (long value / short growth)
+                    _qr = qqq_close_m.iloc[i + 1] / qqq_close_m.iloc[i] - 1
+                    if np.isfinite(_qr):
+                        _mret -= hedge * float(_qr)
+            rets.append(_mret); spies.append(float(sp)); mrets.append((str(pd.Timestamp(date).date()), float(_mret)))
             if tr is not None:
                 tr["basket_ret"] = float(rr / wsum); tr["spy_ret"] = float(sp); trace.append(tr)
         perf = _perf(rets, spies); perf["delisted_picks"] = dl_picks; perf["mega_picks"] = mega_picks
@@ -653,6 +869,336 @@ def build():
                 cells.append(f"{tag} {r['total']:7.1f}% (b{base[aname]:6.1f} {r['total']-base[aname]:+6.1f}) "
                              f"Sh{r['sharpe']:.2f} DD{r['dd']:.0f}% t{r['t_stat']}")
             print(f"  {vname:24} | " + "  ||  ".join(cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("OPTION_TEST"):
+        # ── OPTION-DERIVED signals as pick criteria on the blend (data 2022-09+): ATM IV, IV skew, put/call OI &
+        # volume, dealer GEX. Each tested HIGH (top-half) and LOW (bottom-half). Split the covered window. ──
+        import sys
+        QFACTORS.update(_option_panels(midx, common))
+        cov = float(QFACTORS["atm_iv"].notna().mean().mean())
+        print(f"\n=== OPTION_TEST (no save): option signals as gates on the blend | IV coverage {100*cov:.0f}% ===", flush=True)
+        wins = [("2022-09→now", "2022-09-30", None), ("22-24", "2022-09-30", "2024-06-30"), ("24-26", "2024-07-31", None)]
+        sigs = [("blend (no gate)", None), ("LOW IV", "-atm_iv"), ("HIGH IV", "atm_iv"),
+                ("LOW skew", "-iv_skew"), ("HIGH skew", "iv_skew"), ("LOW pc_oi", "-pc_oi"), ("HIGH pc_oi", "pc_oi"),
+                ("LOW pc_vol", "-pc_vol"), ("HIGH pc_vol", "pc_vol"), ("LOW gex", "-gex"), ("HIGH gex", "gex")]
+        print(f"  {'gate':18}" + "".join(f"{w[0]:>16}" for w in wins), flush=True)
+        base = {}
+        for lab, qg in sigs:
+            cells = []
+            for wl, s, e in wins:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", quality_gate=qg, start_date=s, end_date=e)
+                if qg is None:
+                    base[wl] = r["total"]
+                dtag = f"({r['total']-base[wl]:+.0f})" if qg is not None else ""
+                cells.append(f"{r['total']:>5.0f}%{dtag}")
+            print(f"  {lab:18}" + "".join(f"{c:>16}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("HEDGE_TEST"):
+        # ── QQQ HEDGE in risk-off months (SPY<200d MA): short `hedge` fraction of QQQ. In a downturn cheap value
+        # holds up while growth/QQQ craters, so long-flagship/short-QQQ may capture the spread. Walk-forward. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        arms = [("no hedge", None), ("short 50% QQQ", 0.5), ("short 100% QQQ", 1.0),
+                ("short 50% QQQ + bear-fcf", 0.5)]
+        print("\n=== HEDGE_TEST (no save): short QQQ in risk-off months (SPY<200d MA) ===", flush=True)
+        print(f"  {'policy':26}" + "".join(f"{w[0]:>16}" for w in wins), flush=True)
+        for lab, hf in arms:
+            bg = "fcf_margin" if "bear-fcf" in lab else None
+            cells = []
+            for _, sd, ed in wins:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", hedge=hf, bear_gate=bg, start_date=sd, end_date=ed)
+                cells.append(f"{r['total']:>7.0f}% {r['sharpe']:.2f} {r['dd']:.0f}%")
+            print(f"  {lab:26}" + "".join(f"{c:>16}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("VOL_TEST"):
+        # ── the bought STOCK's own realized volatility (trailing 6mo) as a criterion: does LOW-vol or HIGH-vol
+        # predict better picks? Gate the blend; also a bear-only low-vol switch. Walk-forward. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        arms = [("blend (no vol gate)", dict()), ("LOW vol (keep calm)", dict(quality_gate="-stock_vol")),
+                ("HIGH vol (keep wild)", dict(quality_gate="stock_vol")),
+                ("bear->LOW vol switch", dict(bear_gate="-stock_vol"))]
+        print("\n=== VOL_TEST (no save): stock's own trailing volatility as a pick criterion ===", flush=True)
+        print(f"  {'policy':24}" + "".join(f"{w[0]:>15}" for w in wins), flush=True)
+        for lab, kw in arms:
+            cells = []
+            for _, sd, ed in wins:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", start_date=sd, end_date=ed, **kw)
+                cells.append(f"{r['total']:>7.0f}% {r['sharpe']:.2f}")
+            print(f"  {lab:24}" + "".join(f"{c:>15}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("REGIME_SWITCH"):
+        # ── switch the STOCK-SELECTION factor when SPY < 200d MA (risk-off): apply a quality gate ONLY in bear
+        # months, keep the pure blend in bull. Tests the flight-to-quality switch WITHOUT going to cash. WF. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        arms = [("blend (no switch)", None), ("bear->fcf_margin", "fcf_margin"), ("bear->op_margin", "op_margin"),
+                ("bear->current_ratio", "current_ratio"), ("bear->net_cash", "net_cash"),
+                ("bear->accruals", "accruals"), ("bear->rd_intensity", "rd_intensity")]
+        n_below = int((~bull_200.reindex(midx).fillna(True)).sum())
+        print(f"\n=== REGIME_SWITCH (no save): switch selection factor when SPY<200d MA ({n_below} bear mo) ===", flush=True)
+        print(f"  {'policy':24}" + "".join(f"{w[0]:>15}" for w in wins), flush=True)
+        base = {}
+        for lab, bg in arms:
+            cells = []
+            for wl, sd, ed in wins:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", bear_gate=bg, start_date=sd, end_date=ed)
+                if bg is None:
+                    base[wl] = r["total"]
+                dtag = f"({r['total']-base[wl]:+.0f})" if bg is not None else ""
+                cells.append(f"{r['total']:>6.0f}%{dtag}")
+            print(f"  {lab:24}" + "".join(f"{c:>15}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("SPY200_TEST"):
+        # ── SPY 200-day MA regime switch: go to CASH (or HALF exposure) in months where SPY is below its 200d MA.
+        # The classic trend filter. But the flagship earns its HIGHEST Sharpe in bear months (buys cheap) — does
+        # de-risking help or forfeit that? Walk-forward. ──
+        import sys
+        n_below = int((~bull_200.reindex(midx).fillna(True)).sum())
+        print(f"\n=== SPY200_TEST (no save): de-risk when SPY < 200d MA ({n_below}/{len(midx)} months below) ===", flush=True)
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        arms = [("always invested", None), ("CASH when SPY<200MA", "cash"), ("HALF when SPY<200MA", "half")]
+        print(f"  {'policy':24}" + "".join(f"{w[0]:>16}" for w in wins), flush=True)
+        for lab, sw in arms:
+            cells = []
+            for _, sd, ed in wins:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", spy200=sw, start_date=sd, end_date=ed)
+                cells.append(f"{r['total']:>7.0f}% {r['sharpe']:.2f} {r['dd']:.0f}%")
+            print(f"  {lab:24}" + "".join(f"{c:>16}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("REGIME_FACTOR"):
+        # ── does a fundamental factor that's bad ON AVERAGE become GOOD in a specific market regime? Test each
+        # quality gate WITHIN bull (SPY>10mo MA = risk-on) vs bear (SPY<10mo MA = risk-off) months. ──
+        import sys
+        spy_ma = spy_m.rolling(10, min_periods=3).mean()
+        bull = set(midx[(spy_m >= spy_ma) & spy_ma.notna()])
+        bear = set(midx[(spy_m < spy_ma) & spy_ma.notna()])
+        gates = [("no gate", None), ("accruals", "accruals"), ("op_margin", "op_margin"), ("asset_turn", "asset_turn"),
+                 ("current_ratio", "current_ratio"), ("net_cash", "net_cash"), ("inv_turn", "inv_turn"),
+                 ("fcf_margin", "fcf_margin"), ("rd_intensity hi", "rd_intensity"), ("si LOW", "-si_days"), ("si HIGH", "si_days")]
+        print(f"\n=== REGIME_FACTOR (no save): quality gates WITHIN market regimes ===", flush=True)
+        print(f"regime months: BULL {len(bull)} | BEAR {len(bear)}", flush=True)
+        for rlab, rset in [("BULL / risk-on", bull), ("BEAR / risk-off", bear)]:
+            print(f"\n  --- {rlab} (n={len(rset)} months; total% compounded over regime months, Δ vs no-gate) ---", flush=True)
+            base = None
+            for glab, qg in gates:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", quality_gate=qg, include_months=rset)
+                if qg is None:
+                    base = r["total"]
+                tag = f"({r['total']-base:>+6.0f})" if (base is not None and qg is not None) else ""
+                print(f"    {glab:18}{r['total']:>8.0f}%  Sh{r['sharpe']:>5.2f}  {tag}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("SI_TEST"):
+        # ── SHORT INTEREST at purchase (Polygon/FINRA days-to-cover, PIT): does LOW or HIGH short interest
+        # among the sector's value candidates predict better picks? Gate the blend, walk-forward. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        gates = [("blend (no gate)", None), ("LOW short interest", "-si_days"), ("HIGH short interest", "si_days")]
+        print("\n=== SI_TEST (no save): short interest at purchase, gate on the blend flagship ===", flush=True)
+        print(f"  {'gate':22}" + "".join(f"{w[0]:>16}" for w in wins), flush=True)
+        for lab, qg in gates:
+            cells = []
+            for _, sd, ed in wins:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", quality_gate=qg, start_date=sd, end_date=ed)
+                cells.append(f"{r['total']:>7.0f}% {r['sharpe']:.2f}")
+            print(f"  {lab:22}" + "".join(f"{c:>16}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("FACTOR_TEST"):
+        # ── untested fundamental factors as a QUALITY GATE (keep top-half by the factor) on the blend flagship,
+        # walk-forward. accruals/op_margin/asset_turn/current_ratio/net_cash/inv_turn/fcf_margin/rd_intensity. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        gates = [("blend (no gate)", None), ("accruals (earnings qual)", "accruals"), ("op_margin", "op_margin"),
+                 ("asset_turn", "asset_turn"), ("current_ratio", "current_ratio"), ("net_cash", "net_cash"),
+                 ("inv_turn", "inv_turn"), ("fcf_margin", "fcf_margin"), ("rd_intensity hi", "rd_intensity"),
+                 ("rd_intensity lo", "-rd_intensity")]
+        base = None
+        print("\n=== FACTOR_TEST (no save): fundamental quality GATE on the blend flagship (total% / vs base) ===", flush=True)
+        print(f"  {'gate (keep top-half)':26}" + "".join(f"{w[0]:>16}" for w in wins), flush=True)
+        for lab, qg in gates:
+            cells = []
+            for _, sd, ed in wins:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", quality_gate=qg, start_date=sd, end_date=ed)
+                cells.append(f"{r['total']:>7.0f}% {r['sharpe']:.2f}")
+                if qg is None and sd is None:
+                    base = r["total"]
+            print(f"  {lab:26}" + "".join(f"{c:>16}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("PROXY_TEST"):
+        # ── instead of SKIPPING a commodity/bond/country sleeve that accelerated into the top-10, HOLD its ETF
+        # (Nat-Gas futures ETF, Treasury ETF, country ETF). Test each type separately on the blend flagship. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        arms = [("SKIP (current)", False), ("proxy COMMODITY", {"commodity"}), ("proxy BOND", {"bond"}),
+                ("proxy COUNTRY/foreign", {"foreign"}), ("proxy ALL", True)]
+        print("\n=== PROXY_TEST (no save): hold the ETF for skipped commodity/bond/country sleeves (blend flagship) ===", flush=True)
+        print(f"  {'policy':24}" + "".join(f"{w[0]:>14}" for w in wins) + f"{'proxy-mo':>10}", flush=True)
+        for lab, pe in arms:
+            cells = []
+            pm = None
+            for _, sd, ed in wins:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", proxy_etf=pe, start_date=sd, end_date=ed)
+                cells.append(f"{r['total']:>7.0f}% {r['sharpe']:.2f}")
+                if sd is None and ed is None:
+                    pm = r.get("proxy_months_total")
+            print(f"  {lab:24}" + "".join(f"{c:>14}" for c in cells) + f"{(pm if pm is not None else ''):>10}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("GENO_TEST"):
+        # ── run the flagship BLEND under the current GENO_ETF (Genomics accel driven by ARKG/GNOM/IDNA), across
+        # windows. Run the process 3× with GENO_ETF=ARKG/GNOM/IDNA to A/B the genomics-sleeve replacement. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        print(f"\n=== GENO_TEST: flagship blend with Genomics accel = {_geno or 'ARKG (default)'} ===", flush=True)
+        cells = []
+        for lab, sd, ed in wins:
+            r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", start_date=sd, end_date=ed)
+            cells.append(f"{lab} {r['total']:.0f}% Sh{r['sharpe']:.2f}")
+        print("  " + "  |  ".join(cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("SECTOR_TEST"):
+        # ── SECTOR-STATE scenarios: rank/filter sectors by momentum LEVEL × ACCELERATION, not just top-accel.
+        # "what if it's not accelerating anymore but still up?" etc. Flagship blend pick within each. Walk-forward. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        rules = [("accel (CURRENT)", "accel"), ("mom6 level (trend)", "mom6"),
+                 ("up_and_accel", "up_and_accel"), ("up_decel (up,not accel)", "up_decel"),
+                 ("up_any (still up)", "up_any"), ("down_turning (early rev)", "down_turning"),
+                 ("accel_pos (accel>0)", "accel_pos"), ("mom_x_accel blend", "mom_x_accel")]
+        print("\n=== SECTOR_TEST (no save): sector-selection scenarios × flagship blend (total% / Sharpe) ===", flush=True)
+        print(f"  {'rule':26}" + "".join(f"{w[0]:>14}" for w in wins), flush=True)
+        for lab, sr in rules:
+            cells = []
+            for _, sd, ed in wins:
+                r = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", sector_rule=sr,
+                        start_date=sd, end_date=ed)
+                cells.append(f"{r['total']:>7.0f}% {r['sharpe']:.2f}")
+            print(f"  {lab:26}" + "".join(f"{c:>14}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("UPSIDE_WF"):
+        # ── (a) blend-WEIGHT sensitivity + (b) per-YEAR walk-forward for the cheap-P/B × analyst-upside blend. ──
+        import sys
+        # (a) weight sweep across windows
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        weights = [("pb (w0)", "pb"), ("w30", "upside_pb_30"), ("w40", "upside_pb_40"),
+                   ("w50", "upside_pb_50"), ("w60", "upside_pb_60"), ("w70", "upside_pb_70"), ("upside(w100)", "upside")]
+        print("\n=== (a) UPSIDE×P/B BLEND-WEIGHT sensitivity (total% vs-SPY-agnostic, higher=better) ===", flush=True)
+        print(f"  {'window':10}" + "".join(f"{w[0]:>14}" for w in weights), flush=True)
+        for lab, sd, ed in wins:
+            cells = []
+            for _, vk in weights:
+                r = run(True, True, country_ok=_is_usca, value_key=vk, start_date=sd, end_date=ed)
+                cells.append(f"{r['total']:>10.0f}%")
+            print(f"  {lab:10}" + "".join(f"{c:>14}" for c in cells), flush=True)
+        # (b) per-calendar-year walk-forward: does w50 beat raw pb each year? (2020 = bottom-entry, flag it)
+        print("\n=== (b) PER-YEAR walk-forward: pb vs upside_pb_50 (total% within year) ===", flush=True)
+        print(f"  {'year':8}{'pb':>12}{'upside_pb_50':>16}{'edge(pp)':>10}", flush=True)
+        yrs = [("2020*", "2020-01-01", "2020-12-31"), ("2021", "2021-01-01", "2021-12-31"),
+               ("2022", "2022-01-01", "2022-12-31"), ("2023", "2023-01-01", "2023-12-31"),
+               ("2024", "2024-01-01", "2024-12-31"), ("2025", "2025-01-01", "2025-12-31"),
+               ("2026", "2026-01-01", "2026-12-31")]
+        wins_yr = 0; tot_yr = 0
+        for y, sd, ed in yrs:
+            a = run(True, True, country_ok=_is_usca, value_key="pb", start_date=sd, end_date=ed)
+            b = run(True, True, country_ok=_is_usca, value_key="upside_pb_50", start_date=sd, end_date=ed)
+            edge = b["total"] - a["total"]
+            if "*" not in y:
+                tot_yr += 1; wins_yr += 1 if edge > 0 else 0
+            print(f"  {y:8}{a['total']:>11.1f}%{b['total']:>15.1f}%{edge:>+10.1f}", flush=True)
+        print(f"\n  blend beats raw-P/B in {wins_yr}/{tot_yr} clean years (2020 excluded = bottom-entry artifact)", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("UPSIDE_PRIMARY"):
+        # ── analyst implied-upside % (target/price−1) as the PRIMARY selection criterion (pick highest-upside
+        # name in each sector, ignoring P/B) vs the flagship (cheapest-P/B) vs a 50/50 rank blend. Walk-forward. ──
+        import sys
+        wins = [("FULL 2019→now", None, None), ("ex-2020 (2021→now)", "2021-01-31", None),
+                ("H1 2019→2022", None, "2022-12-31"), ("H2 2023→2026", "2023-01-31", None)]
+        arms = [("pb (flagship)", "pb"), ("upside (primary)", "upside"), ("upside_pb (50/50 blend)", "upside_pb")]
+        print("\n=== UPSIDE_PRIMARY (no save): analyst-upside % as the SELECTOR, walk-forward (total% / Sh / t) ===", flush=True)
+        print(f"  {'window':22}" + "".join(f"{a[0]:>26}" for a in arms), flush=True)
+        for lab, sd, ed in wins:
+            cells = []
+            for _, vk in arms:
+                r = run(True, True, country_ok=_is_usca, value_key=vk, start_date=sd, end_date=ed)
+                cells.append(f"{r['total']:>9.0f}% Sh{r['sharpe']:.2f} t{r['t_stat']}")
+            print(f"  {lab:22}" + "".join(f"{c:>26}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("ANALYST_MIX"):
+        # ── mix the Benzinga analyst implied-upside into the flagship pick: among the 5 cheapest-P/B small-caps,
+        # pick highest analyst-upside (tie-breaker) / lowest (control) / gate >20%. Walk-forward vs the flagship
+        # (cheapest_pb) — only real if it beats baseline AND the upside_lo control underperforms, across windows. ──
+        import sys
+        wins = [("FULL 2019→now", None, None), ("ex-2020 (2021→now)", "2021-01-31", None),
+                ("H1 2019→2022", None, "2022-12-31"), ("H2 2023→2026", "2023-01-31", None)]
+        arms = [("cheapest_pb (flagship)", "cheapest_pb"), ("+upside (tie-break)", "upside"),
+                ("+upside_gate>20%", "upside_gate"), ("upside_lo (control)", "upside_lo")]
+        print("\n=== ANALYST_MIX (no save): implied-upside as tie-breaker on the 5 cheapest-P/B, walk-forward ===", flush=True)
+        print(f"  {'window':22}" + "".join(f"{a[0]:>24}" for a in arms), flush=True)
+        for lab, sd, ed in wins:
+            cells = []
+            for _, mth in arms:
+                r = run(True, True, country_ok=_is_usca, top5=mth, start_date=sd, end_date=ed)
+                cells.append(f"{r['total']:>10.0f}% t{r['t_stat']}")
+            print(f"  {lab:22}" + "".join(f"{c:>24}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("REGIME_TEST"):
+        # ── MARKET-CONDITION SWITCH walk-forward: does "raw-P/B when SPY is in a drawdown, profitability-screen
+        # when calm" beat BOTH static selectors across windows? Only adopt if it wins ex-2020 AND in both halves
+        # (else it's just re-fitting the H1 crash). ──
+        import sys
+        wins = [("FULL 2019→now", None, None), ("ex-2020 (2021→now)", "2021-01-31", None),
+                ("H1 2019→2022", None, "2022-12-31"), ("H2 2023→2026", "2023-01-31", None)]
+        arms = [("pb", dict(value_key="pb")), ("pb_prof", dict(value_key="pb_prof")),
+                ("regime_5", dict(value_key="regime_5")), ("regime_10", dict(value_key="regime_10")),
+                ("regime_15", dict(value_key="regime_15"))]
+        print("\n=== REGIME_TEST (no save): SPY-drawdown selector switch, walk-forward (total% / t) ===", flush=True)
+        print(f"  {'window':22}" + "".join(f"{a[0]:>16}" for a in arms), flush=True)
+        for lab, sd, ed in wins:
+            cells = []
+            for _, kw in arms:
+                r = run(True, True, country_ok=_is_usca, start_date=sd, end_date=ed, **kw)
+                cells.append(f"{r['total']:>8.0f}% t{r['t_stat']}")
+            print(f"  {lab:22}" + "".join(f"{c:>16}" for c in cells), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("CRASH_TEST"):
+        # ── how does the flagship do THROUGH the Feb->Mar 2020 crash? warmup=9 (default) enters end-March = the
+        # bottom (captures only recovery); warmup=6 starts trading 2019-12 so we HOLD a position INTO the crash
+        # (the 2020-02-29 row = return end-Feb->end-Mar = the crash month). ──
+        import sys
+        for wu in (9, 6):
+            tr = []
+            r = run(True, True, country_ok=_is_usca, warmup=wu, trace=tr)
+            print(f"\n=== CRASH_TEST warmup={wu}: first trade {tr[0]['date']} | full-window total {r['total']}% | DD {r['dd']}% ===", flush=True)
+            print(f"  {'month(buy)':12}{'basket→next':>13}{'SPY→next':>11}", flush=True)
+            for t in tr:
+                if t["date"][:7] in ("2019-12", "2020-01", "2020-02", "2020-03", "2020-04", "2020-05"):
+                    mark = "  <-- CRASH (end-Feb→end-Mar)" if t["date"][:7] == "2020-02" else ""
+                    print(f"  {t['date']:12}{t['basket_ret']*100:>+12.1f}%{t['spy_ret']*100:>+10.1f}%{mark}", flush=True)
         sys.exit(0)
 
     if os.environ.get("ADAPT_TEST"):
@@ -823,18 +1369,21 @@ def build():
 
     if os.environ.get("FLAGSHIP_TRACE"):
         import sys
+        # FLAGSHIP is now the CHEAP-P/B × ANALYST-UPSIDE blend (w60) — the one additive lever that beat raw-P/B
+        # in both halves + across weights + 4/6 years (2026-08-17, user). Raw-P/B remains as usca_small reference.
         tr = []
-        perf = run(True, True, country_ok=_is_usca, trace=tr)
-        out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": "usca_small",
+        perf = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", trace=tr)
+        out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": "usca_small_upside_pb",
                "perf": {k: perf.get(k) for k in ("total", "annual", "vs_spy", "sharpe", "dd", "t_stat", "months",
                                                  "delisted_picks")},
-               "params": {"top_n": TOP_N, "small_cap_max": SMALL, "min_dvol": MIN_DVOL, "conv_weight": CONV},
+               "params": {"top_n": TOP_N, "small_cap_max": SMALL, "min_dvol": MIN_DVOL, "conv_weight": CONV,
+                          "selector": "60% analyst implied-upside + 40% cheapest-P/B (rank blend); "
+                                      "cheapest-P/B fallback when no analyst target within 90d"},
                "months": tr}
         fp = Path("/app/.data/studies/flagship_history.json")
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(json.dumps(out, indent=2, default=str))
-        print(f"FLAGSHIP_TRACE written: {fp}  months={len(tr)}  total={perf.get('total')}%  "
-              f"(matches stored 790.4% if identical)", flush=True)
+        print(f"FLAGSHIP_TRACE written: {fp}  months={len(tr)}  total={perf.get('total')}%  (blend flagship)", flush=True)
         sys.exit(0)
 
     results = {
@@ -852,6 +1401,15 @@ def build():
                                pb_ceiling={"micro": 4, "small": 6, "large": 10}),
         "usca_small_ceil_noark": run(True, True, country_ok=_is_usca, drop_sectors={"ARKK", "ARKG"},
                                      pb_ceiling={"micro": 4, "small": 6, "large": 10}),
+        # ⭐ CHEAP-P/B × ANALYST-UPSIDE rank blend (60% analyst implied-upside + 40% cheap-P/B). The one additive
+        # lever that beat raw P/B in BOTH halves + across weights 30-70% + 4/6 clean years (2026-08-17). Uses the
+        # Benzinga implied-upside panel (67% coverage; falls back to cheapest-P/B when no recent target). Caveats:
+        # 2 down years (2021/2024), partial coverage, survivorship/window-inflated absolutes, needs true OOS.
+        "usca_small_upside_pb": run(True, True, country_ok=_is_usca, value_key="upside_pb_60"),
+        # ⭐ REGIME SWITCH (2026-08-17, user): the blend, but when SPY < its 200-day MA (risk-off) tilt the pick
+        # toward cash-generative names (FCF-margin quality gate); pure blend when SPY above 200d MA. +287pp full,
+        # positive in ALL windows (only applies the gate where flight-to-quality helps). Modest, owes OOS.
+        "usca_small_bear_fcf": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", bear_gate="fcf_margin"),
         # ETF-PROXY TEST: same flagship, but when a top-accel sector has NO qualifying value stock (raw
         # commodities like USO/UNG, bonds like TLT/IEF, foreign/index markets) HOLD THE ETF itself — the
         # live is_etf_proxy fallback. Does buying straight commodities/bonds when they accelerate ADD return?
