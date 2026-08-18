@@ -15,8 +15,10 @@ from pathlib import Path
 from collections import defaultdict
 from core.models import DelistedCompany
 
-IN = Path("/app/.data/studies/flagship_history.json")
-OUT = Path("/app/.data/studies/flagship_history_enriched.json")
+_CK = os.environ.get("CONFIG", "adaptive")
+_SUF = "" if _CK == "adaptive" else f"_{_CK}"
+IN = Path(f"/app/.data/studies/flagship_history{_SUF}.json")
+OUT = Path(f"/app/.data/studies/flagship_history{_SUF}_enriched.json")
 
 
 def med(xs):
@@ -122,6 +124,11 @@ def main():
         if pd.notna(p0) and pd.notna(p1) and p0 > 0:
             return float(p1 / p0 - 1.0)
         return None
+
+    # per-PICK held-to-today: what each best/worst pick did from ITS month to the latest close (never sold).
+    # best_picks/worst_picks reference the same dict objects, so they inherit this.
+    for p in all_picks:
+        p["hold_today"] = _hold_today(p["ticker"], p["date"])
 
     stocks = []
     for b in by_stock.values():

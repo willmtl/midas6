@@ -8,10 +8,24 @@ Writes /app/.data/studies/flagship_history.html
 import json, html
 from pathlib import Path
 
-IN = Path("/app/.data/studies/flagship_history_enriched.json")
-OUT = Path("/app/.data/studies/flagship_history.html")
+import os as _os
+_CK = _os.environ.get("CONFIG", "adaptive")
+_SUF = "" if _CK == "adaptive" else f"_{_CK}"
+IN = Path(f"/app/.data/studies/flagship_history{_SUF}_enriched.json")
+OUT = Path(f"/app/.data/studies/flagship_history{_SUF}.html" if _CK != "adaptive" else "/app/.data/studies/flagship_history.html")
 D = json.load(open(IN))
 S, P = D["summary"], D["perf"]
+# filename each config's doc links to (for the subtabs) — adaptive is the main flagship_history.html
+_CFG_FILE = {"adaptive": "flagship_history.html", "core": "flagship_history_core.html",
+             "middle": "flagship_history_middle.html", "aggressive": "flagship_history_aggressive.html"}
+
+# the regime-bet configs (core / middle / adaptive / aggressive) for the "choose your config" section + tabs
+try:
+    _cc = json.load(open("/app/.data/studies/configs_compare.json"))
+    CONFIGS = _cc.get("configs", _cc) if isinstance(_cc, dict) else _cc
+    SPY_CURVE = _cc.get("spy_curve", []) if isinstance(_cc, dict) else []
+except Exception:
+    CONFIGS, SPY_CURVE = [], []
 
 # ── METHOD-TABS data: pull the Finviz engine result + ETF arms so the doc can show a tab per method.
 # Optional/defensive — if the DB isn't reachable the Finviz tab just shows a "pending" note.
@@ -381,6 +395,10 @@ def kpi_tile(k, v, dd, hero=False):
 curve = D["curve"]
 curve_js = json.dumps([{"d": c["date"], "f": round(c["flagship"] * 100000), "s": round(c["spy"] * 100000),
                         "r": c["ret"]} for c in curve])
+configs_js = json.dumps([{"key": c["key"], "total": c["total"], "final_100k": c.get("final_100k"),
+                          "cagr": c.get("cagr"), "sharpe": c["sharpe"], "dd": c["dd"], "curve": c.get("curve", [])}
+                         for c in CONFIGS])
+spy_curve_js = json.dumps(SPY_CURVE)
 stock_trades_js = json.dumps({s["ticker"]: {"co": s["company"], "dl": s["delisted"],
     "t": [{"d": t["date"], "s": t["sector"], "pb": t["pb"], "pe": t["pe"], "roe": t["roe"], "de": t["de"],
            "gpa": t["gpa"], "rg": t["rev_g"], "mc": t["mc"], "w": t["weight"], "r": t["ret"], "cv": t["conviction"]}
@@ -478,6 +496,7 @@ def pick_rows(lst):
           <td class="num">{pefmt(r['pe'])}</td>
           <td class="num">{roefmt(r['roe'])}</td>
           <td class="num strong">{pct(r['ret'])}</td>
+          <td class="num">{pct(r.get('hold_today'))}</td>
         </tr>""")
     return "\n".join(out)
 
@@ -494,11 +513,12 @@ def sector_chips(m):
     """One chip per top-10 accelerating sector this month: name + acceleration, then either the value name it
     resolved to (✓) or the reason the slot was skipped (⊘). This is the 'from the sector to the stock, and
     why skipped' trail the reader asked for."""
-    def sret(r):   # the sleeve ETF's own return this month (what it "would have made")
+    def sret(r):   # the sector ETF's own return this month (what holding the ETF itself would have made)
         if r is None:
-            return ""
+            return ' <span class="slv" title="the sector ETF had no price this month">ETF n/a</span>'
         cls = "pos" if r >= 0 else "neg"
-        return f' <span class="slv">sleeve <span class="{cls}">{r*100:+.1f}%</span></span>'
+        return (f' <span class="slv" title="the sector ETF\'s OWN return this month — what you would have made '
+                f'holding the ETF itself instead of our stock pick">ETF <span class="{cls}">{r*100:+.1f}%</span></span>')
 
     def dvs(pr, sr):   # stock-selection edge: what we made on the stock MINUS just holding the sleeve ETF
         if pr is None or sr is None:
@@ -543,10 +563,10 @@ def sector_chips(m):
     cchips = []
     for s in cold:
         er = s.get("etf_ret")
-        ertxt = "" if er is None else f"{er*100:+.1f}%"
+        ertxt = "ETF n/a" if er is None else f"ETF {er*100:+.1f}%"
         ercls = "pos" if (er or 0) >= 0 else "neg"
         cchips.append(f'<span class="chip cold" title="{esc(s["sector"])} ranked #{s["rank"]} by acceleration ({acc_fmt(s.get("accel"))}) — below the top-10 cutoff, so NOT eligible this month. '
-                      f'That month its ETF returned {ertxt}.">'
+                      f'That month the sector ETF itself returned {"n/a" if er is None else f"{er*100:+.1f}%"}.">'
                       f'<span class="rk">#{s["rank"]}</span>{esc(s["sector"])} '
                       f'<b class="{ercls}">{ertxt}</b> <span class="acc">accel {acc_fmt(s.get("accel"))}</span></span>')
     cold_html = (f'<details class="coldwrap"><summary>+ {len(cold)} colder sleeves ranked #11–{10+len(cold)} '
@@ -598,6 +618,82 @@ for m in D["months"]:
 
 finviz_pane = _build_finviz_pane()
 
+
+def _configs_section():
+    """The 'choose your regime bet' comparison — 3 configs (agnostic core / middle / aggressive) with the
+    honest 2016-2026 numbers + the regime framing. Return ladder that makes the return-vs-robustness dial visible."""
+    if not CONFIGS:
+        return ""
+    order = {"core": 0, "middle": 1, "adaptive": 2, "aggressive": 3}
+    cs = sorted(CONFIGS, key=lambda c: order.get(c["key"], 9))
+    accent = {"core": "var(--accent)", "middle": "var(--gold)", "adaptive": "var(--accent)", "aggressive": "var(--neg)"}
+    cards = ""
+    for c in cs:
+        col = accent.get(c["key"], "var(--ink2)")
+        cards += (
+            f'<div class="cfgcard" style="border-top:3px solid {col}">'
+            f'<div class="cfgname" style="color:{col}">{esc(c["name"])}</div>'
+            f'<div class="cfgbig">+{c["total"]:,.0f}%</div>'
+            f'<div class="cfgcagr">CAGR {c.get("cagr","—")}%/yr · Sharpe {c["sharpe"]}</div>'
+            f'<div class="cfgrow"><span>Max drawdown</span><b class="neg">{c["dd"]:.1f}%</b></div>'
+            f'<div class="cfgrow"><span>pre-2020 (other regime)</span><b class="{"pos" if c["pre2020"]>=0 else "neg"}">{c["pre2020"]:+.0f}%</b></div>'
+            f'<div class="cfgrow"><span>2020-26 (this regime)</span><b class="pos">{c["post2020"]:,.0f}%</b></div>'
+            f'<p class="cfgdesc">{esc(c["desc"])}</p></div>')
+    return (
+        '<section id="configs"><div class="shead"><h2>Choose your regime bet</h2>'
+        '<span class="cnt">honest 2016-2026 · 3 configs</span></div>'
+        '<p class="lede">The strategy is a <b>high-beta small-cap-value engine</b>. How aggressively you enforce the '
+        '<b>small-cap</b> discipline is a bet on whether the <b>post-2020 regime</b> (commodity supercycle, reshoring, '
+        'small-cap revival, higher-for-longer rates) persists. All three trade <i>through</i> the 2018 &amp; 2020 crashes '
+        '(no lucky bottom-entry). The ladder below is the return-vs-robustness dial — read the <b>pre-2020</b> column as '
+        'the stress test (a mega-cap-dominated, small-cap-hostile world, which flashed back in 2023).</p>'
+        f'<div class="cfggrid">{cards}</div>'
+        '<p class="chart-note">More small-cap concentration → more return in the current regime, but weaker pre-2020 and '
+        'deeper drawdown. The core survives any regime; the aggressive config is levered-long the current one.</p></section>')
+
+
+configs_html = _configs_section()
+
+# calendar-year strategy returns (from the enriched data) to annotate the regime timeline
+_calyr = {c["year"]: c["strategy"] for c in D.get("calendar", [])}
+_calspy = {c["year"]: c["spy"] for c in D.get("calendar", [])}
+REGIMES = [
+    ("2016-17", "Late ZIRP · mega-cap growth melt-up", "Near-zero rates + QE funneled money into long-duration growth (FAANG). No penalty for unprofitable growth; value/small-caps ignored.", "hostile"),
+    ("2018", "Rate-hike tantrum · small-cap liquidity crunch", "Fed hiking into QT; Dec −20% correction. Flight to mega-cap quality crushed small-caps and value hardest.", "worst"),
+    ("2019", "Fed pivot · growth resumes", "Fed cut rates; long-duration growth led again.", "hostile"),
+    ("2020", "COVID crash → liquidity flood → everything rally", "Fastest crash ever, then unprecedented stimulus → retail boom, small-cap/thematic mania (clean energy, EVs, SPACs).", "great"),
+    ("2021", "Reflation · commodity & meme boom", "Reopening + stimulus + early inflation + retail. Thematic/commodity rotation paid.", "great"),
+    ("2022", "Inflation shock · value's revenge", "40-yr-high inflation, aggressive hikes → growth −30%+, value & commodities WON. The ideal regime.", "great"),
+    ("2023", "Narrow AI mega-cap melt-up", "ChatGPT → Magnificent-7 frenzy; ~all of SPY's +20% was 7 stocks. The 2017-style failure mode RECURRED.", "worst"),
+    ("2024-26", "Broadening · commodity/critical-minerals supercycle · higher-for-longer", "Rates stay elevated (value-friendly); reshoring/defense/nuclear/minerals capex; small-cap revival; gold/uranium/copper supercycle.", "great"),
+]
+
+
+def _regimes_section():
+    tone = {"great": "var(--pos)", "hostile": "var(--warn)", "worst": "var(--neg)"}
+    rows = ""
+    for yrs, name, cause, t in REGIMES:
+        col = tone.get(t, "var(--ink2)")
+        rows += (f'<tr><td class="l mono" style="white-space:nowrap"><b>{yrs}</b></td>'
+                 f'<td class="l" style="color:{col};font-weight:600">{esc(name)}</td>'
+                 f'<td class="l" style="color:var(--ink2)">{esc(cause)}</td></tr>')
+    return (
+        '<section id="regimes"><div class="shead"><h2>The regimes since 2016 — and what caused them</h2>'
+        '<span class="cnt">why the strategy wins or loses</span></div>'
+        '<p class="lede">The engine <b>thrives when value / small-caps / commodities lead</b> (2020, 2022, 2024-26) and '
+        '<b>gets hurt when narrow mega-cap growth leads</b> (2017, 2018, 2023). Your regime bet is whether the post-2020 '
+        'forces — higher-for-longer rates, the commodity/reshoring supercycle, the small-cap revival — are <b>structural</b> '
+        'or just another cycle that reverts to a 2023-style AI-mega-cap melt-up.</p>'
+        '<div class="tablecard"><div class="scrollx"><table>'
+        '<thead><tr><th class="l">Years</th><th class="l">Regime</th><th class="l">What caused it</th></tr></thead>'
+        f'<tbody>{rows}</tbody></table></div></div>'
+        '<div class="legend" style="margin-top:12px"><span><i style="background:var(--pos)"></i>favorable (value/small-cap/commodity leads)</span>'
+        '<span><i style="background:var(--warn)"></i>hostile (mega-cap growth leads)</span>'
+        '<span><i style="background:var(--neg)"></i>worst (crunch / narrow melt-up)</span></div></section>')
+
+
+regimes_html = _regimes_section()
+
 HTML = f"""<title>usca_small — Flagship Trade History</title>
 <style>
 :root {{
@@ -625,11 +721,9 @@ body{{margin:0}}
   --mono:"SF Mono","Cascadia Code",Consolas,"Liberation Mono",ui-monospace,monospace;
   background:var(--paper); color:var(--ink); font-family:var(--sans); font-size:15px; line-height:1.55; padding:0 20px 100px;
 }}
-.wrap{{max-width:1180px; margin:0 auto}}
+.wrap{{max-width:1600px; margin:0 auto}}
 .mpane#mpane-finviz .wrap, .mpane#mpane-finviz{{max-width:none}}
 #mpane-finviz .tablecard{{max-width:none}}
-/* wider content area for the Finviz tab so more columns/chips are visible */
-.doc:has(#mpane-finviz:not([hidden])) .wrap{{max-width:1600px}}
 .tk{{font-family:var(--mono); font-weight:600; letter-spacing:.02em; font-size:.9em}}
 .mono{{font-family:var(--mono); font-variant-numeric:tabular-nums}}
 .num{{text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap}}
@@ -728,6 +822,16 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 .chip .slv{{color:var(--mut); font-size:10px; font-family:var(--mono)}}
 .chip .dvs{{font-size:10px; font-family:var(--mono); color:var(--mut)}}
 .ddw{{font-family:var(--mono); font-size:10px; color:var(--warn); font-weight:600; cursor:help}}
+.cfggrid{{display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin:14px 0 6px}}
+@media (max-width:900px){{.cfggrid{{grid-template-columns:repeat(2,1fr)}}}}
+@media (max-width:560px){{.cfggrid{{grid-template-columns:1fr}}}}
+.cfgcard{{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 18px 14px; box-shadow:var(--shadow)}}
+.cfgname{{font-family:var(--mono); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; margin-bottom:8px}}
+.cfgbig{{font-family:var(--serif); font-size:34px; font-weight:700; color:var(--gold); line-height:1}}
+.cfgcagr{{font-family:var(--mono); font-size:11px; color:var(--ink2); margin:4px 0 12px}}
+.cfgrow{{display:flex; justify-content:space-between; font-size:12.5px; padding:4px 0; border-top:1px solid var(--line2)}}
+.cfgrow span{{color:var(--mut)}}
+.cfgdesc{{font-size:12px; color:var(--ink2); margin:12px 0 0; line-height:1.5}}
 .chip.cold{{opacity:.6; font-size:10.5px; padding:2px 7px; border-style:dotted}}
 .coldwrap{{margin-top:8px}}
 .coldwrap summary{{font-family:var(--mono); font-size:11px; color:var(--mut); cursor:pointer; padding:4px 0; list-style:revert}}
@@ -767,6 +871,11 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 .mtab[aria-selected="true"]{{background:var(--card); color:var(--ink); font-weight:700; border-color:var(--ink); border-bottom:2px solid var(--card)}}
 .mtab .mpill{{font-size:9.5px; padding:1px 6px; border-radius:10px; background:color-mix(in srgb,var(--accent) 18%,transparent); color:var(--accent); font-weight:700}}
 .mtab .mpill.wip{{background:color-mix(in srgb,var(--gold) 20%,transparent); color:var(--gold)}}
+.cfgtabs{{display:flex; flex-wrap:wrap; gap:6px; padding:14px 0 2px}}
+.cfgtab{{font-family:var(--mono); font-size:11.5px; color:var(--ink2); background:var(--band); border:1px solid var(--line); border-radius:8px; padding:7px 12px; cursor:pointer; display:flex; flex-direction:column; gap:2px; line-height:1.2; text-decoration:none}}
+.cfgtab:hover{{color:var(--ink); border-color:var(--accent)}}
+.cfgtab[aria-selected="true"]{{background:color-mix(in srgb,var(--accent) 14%,var(--card)); color:var(--ink); border-color:var(--accent); font-weight:700}}
+.cfgtab-r{{font-size:9.5px; color:var(--mut); font-weight:400}}
 .mpane[hidden]{{display:none}}
 .statuspill{{font-family:var(--mono); font-size:10px; letter-spacing:.05em; padding:2px 8px; border-radius:10px; background:color-mix(in srgb,var(--gold) 20%,transparent); color:var(--gold); margin-left:8px; vertical-align:middle}}
 .banner{{background:color-mix(in srgb,var(--gold) 9%,var(--card)); border:1px solid color-mix(in srgb,var(--gold) 35%,var(--line)); border-radius:10px; padding:14px 16px; font-size:13.5px; color:var(--ink2); margin:26px 0 4px}}
@@ -782,6 +891,10 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
   </div>
 
   <div class="mpane" id="mpane-etf">
+  <div class="cfgtabs" id="cfgtabs" role="tablist" aria-label="Configuration — full trades per setup">
+    {"".join(f'<a class="cfgtab" href="{_CFG_FILE.get(c["key"],"#")}"{" aria-selected=true" if c["key"]==_CK else ""}>{esc(c["name"].split(" — ")[0].split(" (")[0])}<span class="cfgtab-r">+{c["total"]:,.0f}% · DD {c["dd"]:.0f}%</span></a>' for c in sorted(CONFIGS, key=lambda x: {"core":0,"middle":1,"adaptive":2,"aggressive":3}.get(x["key"],9)))}
+  </div>
+  <p class="lede2" style="margin-top:6px">Each tab opens that setup's <b>full document</b> — every number and every trade recomputed for that config. Currently viewing: <b>{esc(_CK)}</b>.</p>
   <header class="mast">
     <p class="eyebrow">Flagship Strategy · Full Trade History</p>
     <h1>Small-Cap Value, Bought in Accelerating Sectors</h1>
@@ -815,6 +928,10 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
     {"".join(f'<div class="fu"><div class="k">{esc(k)}</div><div class="v">{v}</div><div class="d">{esc(dd)}</div></div>' for k,v,dd in funda)}
   </div>
   <p class="chart-note" style="margin-top:8px">Fundamental medians are measured <b>at the moment of each purchase</b> (point-in-time, 45-day report lag) — not current values.</p>
+
+  {configs_html}
+
+  {regimes_html}
 
   <section id="curve">
     <div class="shead"><h2>Growth of $100,000</h2><span class="cnt">flagship vs S&amp;P 500 · {S['months']} months</span></div>
@@ -868,15 +985,15 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
     <div class="shead"><h2>Best &amp; worst single months</h2><span class="cnt">top 20 each · fundamentals at buy</span></div>
     <div class="tablecard">
       <div class="scrollx"><table class="sortable">
-        <thead><tr><th class="l" colspan="8" style="color:var(--pos)">▲ Best monthly picks</th></tr>
-        <tr>{th("Month","l")}{th("Ticker","l")}{th("Company","l")}{th("Sector","l")}{th("P/B")}{th("P/E")}{th("ROE")}{th("Return")}</tr></thead>
+        <thead><tr><th class="l" colspan="9" style="color:var(--pos)">▲ Best monthly picks</th></tr>
+        <tr>{th("Month","l")}{th("Ticker","l")}{th("Company","l")}{th("Sector","l")}{th("P/B")}{th("P/E")}{th("ROE")}{th("Return")}{th("Held&nbsp;to&nbsp;today")}</tr></thead>
         <tbody>{pick_rows(D['best_picks'])}</tbody>
       </table></div>
     </div>
     <div class="tablecard">
       <div class="scrollx"><table class="sortable">
-        <thead><tr><th class="l" colspan="8" style="color:var(--neg)">▼ Worst monthly picks</th></tr>
-        <tr>{th("Month","l")}{th("Ticker","l")}{th("Company","l")}{th("Sector","l")}{th("P/B")}{th("P/E")}{th("ROE")}{th("Return")}</tr></thead>
+        <thead><tr><th class="l" colspan="9" style="color:var(--neg)">▼ Worst monthly picks</th></tr>
+        <tr>{th("Month","l")}{th("Ticker","l")}{th("Company","l")}{th("Sector","l")}{th("P/B")}{th("P/E")}{th("ROE")}{th("Return")}{th("Held&nbsp;to&nbsp;today")}</tr></thead>
         <tbody>{pick_rows(D['worst_picks'])}</tbody>
       </table></div>
     </div>
@@ -884,7 +1001,7 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 
   <section id="blotter">
     <div class="shead"><h2>Full blotter</h2><span class="cnt">{S['total_picks']} picks across {S['months']} months</span></div>
-    <p class="lede">The complete month-by-month record. Each month is bought at that month-end <b>close</b> and sold at the <b>next</b> month-end close (shown in the header). Then a <b>sector-ranking strip</b> — the ten sleeves that ranked highest by momentum <b>acceleration</b> that month. <b>The percentage labelled "accel" is the ranking signal (3-month momentum minus the prior 3-month), NOT a return.</b> Each chip then shows what actually happened: <span class="chip pick" style="padding:0 5px">→ bought TICKER +x%</span> is the small-cap we bought and <i>its</i> return; <span class="chip skip" style="padding:0 5px">⊘ skipped · sleeve +x%</span> means we did NOT hold it, and "sleeve +x%" is what that sector's own ETF returned (so you can see what we passed on). <span class="chip deact" style="padding:0 5px">⊘ deactivated</span> = a retired sleeve we still track but never trade. Beneath are the holdings with their <b>point-in-time</b> fundamentals; <b>2×</b> = A/D-conviction weight.</p>
+    <p class="lede">The complete month-by-month record. Each month is bought at that month-end <b>close</b> and sold at the <b>next</b> month-end close (shown in the header). Then a <b>sector-ranking strip</b> — the ten sleeves that ranked highest by momentum <b>acceleration</b> that month. <b>The percentage labelled "accel" is the ranking signal (3-month momentum minus the prior 3-month), NOT a return.</b> Each chip then shows what actually happened: <span class="chip pick" style="padding:0 5px">→ bought TICKER +x%</span> is the small-cap we bought and <i>its</i> return; <span class="chip skip" style="padding:0 5px">⊘ skipped · ETF +x%</span> means we did NOT hold it, and <b>"ETF +x%"</b> is what that sector's own ETF returned that month (so you can see exactly what we passed on). Every ranked sleeve — picked, skipped, or cold (#11+) — shows its <b>ETF</b> return. <span class="chip deact" style="padding:0 5px">⊘ deactivated</span> = a retired sleeve we still track but never trade. Beneath are the holdings with their <b>point-in-time</b> fundamentals; <b>2×</b> = A/D-conviction weight.</p>
     <div class="tablecard"><div class="scrolly"><table>
       <thead><tr>{th("Ticker","l")}{th("Company","l")}{th("Sector","l")}{th("Tier")}{th("P/B")}{th("P/E")}{th("ROE")}{th("GP/A")}{th("Rev&nbsp;g")}{th("D/E")}{th("Mkt&nbsp;cap")}{th("Weight")}{th("Return")}</tr></thead>
       <tbody>{"".join(blotter)}</tbody>
@@ -912,6 +1029,30 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 <script>
 (function(){{
   var data = {curve_js};
+  // config tabs: swap the whole equity curve + headline between core/middle/adaptive/aggressive setups
+  var CFGS = {configs_js};
+  var SPYC = {spy_curve_js};
+  var cfgtabs = document.querySelectorAll('.cfgtab');
+  function pickCfg(key){{
+    var c = CFGS.find(function(x){{return x.key===key;}}); if(!c || !c.curve) return;
+    // rebuild `data` from this config's curve (align SPY by index)
+    data = c.curve.map(function(pt,i){{ return {{d: pt.d, f: pt.f, s: (SPYC[i]||SPYC[SPYC.length-1]||100000), r: 0}}; }});
+    LEV = 1.0;
+    var lb=document.getElementById('levBtn'); if(lb){{lb.setAttribute('aria-pressed','false'); lb.textContent='1.3× leverage: OFF';}}
+    var bt=document.getElementById('hlTotal'), bd=document.getElementById('hlDollar');
+    if(bt) bt.textContent='+'+Math.round(c.total).toLocaleString()+'%';
+    if(bd) bd.textContent='$'+Math.round(c.final_100k).toLocaleString();
+    var ke={{'CAGR':c.cagr!=null?c.cagr.toFixed(0)+'%':'—','Sharpe':c.sharpe,'Max DD':c.dd.toFixed(1)+'%'}};
+    document.querySelectorAll('.meta-row span').forEach(function(sp){{
+      var b=sp.querySelector('b'); if(!b) return; var t=sp.textContent;
+      if(t.indexOf('CAGR')===0) b.textContent=ke['CAGR'];
+      else if(t.indexOf('Sharpe')===0) b.textContent=ke['Sharpe'];
+      else if(t.indexOf('Max DD')===0) b.textContent=ke['Max DD'];
+    }});
+    cfgtabs.forEach(function(t){{t.setAttribute('aria-selected', t.getAttribute('data-cfg')===key?'true':'false');}});
+    try{{draw();}}catch(e){{}}
+  }}
+  // config subtabs are links to per-config full docs (each opens its own numbers+trades); no in-page swap.
   // leverage toggle: recompute the flagship equity path from monthly returns × LEV, update chart + headline
   var LEV=1.0;
   function applyLev(){{

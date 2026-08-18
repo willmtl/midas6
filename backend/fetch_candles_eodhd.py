@@ -22,7 +22,10 @@ import config  # noqa: E402
 from api.tasks import _eodhd_get, _eodhd_sym  # noqa: E402
 from core.models import Candle  # noqa: E402
 
-YEARS = 6
+YEARS = int(os.environ.get("CANDLE_YEARS", "11"))    # 2026-08-18: default 11y (~2015) so the backtest trades
+                                                     # THROUGH the 2020 crash, not from its bottom (the #1 return
+                                                     # inflator). The re-importer is delete+reinsert per ticker, so
+                                                     # a shallower FROM would TRUNCATE this deep history — keep 11.
 FROM = (dt.date.today() - dt.timedelta(days=int(YEARS * 365.25))).isoformat()
 
 

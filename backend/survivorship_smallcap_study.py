@@ -206,6 +206,17 @@ MAJOR_EXCH = {"NASDAQ", "NYSE", "NYSE MKT", "NYSE ARCA", "AMEX", "BATS"}
 # for the ETF-PROXY test (does holding raw commodity / bond sectors when they accelerate in ADD return?)
 COMMODITY_ETFS = {"GLD", "SLV", "PPLT", "USO", "UNG", "DBA", "WEAT", "CORN", "DBC", "DBO", "BNO", "UGA",
                   "CPER", "PALL", "DBB", "GSG", "PDBC", "FTGC"}
+
+# ── SECTOR PLAYBOOK (user: "people don't invest in each sector the same way") — map each sector ETF to the
+# way that TYPE of company is really valued. Grounded in valuation common-sense, NOT fit to the data. ──
+PLAY_MINERS = {"GLD", "SLV", "PPLT", "USO", "UNG", "URA", "LIT", "COPX", "SLX", "REMX", "XLE", "XLB",
+               "AMLP", "WOOD"}                              # asset/reserve-heavy -> cheapest P/B, large-cap OK
+PLAY_GROWTH = {"XLK", "SMH", "IGV", "SKYY", "FDN", "BOTZ", "CIBR", "SOCL", "HERO", "PRNT", "UFO", "DRIV",
+               "IPO", "FINX", "IBUY", "MAGS", "QQQ", "IWC", "TINY", "ICLN", "TAN", "PAVE", "SRVR"}  # -> momentum leader
+PLAY_FIN = {"KRE", "XLF", "IAK", "REM"}                     # banks/insurers -> cheapest P/B among profitable
+PLAY_CYCLICAL = {"XLY", "XLI", "XRT", "JETS", "IYT", "XHB", "PEJ", "ITA"}   # cyclicals -> cheapest trailing P/E
+PLAY_DEFENSIVE = {"XLP", "XLU", "PBJ", "MOO", "PHO"}        # defensives -> cheapest P/E among profitable (stable)
+# everything else (healthcare, biotech, genomics, communications, broad, foreign...) -> the analyst-upside blend
 BOND_ETFS = {"TLT", "TLH", "AGG", "BND", "HYG", "JNK", "TIP", "VTIP", "GOVT", "BIL", "SHV", "SHY", "IEI",
              "IEF", "LQD", "FLOT", "MUB", "CWB", "EMB", "BWX", "IGOV", "TIPX"}
 GIC_FILE = "/app/.data/delisted_gic.json"
@@ -317,6 +328,22 @@ def build():
     bull_200 = (spy_m >= _spy200)          # True = above 200d MA (bull); the classic trend filter
     _qqq_d = load_candles(["QQQ"]).get("QQQ")   # for the risk-off QQQ hedge (short growth when value holds up)
     qqq_close_m = (_qqq_d["Close"].resample("ME").last().reindex(midx) if _qqq_d is not None else spy_m)
+
+    # ── REGIME DETECTOR from the rotation system's OWN signal (user: "detect it with the same sector rotation
+    # system"): is VALUE / SMALL-CAP leading (favorable — our regime) or is MEGA-CAP GROWTH leading (hostile,
+    # like 2017/2018/2023)? Same 6-month momentum the accel engine uses, on the style/size ETFs. PIT. ──
+    def _rm(t, w):
+        return etf_m[t].pct_change(w) if t in etf_m.columns else pd.Series(np.nan, index=midx)
+    # regime-detection SPEED matters: 6mo lags regime turns by months (we eat losses in the wrong regime before
+    # it confirms); 1mo reacts fast but whipsaws. Precompute the favorable/hostile signal at several lookbacks.
+    regime_fav_by_w, regime_favboth_by_w = {}, {}
+    for _w in (1, 2, 3, 6, 12):
+        _vg = _rm("VTV", _w) - _rm("VUG", _w)      # value minus growth
+        _sl = _rm("IWM", _w) - _rm("IWB", _w)      # small minus large
+        regime_fav_by_w[_w] = ((_vg > 0) | (_sl > 0)).reindex(midx)
+        regime_favboth_by_w[_w] = ((_vg > 0) & (_sl > 0)).reindex(midx)
+    regime_fav = regime_fav_by_w[6]        # default 6mo
+    regime_fav_both = regime_favboth_by_w[6]
 
     universe = sorted(all_holds | set(delisted_sector))
     stock_daily = load_candles(universe)
@@ -595,9 +622,12 @@ def build():
             top5=None, capaware=None, trace=None, ban_first_loss=False, pb_ceiling=None, drop_sectors=None,
             exclude_tickers=None, start_date=None, end_date=None, warmup=9, sector_rule=None, quality_gate=None,
             include_months=None, spy200=None, bear_gate=None, hedge=None, growth_etfs=None, adaptive_growth=False,
-            growth_fallback=False, top_n=None, size_mode="conv", cost_bps=0.0, lev=1.0, largecap_mode=None):
+            growth_fallback=False, top_n=None, size_mode="conv", cost_bps=0.0, lev=1.0, largecap_mode=None,
+            defensive_riskoff=None, largecap_keep=None, sector_playbook=False, regime_switch=None,
+            regime_lookback=6):
         rets, spies, dl_picks, mrets = [], [], 0, []
         prev_held = set()          # last month's basket, for turnover-based transaction costs
+        _base_lcm = largecap_mode  # base large-cap policy; regime_switch overrides it per-month
         proxy_hold = Counter()          # etf -> # months held as a no-value-stock proxy (the live fallback)
         proxy_contrib = 0.0             # sum of proxy monthly contributions to the basket (weighted)
         mega_picks = 0                  # picks with >$50B USD mktcap (does premium-normalization let mega-caps in?)
@@ -655,6 +685,26 @@ def build():
             else:
                 top = a.dropna().sort_values(ascending=False).head(TOP_N).index
 
+            # REGIME SWITCH (user): use the rotation system's own value/small-cap-leadership signal to pick the
+            # config — AGGRESSIVE (skip large-cap-only, pure small-cap) when our regime is favorable; CORE (keep
+            # large-cap) when mega-cap growth leads (2017/2018/2023). largecap_mode is set per-month here.
+            largecap_mode = _base_lcm
+            if regime_switch:
+                _fw = regime_lookback if regime_lookback in regime_fav_by_w else 6
+                _sig = regime_favboth_by_w[_fw] if regime_switch == "both" else regime_fav_by_w[_fw]
+                _fav = _sig.get(date, True)
+                largecap_mode = "skip" if bool(_fav) else None
+
+            # DEFENSIVE ROTATION in risk-off (user): when SPY < 200d MA, don't de-risk to cash — ROTATE into
+            # defensive sleeves (Gold miners / Consumer Staples / Utilities / Healthcare) and buy the cheap value
+            # name in each. Stays invested, flees to safety, captures flight-to-quality. Only replaces `top`.
+            if defensive_riskoff and not bool(bull_200.get(date, True)):
+                _def = defensive_riskoff if isinstance(defensive_riskoff, (list, set, tuple)) else \
+                    ["GLD", "XLP", "XLU", "XLV", "SCHD"]
+                _dtop = [e for e in _def if e in accel.columns]
+                if _dtop:
+                    top = pd.Index(_dtop)
+
             def pbceil_ok(h):
                 """P/B ceiling gate. pb_ceiling may be None (off), a flat float, or a cap-tiered dict with keys
                 'micro' (<$500M), 'small' (<$2B), 'large' (>=$2B) and optional 'default'."""
@@ -707,7 +757,12 @@ def build():
                 sm = [x for x in g0 if pd.notna(mktcap_usd.loc[date, x]) and mktcap_usd.loc[date, x] < SMALL]
                 _lc_only = (not sm) and bool(g0)       # sector offers ONLY large-caps -> the loss-prone fallback
                 _lc_mom = False
-                if largecap_mode and _lc_only:
+                # commodity/miner exemption (user): a large-cap PRODUCER (ALB/SQM/MP) is a real cheap producer,
+                # not the disrupted-tech value-trap (VSAT/MU) that made skip-large-cap a win. Keep the large-cap
+                # in these sectors instead of skipping.
+                # sector playbook keeps the large-cap in MINER sectors (real producers) automatically
+                _lc_exempt = bool(largecap_keep and etf in largecap_keep) or (sector_playbook and etf in PLAY_MINERS)
+                if largecap_mode and _lc_only and not _lc_exempt:
                     # LARGE-CAP FALLBACK FIX (loser analysis: 58% of big losses were cheap-large-cap fallbacks).
                     if largecap_mode == "skip":
                         sm = []; g0 = []               # skip large-cap-only sectors (concentrate elsewhere)
@@ -783,7 +838,31 @@ def build():
                     _r = [roe.loc[date, x] for x in _pool5 if pd.notna(roe.loc[date, x])]
                     _thr = 0.0 if adaptive_growth is True else float(adaptive_growth)
                     _use_mom = (len(_r) >= 2 and float(np.median(_r)) < _thr)
-                if _use_mom and g:
+                if sector_playbook and g:
+                    # SECTOR PLAYBOOK: value the pick the way that TYPE of company is really valued.
+                    if etf in PLAY_GROWTH:                 # growth/tech -> momentum leader (cheap P/B = trap)
+                        q = [x for x in g if pd.notna(smom6.loc[date, x])]
+                        p = max(q, key=lambda h: smom6.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
+                    elif etf in PLAY_MINERS:               # miners/commodity -> cheapest P/B (book = reserves)
+                        p = min(g, key=lambda h: pb.loc[date, h])
+                    elif etf in PLAY_FIN:                  # banks/insurers -> cheapest P/B among PROFITABLE
+                        q = [x for x in g if pd.notna(roe.loc[date, x]) and roe.loc[date, x] > 0]
+                        p = min(q or g, key=lambda h: pb.loc[date, h])
+                    elif etf in PLAY_CYCLICAL:             # cyclicals -> cheapest trailing P/E (earnings through cycle)
+                        q = [x for x in g if pd.notna(pe_ttm_pos.loc[date, x])]
+                        p = min(q, key=lambda h: pe_ttm_pos.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
+                    elif etf in PLAY_DEFENSIVE:            # defensives -> cheapest P/E among profitable (stable earners)
+                        q = [x for x in g if pd.notna(pe_ttm_pos.loc[date, x]) and pd.notna(roe.loc[date, x]) and roe.loc[date, x] > 0]
+                        p = min(q, key=lambda h: pe_ttm_pos.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
+                    else:                                  # default (healthcare/biotech/broad/foreign) -> analyst blend
+                        _q = [x for x in g if pd.notna(upside_m.loc[date, x])]
+                        if len(_q) >= 3:
+                            pr = pd.Series({h: pb.loc[date, h] for h in _q}).rank(pct=True)
+                            ur = pd.Series({h: upside_m.loc[date, h] for h in _q}).rank(pct=True, ascending=False)
+                            p = (0.6 * ur + 0.4 * pr).idxmin()
+                        else:
+                            p = min(g, key=lambda h: pb.loc[date, h])
+                elif _use_mom and g:
                     q = [x for x in g if pd.notna(smom6.loc[date, x])]
                     p = max(q, key=lambda h: smom6.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
                 elif capaware is not None:        # LIVE cap-aware rule + configurable no-profitable-small-cap fallback
@@ -1121,6 +1200,201 @@ def build():
                     base = r["total"]
                 tag = f"({r['total']-base:>+6.0f})" if (base is not None and qg is not None) else ""
                 print(f"    {glab:18}{r['total']:>8.0f}%  Sh{r['sharpe']:>5.2f}  {tag}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("REGIME_SPEED_TEST"):
+        # ── does the regime switch lag? (user: "bad results because we're not catching the regime quickly
+        # enough"). Test detection SPEED: 1/2/3/6/12-month lookback on the value/small leadership signal. Fast
+        # = less lag but more whipsaw. Honest 2016-2026, focus on the hostile years (2017/2018/2023). ──
+        import sys
+        from collections import defaultdict
+        print("\n=== REGIME_SPEED_TEST (honest 2016-2026): regime-detection lookback speed ===", flush=True)
+        print(f"  {'lookback':16}{'FULL':>12}{'DD':>8}{'pre-2020':>10}{'2017':>8}{'2018':>8}{'2023':>8}{'Sharpe':>8}", flush=True)
+        for w in (1, 2, 3, 6, 12):
+            r = run(True, True, country_ok=_is_usca, regime_switch="either", regime_lookback=w)
+            rp = run(True, True, country_ok=_is_usca, regime_switch="either", regime_lookback=w, end_date="2019-12-31")
+            mo = dict(r.get("monthly", []))
+            yr = defaultdict(lambda: 1.0)
+            for d, rr in r.get("monthly", []):
+                yr[d[:4]] *= (1 + rr)
+            print(f"  {str(w)+'-month':16}{r['total']:>11.0f}%{r['dd']:>7.1f}%{rp['total']:>9.0f}%"
+                  f"{(yr['2017']-1)*100:>7.0f}%{(yr['2018']-1)*100:>7.0f}%{(yr['2023']-1)*100:>7.0f}%{r['sharpe']:>8.2f}", flush=True)
+        # reference: static core and aggressive on the same year breakdown
+        for lab, kw in [("static CORE", dict()), ("static AGGRESSIVE", dict(largecap_mode="skip"))]:
+            r = run(True, True, country_ok=_is_usca, **kw)
+            yr = defaultdict(lambda: 1.0)
+            for d, rr in r.get("monthly", []):
+                yr[d[:4]] *= (1 + rr)
+            print(f"  {lab:16}{r['total']:>11.0f}%{r['dd']:>7.1f}%{'':>10}{(yr['2017']-1)*100:>7.0f}%{(yr['2018']-1)*100:>7.0f}%{(yr['2023']-1)*100:>7.0f}%{r['sharpe']:>8.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("REGIME_SWITCH_TEST"):
+        # ── REGIME SWITCH (user): detect the regime with the rotation system's OWN value/small-cap leadership
+        # signal, run AGGRESSIVE (skip large-cap) when favorable, CORE when mega-cap growth leads. Does it
+        # capture the aggressive upside AND dodge the 2017/2018/2023 drawdown? Honest 2016-2026, WF. ──
+        import sys
+        arms = [("static CORE", dict()),
+                ("static AGGRESSIVE (skip all)", dict(largecap_mode="skip")),
+                ("REGIME-SWITCH (value OR small leads)", dict(regime_switch="either")),
+                ("REGIME-SWITCH (value AND small lead)", dict(regime_switch="both"))]
+        print("\n=== REGIME_SWITCH_TEST (honest 2016-2026): detect regime from the rotation system, switch config ===", flush=True)
+        print(f"  {'config':40}{'FULL':>13}{'DD':>8}{'pre-2020':>11}{'2020-26':>11}{'Sharpe':>8}", flush=True)
+        for lab, kw in arms:
+            r = run(True, True, country_ok=_is_usca, **kw)
+            rp = run(True, True, country_ok=_is_usca, end_date="2019-12-31", **kw)
+            rq = run(True, True, country_ok=_is_usca, start_date="2020-01-31", **kw)
+            print(f"  {lab:40}{r['total']:>12.0f}%{r['dd']:>7.1f}%{rp['total']:>10.0f}%{rq['total']:>10.0f}%{r['sharpe']:>8.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("CONFIGS_COMPARE"):
+        # ── compute the 3 regime-bet configs (agnostic core / middle / aggressive) + save for the doc. ──
+        import sys, json as _j
+        MINER = {"GLD", "SLV", "PPLT", "USO", "UNG", "URA", "LIT", "COPX", "SLX", "REMX", "XLE", "XLB"}
+        cfgs = [
+            ("core", "Regime-agnostic core", "Cheapest-P/B small-cap value, top-10, equal-weight. Works in both worlds.",
+             dict()),
+            ("middle", "Middle — commodity exemption", "Skip large-cap-only sectors EXCEPT commodity/miners (keep the real producer). Robust + lower DD.",
+             dict(largecap_mode="skip", largecap_keep=MINER)),
+            ("adaptive", "Adaptive — regime switch (12mo)", "Detects value/small-cap leadership from the rotation system's own 12-month momentum (regimes are multi-year, so a slow signal avoids whipsaw); aggressive in our regime, core when mega-cap growth leads. Best risk-adjusted config.",
+             dict(regime_switch="either", regime_lookback=12)),
+            ("aggressive", "Aggressive — regime bet", "Skip ALL large-cap-only sectors (pure small-cap). Levered long the post-2020 small-cap/commodity regime.",
+             dict(largecap_mode="skip")),
+        ]
+        # shared SPY equity curve (same benchmark for every config)
+        _spycurve = []
+        _e = 1.0
+        for i in range(max(6, 9), len(midx) - 1):
+            _sr = spy_m.iloc[i + 1] / spy_m.iloc[i] - 1
+            if np.isfinite(_sr):
+                _e *= (1 + float(_sr)); _spycurve.append(round(_e * 100000))
+        out = []
+        for key, name, desc, kw in cfgs:
+            rF = run(True, True, country_ok=_is_usca, **kw)
+            rp = run(True, True, country_ok=_is_usca, end_date="2019-12-31", **kw)
+            rq = run(True, True, country_ok=_is_usca, start_date="2020-01-31", **kw)
+            n_yr = rF["months"] / 12.0
+            cagr = ((1 + rF["total"] / 100) ** (1 / n_yr) - 1) * 100 if rF["total"] > -100 else None
+            # equity curve + calendar from the monthly returns
+            mo = rF.get("monthly", [])
+            eq = 1.0; curve = []
+            cal = {}
+            for d, r in mo:
+                eq *= (1 + r); curve.append({"d": d, "f": round(eq * 100000)})
+                y = d[:4]; cal[y] = (cal.get(y, 1.0)) * (1 + r)
+            calendar = [{"year": y, "ret": round((v - 1) * 100, 1)} for y, v in sorted(cal.items())]
+            out.append({"key": key, "name": name, "desc": desc, "total": rF["total"], "sharpe": rF["sharpe"],
+                        "dd": rF["dd"], "cagr": round(cagr, 1) if cagr else None, "t_stat": rF.get("t_stat"),
+                        "pre2020": rp["total"], "post2020": rq["total"], "months": rF["months"],
+                        "curve": curve, "calendar": calendar,
+                        "final_100k": round(100000 * (1 + rF["total"] / 100))})
+            print(f"  {name}: FULL {rF['total']:.0f}% Sh{rF['sharpe']} DD{rF['dd']}% pre{rp['total']:.0f} post{rq['total']:.0f}", flush=True)
+        Path("/app/.data/studies/configs_compare.json").write_text(_j.dumps(
+            {"configs": out, "spy_curve": _spycurve}, default=str))
+        print("saved configs_compare.json", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("PLAYBOOK_TEST"):
+        # ── SECTOR PLAYBOOK (user: "common-sense rule per sector — people don't invest the same way"):
+        # miners->cheap P/B(+large-cap OK), growth->momentum, banks->P/B-if-profitable, cyclicals->P/E,
+        # defensives->P/E-if-profitable, else->analyst blend. vs the uniform flagship. Honest 2016-2026, WF. ──
+        import sys
+        arms = [("uniform blend + skip-largecap (config)", dict(value_key="upside_pb_60", growth_fallback=True, largecap_mode="skip")),
+                ("SECTOR PLAYBOOK", dict(sector_playbook=True, growth_fallback=True)),
+                ("SECTOR PLAYBOOK + skip-largecap non-miner", dict(sector_playbook=True, growth_fallback=True, largecap_mode="skip"))]
+        print("\n=== PLAYBOOK_TEST (honest 2016-2026): per-sector valuation rules vs uniform ===", flush=True)
+        print(f"  {'config':44}{'FULL':>13}{'DD':>8}{'pre-2020':>11}{'2020-26':>11}{'Sharpe':>8}", flush=True)
+        for lab, kw in arms:
+            r = run(True, True, country_ok=_is_usca, **kw)
+            rp = run(True, True, country_ok=_is_usca, end_date="2019-12-31", **kw)
+            rq = run(True, True, country_ok=_is_usca, start_date="2020-01-31", **kw)
+            print(f"  {lab:44}{r['total']:>12.0f}%{r['dd']:>7.1f}%{rp['total']:>10.0f}%{rq['total']:>10.0f}%{r['sharpe']:>8.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("COMMODITY_LC_TEST"):
+        # ── COMMODITY/MINER large-cap exemption (user, from Rare-Earth skip): skip large-cap-only sectors
+        # EVERYWHERE except commodity/miner sectors, where the large-cap is a real producer (ALB/SQM/MP), not
+        # a tech value-trap. Does keeping their large-cap help? Honest 2016-2026. ──
+        import sys
+        MINER = {"GLD", "SLV", "PPLT", "USO", "UNG", "URA", "LIT", "COPX", "SLX", "REMX", "XLE", "XLB"}
+        base = dict(country_ok=_is_usca, largecap_mode="skip")     # config 2
+        arms = [("config2 (skip ALL large-cap-only)", dict()),
+                ("keep large-cap in commodity/miner", dict(largecap_keep=MINER))]
+        print("\n=== COMMODITY_LC_TEST (honest 2016-2026): keep large-cap producers in miner sectors ===", flush=True)
+        print(f"  {'policy':38}{'FULL':>13}{'DD':>8}{'pre-2020':>11}{'2020-26':>11}{'Sharpe':>8}", flush=True)
+        for lab, kw in arms:
+            r = run(True, True, **base, **kw)
+            rp = run(True, True, end_date="2019-12-31", **base, **kw)
+            rq = run(True, True, start_date="2020-01-31", **base, **kw)
+            print(f"  {lab:38}{r['total']:>12.0f}%{r['dd']:>7.1f}%{rp['total']:>10.0f}%{rq['total']:>10.0f}%{r['sharpe']:>8.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("DEFENSIVE_TEST"):
+        # ── DEFENSIVE ROTATION in risk-off (user): when SPY<200MA, rotate into Gold/Staples/Utilities/Healthcare
+        # instead of de-risking to cash. Test on config 2 (core + skip-large-cap, DD-42%). Does it cut the DD
+        # while keeping return? Honest 2016-2026. ──
+        import sys
+        base = dict(country_ok=_is_usca, largecap_mode="skip")
+        arms = [("config2 (baseline)", dict()),
+                ("Gold+Staples+Utilities+HC+Div", dict(defensive_riskoff=True)),
+                ("Gold + Staples only", dict(defensive_riskoff=["GLD", "XLP"])),
+                ("Gold + Utilities + Staples", dict(defensive_riskoff=["GLD", "XLU", "XLP"])),
+                ("Gold only (pure haven)", dict(defensive_riskoff=["GLD"]))]
+        print("\n=== DEFENSIVE_TEST (honest 2016-2026): rotate to defensives when SPY<200MA (config 2) ===", flush=True)
+        print(f"  {'risk-off policy':34}{'FULL':>13}{'DD':>8}{'pre-2020':>11}{'2020-26':>11}{'Sharpe':>8}", flush=True)
+        for lab, kw in arms:
+            r = run(True, True, **base, **kw)
+            rp = run(True, True, end_date="2019-12-31", **base, **kw)
+            rq = run(True, True, start_date="2020-01-31", **base, **kw)
+            print(f"  {lab:34}{r['total']:>12.0f}%{r['dd']:>7.1f}%{rp['total']:>10.0f}%{rq['total']:>10.0f}%{r['sharpe']:>8.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("DD_TEST"):
+        # ── LOWER THE DRAWDOWN on config 2 (core + skip-large-cap = 38294% but DD-42%), user wants to keep the
+        # return + cut the DD. Test regime/trend de-riskers that dodge the 2018/2020 crashes. Honest 2016-2026. ──
+        import sys
+        wins = [("FULL 16-26", None, None), ("pre-2020", None, "2019-12-31"), ("2020-26", "2020-01-31", None)]
+        base = dict(country_ok=_is_usca, largecap_mode="skip")     # config 2
+        arms = [("config2 (baseline)", dict()),
+                ("+ SPY<200MA -> half exposure", dict(spy200="half")),
+                ("+ SPY<200MA -> cash", dict(spy200="cash")),
+                ("+ SPY<200MA -> FCF-quality gate", dict(bear_gate="fcf_margin")),
+                ("+ only accelerating sectors (accel>0)", dict(sector_rule="accel_pos")),
+                ("+ up AND accel sectors", dict(sector_rule="up_and_accel")),
+                ("+ SPY<200MA short 50% QQQ", dict(hedge=0.5))]
+        print("\n=== DD_TEST (honest 2016-2026): lower config-2's -42% DD, keep the return ===", flush=True)
+        print(f"  {'overlay':40}{'FULL':>15}{'DD':>8}{'pre-2020':>11}{'2020-26':>11}", flush=True)
+        for lab, kw in arms:
+            r = run(True, True, start_date=None, end_date=None, **base, **kw)
+            rp = run(True, True, end_date="2019-12-31", **base, **kw)
+            rq = run(True, True, start_date="2020-01-31", **base, **kw)
+            print(f"  {lab:40}{r['total']:>13.0f}% {r['dd']:>6.1f}% {rp['total']:>9.0f}% {rq['total']:>9.0f}%"
+                  f"  Sh{r['sharpe']:.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("LEVER_ABLATION"):
+        # ── ABLATE every lever on the HONEST 2016-2026 history (user 'test them all'). Cumulative stack:
+        # core -> +skip-largecap -> +blend -> +hypergrowth-fill -> +top7 -> +upside-size. Report total/Sharpe/DD
+        # + pre-2020 (most OOS-like) vs post-2020, so we see which levers earn their drawdown. ──
+        import sys
+        wins = [("FULL 16-26", None, None), ("pre-2020", None, "2019-12-31"), ("2020-26", "2020-01-31", None)]
+        configs = [
+            ("1. core (raw P/B, top10, eq-wt)", dict()),
+            ("2. + skip large-cap-only", dict(largecap_mode="skip")),
+            ("3. + analyst-upside blend", dict(largecap_mode="skip", value_key="upside_pb_60")),
+            ("4. + hypergrowth-fill", dict(largecap_mode="skip", value_key="upside_pb_60", growth_fallback=True)),
+            ("5. + top-7 concentration", dict(largecap_mode="skip", value_key="upside_pb_60", growth_fallback=True, top_n=7)),
+            ("6. + upside-sizing (FULL)", dict(largecap_mode="skip", value_key="upside_pb_60", growth_fallback=True, top_n=7, size_mode="upside")),
+        ]
+        print("\n=== LEVER_ABLATION (honest 2016-2026): cumulative stack — total / Sharpe / DD ===", flush=True)
+        print(f"  {'config':34}{'FULL':>16}{'pre-2020':>16}{'2020-26':>16}{'DD':>8}", flush=True)
+        for lab, kw in configs:
+            cells = []; dd = None
+            for _, sd, ed in wins:
+                r = run(True, True, country_ok=_is_usca, start_date=sd, end_date=ed, **kw)
+                cells.append(f"{r['total']:>8.0f}% {r['sharpe']:.2f}")
+                if sd is None and ed is None:
+                    dd = r.get("dd")
+            print(f"  {lab:34}" + "".join(f"{c:>16}" for c in cells) + f"{dd:>7.1f}%", flush=True)
         sys.exit(0)
 
     if os.environ.get("LARGECAP_TEST"):
@@ -1835,19 +2109,29 @@ def build():
         # FLAGSHIP is now the CHEAP-P/B × ANALYST-UPSIDE blend (w60) — the one additive lever that beat raw-P/B
         # in both halves + across weights + 4/6 years (2026-08-17, user). Raw-P/B remains as usca_small reference.
         tr = []
-        perf = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True,
-                   top_n=7, size_mode="upside", largecap_mode="skip", trace=tr)
-        out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": "usca_small_upside_pb",
+        # CONFIG-parameterized trace so each setup gets its own full doc (subtabs -> per-config trades).
+        # FLAGSHIP default = ADAPTIVE: raw-value core + 12-month regime switch. Best risk-adjusted (28447%).
+        _cfgkw = {
+            "adaptive": dict(regime_switch="either", regime_lookback=12),
+            "core": dict(),
+            "middle": dict(largecap_mode="skip", largecap_keep={"GLD", "SLV", "PPLT", "USO", "UNG", "URA", "LIT",
+                                                                 "COPX", "SLX", "REMX", "XLE", "XLB"}),
+            "aggressive": dict(largecap_mode="skip"),
+        }
+        _ck = os.environ.get("CONFIG", "adaptive")
+        _kw = _cfgkw.get(_ck, _cfgkw["adaptive"])
+        perf = run(True, True, country_ok=_is_usca, trace=tr, **_kw)
+        out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": f"usca_small_{_ck}", "config": _ck,
                "perf": {k: perf.get(k) for k in ("total", "annual", "vs_spy", "sharpe", "dd", "t_stat", "months",
                                                  "delisted_picks")},
                "params": {"top_n": TOP_N, "small_cap_max": SMALL, "min_dvol": MIN_DVOL, "conv_weight": CONV,
-                          "selector": "60% analyst implied-upside + 40% cheapest-P/B (rank blend); "
-                                      "cheapest-P/B fallback when no analyst target within 90d"},
+                          "config": _ck, "selector": "cheapest-P/B value in accelerating sectors; " + _ck + " overlay"},
                "months": tr}
-        fp = Path("/app/.data/studies/flagship_history.json")
+        suffix = "" if _ck == "adaptive" else f"_{_ck}"
+        fp = Path(f"/app/.data/studies/flagship_history{suffix}.json")
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(json.dumps(out, indent=2, default=str))
-        print(f"FLAGSHIP_TRACE written: {fp}  months={len(tr)}  total={perf.get('total')}%  (blend flagship)", flush=True)
+        print(f"FLAGSHIP_TRACE[{_ck}] written: {fp}  months={len(tr)}  total={perf.get('total')}%", flush=True)
         sys.exit(0)
 
     results = {
@@ -1869,9 +2153,12 @@ def build():
         # lever that beat raw P/B in BOTH halves + across weights 30-70% + 4/6 clean years (2026-08-17). Uses the
         # Benzinga implied-upside panel (67% coverage; falls back to cheapest-P/B when no recent target). Caveats:
         # 2 down years (2021/2024), partial coverage, survivorship/window-inflated absolutes, needs true OOS.
-        # ⭐ FLAGSHIP (2026-08-18): blend + hypergrowth-fill + TOP-7 concentration + ANALYST-UPSIDE sizing.
-        # 12432% (2× the top-10 blend), LOWER DD −19.3%, positive all windows. top-7 slightly fit; size-upside
-        # is the principled Pareto half. Costs IGNORED per user.
+        # ⭐⭐ FLAGSHIP (2026-08-18): ADAPTIVE — raw-value core + 12-month REGIME SWITCH (aggressive skip-large-cap
+        # when value/small-cap leads, core when mega-cap growth leads). Best risk-adjusted config: 28447% Sh1.61
+        # DD−24.9% (core-level DD, 2.4× the core return), +72% pre-2020. Detects regime from the rotation
+        # system's own 12mo value/small leadership signal (slow = matches the multi-year regime, no whipsaw).
+        "usca_small_adaptive": run(True, True, country_ok=_is_usca, regime_switch="either", regime_lookback=12),
+        # the demoted aggressive stack (kept for reference; overfit the 2020 recovery, DD−42%)
         "usca_small_upside_pb": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True,
                                     top_n=7, size_mode="upside", largecap_mode="skip"),
         # references to keep the levers' lift visible
