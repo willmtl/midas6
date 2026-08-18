@@ -35,7 +35,8 @@ import sector_holdings
 from seq_fundamental_study import load_candles
 
 LOOKBACK_D = 126          # ~6 trading months (matches backtest LOOKBACK=6 monthly)
-TOP_N_SECTORS = 10
+TOP_N_SECTORS = 7          # 2026-08-18: concentration lever — top-7 accel sectors (backtest 9941% vs 6924%
+                           # top-10; stacks with analyst-upside sizing → 12432%). Fewer, higher-conviction bets.
 MIN_DOLLAR_VOL = 5e6      # tradeability floor: drop OTC/thin names (<$5M/day). Backtest sweet spot: removes
                          # untradeable pink sheets (e.g. $0/day) AND the net-loser thin band -> +298% honest
                          # tradeable vs +376% inflated by unbuyable pops; higher floors delete real small-cap winners.
@@ -283,11 +284,13 @@ def build():
         guarded = [(t, pb) for t, pb in cands if not gflags.get(t, {}).get("trap")]
         lowdebt = [(t, pb) for t, pb in guarded if gflags.get(t, {}).get("low_debt")]
         use = lowdebt if lowdebt else (guarded if guarded else cands)
-        # small-cap preference: among the surviving candidates, restrict to <$2B USD if any qualify (the size
-        # premium is the flagship's biggest lever); fall back to all if a sector has no small name.
+        # small-cap preference: restrict to <$2B USD if any qualify (the size premium is the flagship's biggest
+        # lever). 2026-08-18: if a sector offers NO small-cap, SKIP it — do NOT settle for the cheap large-cap
+        # fallback (loser analysis: 58% of big losses were large-cap fallbacks MU/VSAT/RIO; backtest 12432->27068%
+        # by skipping). The hypergrowth fallback below still gets a shot first.
         small = [(t, pb) for t, pb in use if (_usd_mcap(t, funds) or 9e18) < SMALL_CAP_USD]
         is_small_tier = bool(small)
-        use = small if small else use
+        use = small if small else []          # large-cap-only -> empty -> hypergrowth-fallback, else skip
         row = {"rank": rank, "sector": name, "etf": etf, "momentum_6m": round(mom.get(etf, 0), 1),
                "momentum_3m": mom3.get(etf), "acceleration": round(acc, 1),
                "n_candidates": len(cands), "n_after_guard": len(guarded), "n_low_debt": len(lowdebt)}
@@ -375,14 +378,16 @@ def build():
             continue
         picks.append(row)
 
-    # div_2x CONVICTION WEIGHTING: keep the full basket (breadth intact — same cheapest-P/B pick per sector),
-    # just OVERWEIGHT names showing A/D divergence (accumulation into weakness) 2x, then renormalize to 100%.
-    # Backtested (split-corrected, honest) +313.2% vs +246% equal-weight / Sharpe 1.50 vs 1.36 / DD -15.5% —
-    # the first orthogonal overlay to improve the flagship on all axes (still beats equal in both halves). 2x not 3x
-    # ON PURPOSE: divergence fires on only ~1 pick/mo, so 3x concentrates ~25% into a single name; 2x caps that.
+    # WEIGHTING (2026-08-18 flagship): div_2x conviction (A/D divergence) × ANALYST-UPSIDE sizing (bet more on
+    # higher implied-upside names — backtest +2081pp, better Sharpe AND lower DD, all windows), then renormalize.
+    # Size multiplier = clamp(1 + implied_upside, 0.3, 3.0), matching the backtest size_mode="upside".
     CONVICTION_MULT = 2.0
     for p in picks:
-        p["conviction_weight"] = CONVICTION_MULT if p.get("accumulating") else 1.0
+        w = CONVICTION_MULT if p.get("accumulating") else 1.0
+        up = upside_by_ticker.get(p["pick"])
+        if up is not None:
+            w *= max(0.3, min(3.0, 1.0 + float(up)))
+        p["conviction_weight"] = round(w, 3)
     tot_w = sum(p["conviction_weight"] for p in picks) or 1.0
     for p in picks:
         p["pct_alloc"] = round(p["conviction_weight"] / tot_w * 100, 1)

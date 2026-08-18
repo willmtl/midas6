@@ -309,6 +309,7 @@ TIP = {
     "Worst": "Worst single-month return this name ever posted as a holding.",
     "Contrib.": "Summed A/D-conviction-weighted return contribution to the portfolio across all holds. This is the sort key — a few names carry the book.",
     "Span": "First → last rebalance month the name appears as a holding.",
+    "Held to today": "Buy-and-hold return if you had bought this name at its FIRST purchase month and never sold — first-purchase close to the latest close (split/div-adjusted). Shows whether the monthly rotation left money on the table (name kept running) or dodged a later collapse. Delisted names run to their last traded price.",
     "Weight": "Basket weight: 2× when the name shows A/D accumulation into price weakness (conviction), else 1×.",
     "In top-10": "How many months this sleeve's ETF accelerated into the momentum top-10.",
     "Picked from": "How many of those top-10 months the engine found a qualifying value pick in the sleeve.",
@@ -378,8 +379,8 @@ def kpi_tile(k, v, dd, hero=False):
 
 # ---------- equity curve ----------
 curve = D["curve"]
-curve_js = json.dumps([{"d": c["date"], "f": round(c["flagship"] * 100000), "s": round(c["spy"] * 100000)}
-                       for c in curve])
+curve_js = json.dumps([{"d": c["date"], "f": round(c["flagship"] * 100000), "s": round(c["spy"] * 100000),
+                        "r": c["ret"]} for c in curve])
 stock_trades_js = json.dumps({s["ticker"]: {"co": s["company"], "dl": s["delisted"],
     "t": [{"d": t["date"], "s": t["sector"], "pb": t["pb"], "pe": t["pe"], "roe": t["roe"], "de": t["de"],
            "gpa": t["gpa"], "rg": t["rev_g"], "mc": t["mc"], "w": t["weight"], "r": t["ret"], "cv": t["conviction"]}
@@ -444,6 +445,7 @@ for s in D["by_stock"]:
       <td class="num">{pct(s['best'])}</td>
       <td class="num">{pct(s['worst'])}</td>
       <td class="num strong">{pct(s['sum_contrib'])}</td>
+      <td class="num">{pct(s.get('hold_today'))}</td>
       <td class="num span">{esc(span)}</td>
     </tr>""")
 
@@ -643,6 +645,9 @@ body{{margin:0}}
 .mast .sub{{font-family:var(--serif); font-style:italic; color:var(--ink2); font-size:clamp(17px,2.4vw,21px); margin:0 0 26px}}
 .headline{{display:flex; flex-wrap:wrap; align-items:flex-end; gap:10px 34px; margin-top:10px}}
 .bignum{{font-family:var(--serif); font-weight:700; font-size:clamp(46px,9vw,86px); line-height:.92; color:var(--gold); letter-spacing:-.02em}}
+.levbtn{{align-self:center; font-family:var(--mono); font-size:12px; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink2); cursor:pointer}}
+.levbtn:hover{{color:var(--ink); border-color:var(--accent)}}
+.levbtn[aria-pressed="true"]{{background:color-mix(in srgb,var(--gold) 18%,transparent); color:var(--gold); border-color:var(--gold); font-weight:700}}
 .bigsub{{display:flex; flex-direction:column; gap:2px; padding-bottom:8px}}
 .bigsub .a{{font-size:20px; font-weight:700}}
 .bigsub .b{{font-size:13px; color:var(--ink2)}}
@@ -782,12 +787,12 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
     <h1>Small-Cap Value, Bought in Accelerating Sectors</h1>
     <p class="sub">Every sector held and every stock picked that compounded $100,000 into ${S['final_100k_flagship']:,} — with the fundamentals as they stood on each purchase date.</p>
     <div class="headline">
-      <div class="bignum">+{P['total']:.0f}%</div>
+      <div class="bignum" id="hlTotal">+{P['total']:.0f}%</div>
       <div class="bigsub">
-        <span class="a">${S['final_100k_flagship']:,} <span class="mut" style="font-weight:400">from $100k</span></span>
+        <span class="a"><span id="hlDollar">${S['final_100k_flagship']:,}</span> <span class="mut" style="font-weight:400">from $100k</span></span>
         <span class="b">{S['first']} → {S['last']} · {S['months']} months · vs SPY ${S['final_100k_spy']:,}</span>
       </div>
-      <span class="codechip">arm: usca_small</span>
+      <button class="levbtn" id="levBtn" type="button" aria-pressed="false" title="Apply 1.3× leverage to the monthly returns. Return-max dial — scales return AND drawdown proportionally (Sharpe unchanged); a risk decision, not an edge improvement.">1.3× leverage: OFF</button>
     </div>
     <div class="meta-row">
       <span>CAGR <b>{P['annual']:.1f}%</b></span><span>Sharpe <b>{P['sharpe']:.2f}</b></span>
@@ -844,7 +849,7 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
       <thead><tr>
         {th("Ticker","l")}{th("Company","l")}{th("Sector(s)","l")}{th("Held")}{th("Win%")}
         {th("P/B")}{th("P/E")}{th("ROE")}{th("GP/A")}{th("Rev&nbsp;g")}{th("D/E")}{th("Mkt&nbsp;cap")}{th("Tier")}
-        {th("Avg&nbsp;ret")}{th("Best")}{th("Worst")}{th("Contrib.")}{th("Span")}
+        {th("Avg&nbsp;ret")}{th("Best")}{th("Worst")}{th("Contrib.")}{th("Held&nbsp;to&nbsp;today")}{th("Span")}
       </tr></thead>
       <tbody>{"".join(stock_rows)}</tbody>
     </table></div></div>
@@ -907,6 +912,24 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 <script>
 (function(){{
   var data = {curve_js};
+  // leverage toggle: recompute the flagship equity path from monthly returns × LEV, update chart + headline
+  var LEV=1.0;
+  function applyLev(){{
+    var eq=100000;
+    data.forEach(function(d){{ var r=(typeof d.r==='number'?d.r:0); eq*=(1+Math.max(-0.99,LEV*r)); d.lf=eq; }});
+    var fin=data.length?data[data.length-1].lf:100000, tot=(fin/100000-1)*100;
+    var bt=document.getElementById('hlTotal'), bd=document.getElementById('hlDollar');
+    if(bt) bt.textContent='+'+Math.round(tot).toLocaleString()+'%';
+    if(bd) bd.textContent='$'+Math.round(fin).toLocaleString();
+  }}
+  applyLev();
+  var levBtn=document.getElementById('levBtn');
+  if(levBtn) levBtn.addEventListener('click',function(){{
+    LEV = (LEV===1.0?1.3:1.0); var on=LEV!==1.0;
+    levBtn.setAttribute('aria-pressed', on?'true':'false');
+    levBtn.textContent = '1.3× leverage: '+(on?'ON':'OFF');
+    applyLev(); draw();
+  }});
   var root=document.documentElement, tog=document.getElementById('tog');
   tog.addEventListener('click',function(){{
     var cur=root.getAttribute('data-theme');
@@ -922,7 +945,7 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
     cv.width=w*dpr; cv.height=h*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
     var padL=64,padR=16,padT=14,padB=26;
     var gold=css('--gold'), mut=css('--mut'), line=css('--line');
-    var maxV=0; data.forEach(function(d){{maxV=Math.max(maxV,d.f,d.s);}}); var minV=100000;
+    var maxV=0; data.forEach(function(d){{maxV=Math.max(maxV,(d.lf||d.f),d.s);}}); var minV=100000;
     function X(i){{return padL+(w-padL-padR)*(i/(data.length-1));}}
     function Y(v){{return padT+(h-padT-padB)*(1-(v-minV)/(maxV-minV));}}
     ctx.font='11px "SF Mono",Consolas,monospace'; ctx.textBaseline='middle';
@@ -932,10 +955,10 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
     ctx.textAlign='center'; var lastYr='';
     data.forEach(function(d,i){{ var yr=d.d.slice(0,4); if(yr!==lastYr){{lastYr=yr; ctx.fillText(yr, X(i), h-8);}} }});
     var grad=ctx.createLinearGradient(0,padT,0,h-padB); grad.addColorStop(0, hexA(gold,.22)); grad.addColorStop(1, hexA(gold,0));
-    ctx.beginPath(); data.forEach(function(d,i){{var x=X(i),y=Y(d.f); i?ctx.lineTo(x,y):ctx.moveTo(x,y);}});
+    ctx.beginPath(); data.forEach(function(d,i){{var x=X(i),y=Y(d.lf||d.f); i?ctx.lineTo(x,y):ctx.moveTo(x,y);}});
     ctx.lineTo(X(data.length-1),Y(minV)); ctx.lineTo(X(0),Y(minV)); ctx.closePath(); ctx.fillStyle=grad; ctx.fill();
     function plot(key,color,wd){{ ctx.beginPath(); ctx.lineWidth=wd; ctx.strokeStyle=color; ctx.lineJoin='round';
-      data.forEach(function(d,i){{ var x=X(i),y=Y(d[key]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }}); ctx.stroke(); }}
+      data.forEach(function(d,i){{ var x=X(i),y=Y(key==='f'?(d.lf||d.f):d[key]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }}); ctx.stroke(); }}
     plot('s',mut,1.6); plot('f',gold,2.4);
     var last=data[data.length-1]; ctx.fillStyle=gold; ctx.beginPath(); ctx.arc(X(data.length-1),Y(last.f),4,0,7); ctx.fill();
   }}

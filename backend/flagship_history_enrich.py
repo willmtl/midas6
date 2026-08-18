@@ -106,6 +106,23 @@ def main():
     worst_picks = sorted(all_picks, key=lambda x: x["ret"])[:20]
     best_picks = sorted(all_picks, key=lambda x: -x["ret"])[:20]
 
+    # buy-and-hold-till-TODAY per name: return from the FIRST purchase-month close to the latest close
+    # (never sold). Uses split/div-adjusted closes; delisted names -> to their last traded price.
+    import pandas as pd
+    from seq_fundamental_study import load_candles
+    _cands = load_candles(list(by_stock.keys()))
+
+    def _hold_today(tk, first_date):
+        df = _cands.get(tk)
+        if df is None or not len(df):
+            return None
+        c = df["Close"]
+        p0 = c.asof(pd.Timestamp(first_date))
+        p1 = c.iloc[-1]
+        if pd.notna(p0) and pd.notna(p1) and p0 > 0:
+            return float(p1 / p0 - 1.0)
+        return None
+
     stocks = []
     for b in by_stock.values():
         stocks.append({"ticker": b["ticker"], "company": b["company"], "sectors": sorted(b["sectors"]),
@@ -114,7 +131,8 @@ def main():
                        "win_rate": round(100 * b["wins"] / b["n"], 0), "conv": b["conv"],
                        "first": b["first"], "last": b["last"], "med_pe": med(b["pe"]), "med_roe": med(b["roe"]),
                        "med_de": med(b["de"]), "med_pb": med(b["pb"]), "med_mc": med(b["mc"]),
-                       "med_rev_g": med(b["rev_g"]), "med_gpa": med(b["gpa"]), "trades": b["trades"]})
+                       "med_rev_g": med(b["rev_g"]), "med_gpa": med(b["gpa"]), "trades": b["trades"],
+                       "hold_today": _hold_today(b["ticker"], b["first"])})
     stocks.sort(key=lambda x: -x["sum_contrib"])
 
     sectors = []

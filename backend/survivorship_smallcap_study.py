@@ -595,8 +595,9 @@ def build():
             top5=None, capaware=None, trace=None, ban_first_loss=False, pb_ceiling=None, drop_sectors=None,
             exclude_tickers=None, start_date=None, end_date=None, warmup=9, sector_rule=None, quality_gate=None,
             include_months=None, spy200=None, bear_gate=None, hedge=None, growth_etfs=None, adaptive_growth=False,
-            growth_fallback=False):
+            growth_fallback=False, top_n=None, size_mode="conv", cost_bps=0.0, lev=1.0, largecap_mode=None):
         rets, spies, dl_picks, mrets = [], [], 0, []
+        prev_held = set()          # last month's basket, for turnover-based transaction costs
         proxy_hold = Counter()          # etf -> # months held as a no-value-stock proxy (the live fallback)
         proxy_contrib = 0.0             # sum of proxy monthly contributions to the basket (weighted)
         mega_picks = 0                  # picks with >$50B USD mktcap (does premium-normalization let mega-caps in?)
@@ -633,8 +634,9 @@ def build():
                 m3 = m3.drop([e for e in _dcols if e in m3.index], errors="ignore")
             # SECTOR-STATE scenarios (2-D: momentum LEVEL × ACCELERATION). Default 'accel' = current flagship.
             _sr = sector_rule
-            if _sr == "accel" or _sr is None:          # top-10 by acceleration (CURRENT)
-                top = a.dropna().sort_values(ascending=False).head(TOP_N).index
+            _tn = top_n or TOP_N                       # concentration: override the number of sectors held
+            if _sr == "accel" or _sr is None:          # top-N by acceleration (CURRENT)
+                top = a.dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "mom6":                        # top-10 by 6mo momentum LEVEL (trend-following)
                 top = m6.dropna().sort_values(ascending=False).head(TOP_N).index
             elif _sr == "up_and_accel":                # up AND accelerating (mom>0 & accel>0), by accel
@@ -703,6 +705,17 @@ def build():
                          and not (pharma and (pd.isna(mktcap_usd.loc[date, h]) or mktcap_usd.loc[date, h] < MICRO_PHARMA_MIN))]
                 g0 = [x for x in cands if bool(low.loc[date, x])] or cands
                 sm = [x for x in g0 if pd.notna(mktcap_usd.loc[date, x]) and mktcap_usd.loc[date, x] < SMALL]
+                _lc_only = (not sm) and bool(g0)       # sector offers ONLY large-caps -> the loss-prone fallback
+                _lc_mom = False
+                if largecap_mode and _lc_only:
+                    # LARGE-CAP FALLBACK FIX (loser analysis: 58% of big losses were cheap-large-cap fallbacks).
+                    if largecap_mode == "skip":
+                        sm = []; g0 = []               # skip large-cap-only sectors (concentrate elsewhere)
+                    elif largecap_mode == "quality":   # require ROE>0 among the large-caps (drop value traps)
+                        _q = [x for x in g0 if pd.notna(roe.loc[date, x]) and roe.loc[date, x] > 0]
+                        g0 = _q or g0
+                    elif largecap_mode == "momentum":  # buy the large-cap WINNER, not the cheapest (VSAT/MU trap)
+                        _lc_mom = True
                 g = (sm or g0) if (small_only or capaware is not None) else g0
                 # active quality gate: bear_gate ONLY when SPY<200d MA (switch selection factor in risk-off); else quality_gate
                 _ag = quality_gate
@@ -764,7 +777,7 @@ def build():
                 # names like VSAT/DDD) -> buy the MOMENTUM leader instead; if the cheap cohort is cash-generative,
                 # keep the VALUE pick. growth_etfs = the old hand-picked override (for the A/B); adaptive_growth
                 # = the principled version we walk-forward.
-                _use_mom = bool(growth_etfs and etf in growth_etfs)
+                _use_mom = bool(growth_etfs and etf in growth_etfs) or _lc_mom
                 if adaptive_growth and g and not _use_mom:
                     _pool5 = sorted(sm, key=lambda h: pb.loc[date, h])[:5] if sm else g[:5]
                     _r = [roe.loc[date, x] for x in _pool5 if pd.notna(roe.loc[date, x])]
@@ -879,6 +892,20 @@ def build():
                 if p in delisted_sector:
                     dl_picks += 1
                 w = CONV if accumulating(p, date) else 1.0
+                if size_mode == "accel":            # bigger bet on the hotter sector (weight ∝ 1+accel)
+                    _ac = accel.loc[date, etf] if etf in accel.columns else np.nan
+                    if pd.notna(_ac):
+                        w *= max(0.3, min(3.0, 1.0 + 1.5 * float(_ac)))
+                elif size_mode in ("upside", "upside_steep", "upside_accel"):   # bigger bet on higher analyst upside
+                    _up = upside_m.loc[date, p] if p in upside_m.columns else np.nan
+                    if pd.notna(_up):
+                        _cap = 5.0 if size_mode == "upside_steep" else 3.0
+                        _mult = (1.0 + float(_up)) ** (1.5 if size_mode == "upside_steep" else 1.0)
+                        w *= max(0.3, min(_cap, _mult))
+                    if size_mode == "upside_accel":      # ALSO tilt by sector accel (stack both sizing signals)
+                        _ac = accel.loc[date, etf] if etf in accel.columns else np.nan
+                        if pd.notna(_ac):
+                            w *= max(0.5, min(2.0, 1.0 + float(_ac)))
                 wsum += w; rr += w * float(r)
                 if ban_first_loss and p not in traded:   # record FIRST-ever trade; ban if it was a loss
                     traded.add(p)
@@ -906,6 +933,12 @@ def build():
                     _qr = qqq_close_m.iloc[i + 1] / qqq_close_m.iloc[i] - 1
                     if np.isfinite(_qr):
                         _mret -= hedge * float(_qr)
+            if cost_bps > 0:            # transaction-cost drag: charge cost_bps on the fraction of the basket
+                turnover = len(held ^ prev_held) / max(1, len(held))   # that turned over (symmetric diff ≈ two-way)
+                _mret -= (cost_bps / 10000.0) * turnover
+            prev_held = set(held)
+            if lev != 1.0:              # leverage: scale the monthly return (return-additive; -100% floor = ruin month)
+                _mret = max(-0.99, lev * _mret)
             rets.append(_mret); spies.append(float(sp)); mrets.append((str(pd.Timestamp(date).date()), float(_mret)))
             if tr is not None:
                 # basket worst intra-month drawdown = weighted mean of each holding's max adverse excursion
@@ -1088,6 +1121,110 @@ def build():
                     base = r["total"]
                 tag = f"({r['total']-base:>+6.0f})" if (base is not None and qg is not None) else ""
                 print(f"    {glab:18}{r['total']:>8.0f}%  Sh{r['sharpe']:>5.2f}  {tag}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("LARGECAP_TEST"):
+        # ── LARGE-CAP FALLBACK FIX (loser analysis: 58% of big losses were cheap-large-cap fallbacks like
+        # MU/VSAT/RIO). When a sector offers ONLY large-caps, test: skip it, quality-gate (ROE>0), or buy the
+        # momentum leader instead of the cheapest. On the full flagship. Walk-forward. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        base = dict(country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True, top_n=7, size_mode="upside")
+        arms = [("flagship (cheap large-cap)", None), ("SKIP large-cap-only sectors", "skip"),
+                ("quality-gate large-caps (ROE>0)", "quality"), ("momentum on large-caps", "momentum")]
+        print("\n=== LARGECAP_TEST (no save): fix the loss-prone large-cap fallback ===", flush=True)
+        print(f"  {'variant':34}" + "".join(f"{w[0]:>13}" for w in wins) + f"{'DD':>8}", flush=True)
+        for lab, lm in arms:
+            cells = []; dd = None
+            for _, sd, ed in wins:
+                r = run(True, True, start_date=sd, end_date=ed, largecap_mode=lm, **base)
+                cells.append(f"{r['total']:>6.0f}% {r['sharpe']:.2f}")
+                if sd is None and ed is None:
+                    dd = r.get("dd")
+            print(f"  {lab:34}" + "".join(f"{c:>13}" for c in cells) + f"{dd:>7.1f}%", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("ROUND2_TEST"):
+        # ── ROUND 2 (user): push the winning conviction-amplification further — steeper/stacked sizing + leverage,
+        # on the new flagship (top-7 + upside-size + hypergrowth-fill). Walk-forward + DD. Costs ignored. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        base = dict(country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True, top_n=7)
+        arms = [("flagship (size-upside)", dict(size_mode="upside")),
+                ("steeper upside (^1.5, cap5)", dict(size_mode="upside_steep")),
+                ("upside × accel (stack sizing)", dict(size_mode="upside_accel")),
+                ("size-upside + 1.3× lev", dict(size_mode="upside", lev=1.3)),
+                ("size-upside + 1.5× lev", dict(size_mode="upside", lev=1.5)),
+                ("steeper + 1.3× lev", dict(size_mode="upside_steep", lev=1.3)),
+                ("pure upside select (w100)", dict(size_mode="upside", value_key="upside"))]
+        print("\n=== ROUND2_TEST (no save): steeper/stacked sizing + leverage on the flagship ===", flush=True)
+        print(f"  {'variant':32}" + "".join(f"{w[0]:>13}" for w in wins) + f"{'DD':>8}", flush=True)
+        for lab, kw in arms:
+            cells = []; dd = None
+            merged = {**base, **kw}
+            for _, sd, ed in wins:
+                r = run(True, True, start_date=sd, end_date=ed, **merged)
+                cells.append(f"{r['total']:>6.0f}% {r['sharpe']:.2f}")
+                if sd is None and ed is None:
+                    dd = r.get("dd")
+            print(f"  {lab:32}" + "".join(f"{c:>13}" for c in cells) + f"{dd:>7.1f}%", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("STACK_TEST"):
+        # ── stack the two IMPROVE winners (top-7 concentration + size-by-analyst-upside), gross AND net of a
+        # realistic 25bps round-trip cost. Walk-forward. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        base = dict(country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True)
+        arms = [("flagship (top-10)", dict()),
+                ("top-7", dict(top_n=7)),
+                ("size-upside", dict(size_mode="upside")),
+                ("top-7 + size-upside", dict(top_n=7, size_mode="upside")),
+                ("top-7 + size-upside + 25bps", dict(top_n=7, size_mode="upside", cost_bps=25)),
+                ("flagship + 25bps (net baseline)", dict(cost_bps=25))]
+        print("\n=== STACK_TEST (no save): stack the winners, gross + net of 25bps ===", flush=True)
+        print(f"  {'variant':34}" + "".join(f"{w[0]:>13}" for w in wins) + f"{'DD':>8}", flush=True)
+        for lab, kw in arms:
+            cells = []; dd = None
+            for _, sd, ed in wins:
+                r = run(True, True, start_date=sd, end_date=ed, **base, **kw)
+                cells.append(f"{r['total']:>6.0f}% {r['sharpe']:.2f}")
+                if sd is None and ed is None:
+                    dd = r.get("dd")
+            print(f"  {lab:34}" + "".join(f"{c:>13}" for c in cells) + f"{dd:>7.1f}%", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("IMPROVE_TEST"):
+        # ── BRAINSTORM batch (user 'try all'): concentration, conviction-sizing, transaction costs. All on the
+        # current flagship (blend + hypergrowth-fill). Walk-forward. ──
+        import sys
+        wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
+                ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
+        base = dict(country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True)
+        arms = [("flagship (top-10, conv2x)", dict()),
+                ("CONCENTRATION top-5", dict(top_n=5)),
+                ("CONCENTRATION top-3", dict(top_n=3)),
+                ("CONCENTRATION top-7", dict(top_n=7)),
+                ("SIZE by accel (top-10)", dict(size_mode="accel")),
+                ("SIZE by upside (top-10)", dict(size_mode="upside")),
+                ("top-5 + size by accel", dict(top_n=5, size_mode="accel")),
+                ("COST 10bps round-trip", dict(cost_bps=10)),
+                ("COST 25bps round-trip", dict(cost_bps=25)),
+                ("COST 50bps round-trip", dict(cost_bps=50)),
+                ("top-5 + COST 25bps", dict(top_n=5, cost_bps=25))]
+        print("\n=== IMPROVE_TEST (no save): concentration / sizing / costs on the flagship ===", flush=True)
+        print(f"  {'variant':30}" + "".join(f"{w[0]:>13}" for w in wins) + f"{'DD':>8}", flush=True)
+        for lab, kw in arms:
+            cells = []; dd = None
+            for _, sd, ed in wins:
+                r = run(True, True, start_date=sd, end_date=ed, **base, **kw)
+                cells.append(f"{r['total']:>6.0f}% {r['sharpe']:.2f}")
+                if sd is None and ed is None:
+                    dd = r.get("dd")
+            print(f"  {lab:30}" + "".join(f"{c:>13}" for c in cells) + f"{dd:>7.1f}%", flush=True)
         sys.exit(0)
 
     if os.environ.get("GROWTH_FB"):
@@ -1698,7 +1835,8 @@ def build():
         # FLAGSHIP is now the CHEAP-P/B × ANALYST-UPSIDE blend (w60) — the one additive lever that beat raw-P/B
         # in both halves + across weights + 4/6 years (2026-08-17, user). Raw-P/B remains as usca_small reference.
         tr = []
-        perf = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True, trace=tr)
+        perf = run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True,
+                   top_n=7, size_mode="upside", largecap_mode="skip", trace=tr)
         out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": "usca_small_upside_pb",
                "perf": {k: perf.get(k) for k in ("total", "annual", "vs_spy", "sharpe", "dd", "t_stat", "months",
                                                  "delisted_picks")},
@@ -1731,8 +1869,13 @@ def build():
         # lever that beat raw P/B in BOTH halves + across weights 30-70% + 4/6 clean years (2026-08-17). Uses the
         # Benzinga implied-upside panel (67% coverage; falls back to cheapest-P/B when no recent target). Caveats:
         # 2 down years (2021/2024), partial coverage, survivorship/window-inflated absolutes, needs true OOS.
-        "usca_small_upside_pb": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True),
-        # reference: the blend WITHOUT the hypergrowth-fill (pure skip) so the fallback's lift stays visible
+        # ⭐ FLAGSHIP (2026-08-18): blend + hypergrowth-fill + TOP-7 concentration + ANALYST-UPSIDE sizing.
+        # 12432% (2× the top-10 blend), LOWER DD −19.3%, positive all windows. top-7 slightly fit; size-upside
+        # is the principled Pareto half. Costs IGNORED per user.
+        "usca_small_upside_pb": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True,
+                                    top_n=7, size_mode="upside", largecap_mode="skip"),
+        # references to keep the levers' lift visible
+        "usca_small_blend_top10": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True),
         "usca_small_blend_nofill": run(True, True, country_ok=_is_usca, value_key="upside_pb_60"),
         # ⭐ REGIME SWITCH (2026-08-17, user): the blend, but when SPY < its 200-day MA (risk-off) tilt the pick
         # toward cash-generative names (FCF-margin quality gate); pure blend when SPY above 200d MA. +287pp full,
