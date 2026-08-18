@@ -36,6 +36,8 @@ SECTOR_ETFS = {
     # REMOVED "Quantum Computing": "QTUM" (2026-08-17, user): thin/hype-driven single-theme sleeve,
     # not a durable sector — high-vol names game the accel rank and pull weak picks into the top-10.
     "Aerospace & Defense": "ITA",
+    # TESTED + REVERTED (2026-08-18): adding "Defense" (XAR) HURT −304pp (6804→6500 FULL, also ex-2020/H2 down,
+    # Sharpe flat). 4th sector-adds-hurt confirmation — we already have ITA; XAR overlaps + games accel. Do NOT re-add.
     "Space": "UFO",
     "Clean Energy": "ICLN",
     "Solar": "TAN",
@@ -196,6 +198,20 @@ SECTOR_ETFS = {
 
     # ── Alts ──
     "Cannabis": "MSOS",
+}
+
+# DEACTIVATED sleeves (2026-08-17, user): kept + their acceleration still CALCULATED and shown for
+# monitoring, but DROPPED from the pickable top-10 and marked "⊘ deactivated" — never traded. These were
+# removed/reverted because they HURT (ARKK worst sleeve; QTUM/SPLV/NLR/GRID game the accel ranking and
+# displace winners — see sector-adds-hurt memory). Backtest results are UNCHANGED vs fully-removed (they
+# never take a pick slot); this just keeps them visible so we can watch what we're deliberately not buying.
+DEACTIVATED_ETFS = {
+    "Ark Innovation": "ARKK",
+    "Ark Genomics": "ARKG",
+    "Quantum Computing": "QTUM",
+    "Low Volatility": "SPLV",
+    "Nuclear & SMR": "NLR",
+    "Grid & Electrification": "GRID",
 }
 
 # Data settings

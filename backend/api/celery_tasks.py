@@ -572,6 +572,21 @@ def run_rotation_picks():
 
 
 @shared_task
+def run_rotation_picks_regime():
+    """Nightly: the OPT-IN 'blend + 200-MA regime' COPY of the live basket (demoted from production but kept
+    for comparison) → BacktestResult[rotation_picks_regime]. Same scan with ROTATION_REGIME=1."""
+    import subprocess, os
+    if not os.path.exists("/app/rotation_pick_scan.py"):
+        return {"error": "not mounted"}
+    env = {**os.environ, "EXPANDED_UNIVERSE": "1", "ROTATION_REGIME": "1"}
+    proc = subprocess.run(["python", "-u", "/app/rotation_pick_scan.py"], cwd="/app", env=env,
+                          capture_output=True, text=True, timeout=1200)
+    if proc.returncode != 0:
+        logger.error("rotation_pick_scan (regime) failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def run_rotation_call():
     """Nightly: the flagship Rotation Call (regime-leader sectors ∩ cheapest-P/B value pick ∩ oversold
     entry; commodity/foreign sleeves pick a producer/foreign name, else the ETF) → BacktestResult."""

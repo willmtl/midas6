@@ -165,6 +165,7 @@ HOLDINGS = {
     },
     # REMOVED "Quantum Computing" (QTUM) 2026-08-17: hype-driven single-theme sleeve. Real semis (STM/MKSI)
     # folded into Semiconductors; pure-quantum names (IONQ/RGTI/QUBT/ARQQ/QBTS) intentionally dropped.
+    # TESTED + REVERTED 2026-08-18: "Defense" (XAR) HURT −304pp (config note + [[sector-adds-hurt]]).
     "Aerospace & Defense": {
         "etf": "ITA",
         "holdings": [

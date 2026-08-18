@@ -105,6 +105,53 @@ def _max_drawdown(rets):
     return float((eq / peak - 1).min() * 100)
 
 
+def _aggregate_trace(tm):
+    """Build the same tearsheet sections the ETF flagship has (leaderboard / industries / best-worst /
+    calendar / equity curve) from the detailed per-month trace."""
+    from collections import defaultdict
+    stk = defaultdict(lambda: {"contrib": 0.0, "n": 0, "rets": [], "industry": "", "company": ""})
+    ind = defaultdict(lambda: {"in_top": 0, "picked": 0, "skipped": 0, "rets": []})
+    allp, curve = [], []
+    eqf = eqs = 1.0
+    yr = defaultdict(lambda: {"s": [], "sp": []})
+    for m in tm:
+        ws = len(m["picks"]) or 1
+        for it in m["top_industries"]:
+            ind[it["industry"]]["in_top"] += 1
+        for sk in m["skipped"]:
+            ind[sk["industry"]]["skipped"] += 1
+        for p in m["picks"]:
+            v = stk[p["ticker"]]
+            v["contrib"] += (1 / ws) * p["ret"]; v["n"] += 1; v["rets"].append(p["ret"])
+            v["industry"] = p["industry"]; v["company"] = p["company"]
+            ind[p["industry"]]["picked"] += 1; ind[p["industry"]]["rets"].append(p["ret"])
+            allp.append({**p, "date": m["date"]})
+        eqf *= (1 + m["basket_ret"])
+        if m["spy_ret"] is not None:
+            eqs *= (1 + m["spy_ret"])
+        curve.append({"d": m["date"], "f": round(eqf * 100000), "s": round(eqs * 100000)})
+        y = m["date"][:4]; yr[y]["s"].append(m["basket_ret"])
+        if m["spy_ret"] is not None:
+            yr[y]["sp"].append(m["spy_ret"])
+    leaderboard = sorted(({"ticker": t, "company": v["company"], "industry": v["industry"], "held": v["n"],
+                           "contrib": round(v["contrib"] * 100, 1), "avg": round(float(np.mean(v["rets"])) * 100, 1),
+                           "win": round(100 * sum(1 for x in v["rets"] if x > 0) / len(v["rets"])) if v["rets"] else 0}
+                          for t, v in stk.items()), key=lambda x: -x["contrib"])
+    industries = sorted(({"industry": n, "in_top": v["in_top"], "picked": v["picked"], "skipped": v["skipped"],
+                          "avg": round(float(np.mean(v["rets"])) * 100, 1) if v["rets"] else None}
+                         for n, v in ind.items()), key=lambda x: -x["picked"])
+    cal = []
+    for y in sorted(yr):
+        s = float(np.prod([1 + x for x in yr[y]["s"]]) - 1) * 100
+        sp = float(np.prod([1 + x for x in yr[y]["sp"]]) - 1) * 100 if yr[y]["sp"] else 0.0
+        cal.append({"year": y, "strategy": round(s, 1), "spy": round(sp, 1),
+                    "excess": round(s - sp, 1), "months": len(yr[y]["s"])})
+    return {"leaderboard": leaderboard, "industries": industries,
+            "best": sorted(allp, key=lambda x: -x["ret"])[:20], "worst": sorted(allp, key=lambda x: x["ret"])[:20],
+            "calendar": cal, "curve": curve, "n_stocks": len(stk),
+            "final_100k_flagship": round(eqf * 100000), "final_100k_spy": round(eqs * 100000)}
+
+
 def _annualized_sharpe(rets):
     r = pd.Series(rets).dropna()
     if r.std() == 0 or len(r) < 3:
@@ -175,10 +222,13 @@ def build():
 
     ind_cols = {name: [t for t in ts if t in common] for name, ts in members.items()}
 
+    meta = finviz_config.ticker_meta()
+
     def run(top_k=10, start=None, end=None, min_mktcap=3e8, require_profit=False,
-            min_dvol=0.0, pb_floor=MIN_PB, value_key="pb"):   # DEFAULT floor $300M; value_key "pb" or "blend"
+            min_dvol=0.0, pb_floor=MIN_PB, value_key="pb", trace=False):   # DEFAULT floor $300M; value_key "pb"/"blend"
         rets = []
         picks_log = []
+        tmonths = []          # detailed per-month record (only when trace=True)
         idx = [d for d in midx[WARMUP:-1]]
         for d in idx:
             if start and d < pd.Timestamp(start):
@@ -186,6 +236,7 @@ def build():
             if end and d > pd.Timestamp(end):
                 continue
             i = midx.get_loc(d)
+            ndate = midx[i + 1]
             row = accel.loc[d].dropna()
             if row.empty:
                 continue
@@ -193,7 +244,12 @@ def build():
             held = set()
             month_rets = []
             month_names = []
+            t_top, t_picks, t_skips = [], [], []
             for name in top:
+                if trace:
+                    _ir = ind_ret.loc[ndate, name] if name in ind_ret.columns else np.nan
+                    t_top.append({"industry": name, "accel": float(accel.loc[d, name]) if name in accel.columns else None,
+                                  "ind_ret": (float(_ir) if pd.notna(_ir) else None)})
                 cands = []
                 for t in ind_cols.get(name, []):
                     if t in held:
@@ -218,6 +274,8 @@ def build():
                     p_up = upside.loc[d, t] if (not upside.empty and t in upside.columns) else np.nan
                     cands.append((t, float(p_pb), (float(p_up) if pd.notna(p_up) else None)))
                 if not cands:
+                    if trace:
+                        t_skips.append({"industry": name, "reason": "no qualifying small-cap value name (P/B, $300M size, price)"})
                     continue                                                   # SKIP (same as flagship)
                 if value_key == "blend":     # 60% analyst-upside + 40% cheap-P/B rank blend; fallback cheapest-P/B
                     q = [(ct, cpb, cup) for ct, cpb, cup in cands if cup is not None]
@@ -233,22 +291,37 @@ def build():
                 p0 = as_traded.loc[d, t]
                 p1 = as_traded.iloc[i + 1][t] if t in as_traded.columns else np.nan
                 if pd.notna(p0) and pd.notna(p1) and p0 > 0:
-                    month_rets.append(p1 / p0 - 1.0)
+                    _r = p1 / p0 - 1.0
+                    month_rets.append(_r)
                     month_names.append(t)
+                    if trace:
+                        _mc = mktcap.loc[d, t] if t in mktcap.columns else np.nan
+                        _up = upside.loc[d, t] if (not upside.empty and t in upside.columns) else np.nan
+                        t_picks.append({"ticker": t, "industry": name,
+                                        "company": meta.get(t, {}).get("company", ""),
+                                        "pb": round(float(pb.loc[d, t]), 2) if pd.notna(pb.loc[d, t]) else None,
+                                        "mktcap": (float(_mc) if pd.notna(_mc) else None),
+                                        "roe": round(float(roe.loc[d, t]), 3) if (t in roe.columns and pd.notna(roe.loc[d, t])) else None,
+                                        "upside": round(float(_up), 3) if pd.notna(_up) else None,
+                                        "ret": round(_r, 4)})
             if month_rets:
                 br = float(np.mean(month_rets))
                 rets.append(br)
+                _spy = float(spy_ret.loc[ndate]) if pd.notna(spy_ret.loc[ndate]) else None
                 picks_log.append({"date": str(d.date()), "n": len(month_names),
                                   "picks": month_names, "ret": round(br * 100, 2),
-                                  "spy": round(float(spy_ret.loc[midx[i + 1]]) * 100, 2)
-                                  if pd.notna(spy_ret.loc[midx[i + 1]]) else None})
+                                  "spy": round(_spy * 100, 2) if _spy is not None else None})
+                if trace:
+                    tmonths.append({"date": str(d.date()), "ndate": str(ndate.date()),
+                                    "basket_ret": br, "spy_ret": _spy,
+                                    "top_industries": t_top, "picks": t_picks, "skipped": t_skips})
         total = (np.prod([1 + r for r in rets]) - 1) * 100 if rets else 0.0
         # matched SPY over the same months
         sp = [picks_log[k]["spy"] / 100 for k in range(len(picks_log)) if picks_log[k]["spy"] is not None]
         spy_total = (np.prod([1 + r for r in sp]) - 1) * 100 if sp else 0.0
         return {"total": round(total, 1), "spy_total": round(spy_total, 1),
                 "sharpe": round(_annualized_sharpe(rets), 2), "dd": round(_max_drawdown(rets), 1),
-                "months": len(rets), "picks_log": picks_log}
+                "months": len(rets), "picks_log": picks_log, "tmonths": tmonths}
 
     wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
             ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
@@ -256,7 +329,7 @@ def build():
     print(f"  {'window':12}{'finviz%':>12}{'SPY%':>10}{'Sharpe':>8}{'months':>8}", flush=True)
     full = None
     for lab, sd, ed in wins:
-        r = run(top_k=10, start=sd, end=ed, value_key="blend")   # v2 default = $300M floor + analyst-upside blend
+        r = run(top_k=10, start=sd, end=ed, value_key="blend", trace=(lab == "FULL"))  # v2 default = $300M floor + blend
         if lab == "FULL":
             full = r
         print(f"  {lab:12}{r['total']:>11.0f}%{r['spy_total']:>9.0f}%{r['sharpe']:>8.2f}{r['dd']:>8.1f}%{r['months']:>7}", flush=True)
@@ -305,10 +378,12 @@ def build():
                  "liquidity filters the ETF gives for free (profit gate ROE>0, size floor, dollar-volume "
                  "liquidity, P/B distress floor) — see tightening_sweep. Shares only the data/PIT library."),
         "universe": {"industries": ind_ret.shape[1], "tickers": len(all_t), "with_fundamentals": len(common)},
-        "full": {k: v for k, v in full.items() if k != "picks_log"},
+        "full": {k: v for k, v in full.items() if k not in ("picks_log", "tmonths")},
         "tightening_sweep": sweep,
         "best_variant": (best[1] if best else None),
         "picks_log": full["picks_log"],
+        "sections": _aggregate_trace(full.get("tmonths", [])),
+        "tmonths": full.get("tmonths", []),
     }))
     print("\nsaved BacktestResult[finviz_rotation]", flush=True)
 

@@ -265,6 +265,10 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_rotation_call",
         "schedule": crontab(hour=22, minute=7),
     },
+    "rotation-picks-regime-nightly": {  # opt-in blend+200MA-regime COPY of the live basket (kept for comparison)
+        "task": "api.celery_tasks.run_rotation_picks_regime",
+        "schedule": crontab(hour=22, minute=9),
+    },
     "live-conviction-nightly": {        # score live basket 0-5, tag perfect plays — after picks — 22:12 UTC
         "task": "api.celery_tasks.run_live_conviction",
         "schedule": crontab(hour=22, minute=12),

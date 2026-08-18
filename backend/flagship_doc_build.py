@@ -36,92 +36,160 @@ except Exception as _e:
 
 
 def _build_finviz_pane():
-    """The Finviz-version tab: separate engine, head-to-head vs the ETF arms, status = iterating."""
-    _armlab = [("usca_small_bear_fcf", "ETF · blend + 200-MA regime", False),
-               ("usca_small_upside_pb", "ETF · analyst-upside × P/B blend", False),
-               ("usca_small", "ETF · raw cheapest-P/B (apples-to-apples)", False),
-               ("usca_small_proxy", "ETF · buy-the-skipped-ETF (refuted)", False)]
+    """The Finviz-version tab — the SAME sections as the ETF flagship (KPIs, head-to-head, by-year,
+    leaderboard, industries, best/worst, full blotter), built from the engine's detailed trace."""
+    if not FINVIZ:
+        return ('<div class="mpane" id="mpane-finviz" hidden><header class="mast">'
+                '<h1>Finviz Industry Rotation</h1><p class="sub">Pending — run finviz_rotation_study.py.</p>'
+                '</header></div>')
+    f = FINVIZ["full"]
+    u = FINVIZ.get("universe", {})
+    sec = FINVIZ.get("sections", {}) or {}
+    tmonths = FINVIZ.get("tmonths", [])
+
+    # ── head-to-head vs the ETF arms ──
+    _armlab = [("usca_small_upside_pb", "ETF · analyst-upside × P/B blend (live default)"),
+               ("usca_small", "ETF · raw cheapest-P/B (apples-to-apples)"),
+               ("usca_small_bear_fcf", "ETF · blend + 200-MA regime (demoted — dropped from production)"),
+               ("usca_small_proxy", "ETF · buy-the-skipped-ETF (refuted)")]
     rows = ""
-    for k, lab, _ in _armlab:
+    for k, lab in _armlab:
         v = ETF_ARMS.get(k)
         if v:
             rows += (f'<tr><td class="l sec" style="max-width:none">{lab}</td>'
-                     f'<td class="num">{v.get("total", 0):,.0f}%</td>'
-                     f'<td class="num">{v.get("sharpe", "—")}</td></tr>')
-    if FINVIZ:
-        f = FINVIZ["full"]
-        u = FINVIZ.get("universe", {})
-        rows += (f'<tr style="background:color-mix(in srgb,var(--gold) 12%,transparent)">'
-                 f'<td class="l sec strong" style="max-width:none">Finviz · industry rotation (v1)</td>'
-                 f'<td class="num strong">{f["total"]:,.0f}%</td>'
-                 f'<td class="num strong">{f["sharpe"]}</td></tr>')
-        kpis = [("Total return", f'{f["total"]:,.0f}%', "raw P/B, v1"),
-                ("Sharpe", f'{f["sharpe"]}', f'{f["months"]} months'),
-                ("Industries used", f'{u.get("industries", "—")}', "of 149 (≥3 members)"),
-                ("Names w/ fundamentals", f'{u.get("with_fundamentals", "—")}', f'of {u.get("tickers", "—"):,} US/CA')]
-        picks = FINVIZ.get("picks_log", [])[-12:]
+                     f'<td class="num">{v.get("total", 0):,.0f}%</td><td class="num">{v.get("sharpe", "—")}</td></tr>')
+    rows += (f'<tr style="background:color-mix(in srgb,var(--gold) 12%,transparent)">'
+             f'<td class="l sec strong" style="max-width:none">Finviz · industry rotation v2 ($300M floor + blend)</td>'
+             f'<td class="num strong">{f["total"]:,.0f}%</td><td class="num strong">{f["sharpe"]}</td></tr>')
 
-        def _prow(p):
-            spy = "—" if p.get("spy") is None else f'{p["spy"]:+.1f}%'
-            cls = "pos" if (p["ret"] or 0) >= 0 else "neg"
-            return (f'<tr><td class="l mono">{esc(p["date"])}</td><td class="num">{p["n"]}</td>'
-                    f'<td class="l sec" style="max-width:none">{esc(", ".join(p["picks"]))}</td>'
-                    f'<td class="num {cls}">{p["ret"]:+.1f}%</td>'
-                    f'<td class="num mut">{spy}</td></tr>')
-        prows = "".join(_prow(p) for p in picks)
-    else:
-        kpis = [("Status", "pending", "run finviz_rotation_study.py")]
-        prows = ""
-    kpi_html = "".join(f'<div class="kpi"><div class="k">{esc(k)}</div><div class="v">{v}</div>'
-                       f'<div class="d">{esc(dd)}</div></div>' for k, v, dd in kpis)
-    sweep = FINVIZ.get("tightening_sweep") if FINVIZ else None
-    sweep_block = ""
-    if sweep:
-        srows = ""
-        for s in sweep:
-            hot = "font-weight:700;background:color-mix(in srgb,var(--gold) 12%,transparent)" if s["variant"].startswith("size floor $300M") else ""
-            srows += (f'<tr style="{hot}"><td class="l sec" style="max-width:none">{esc(s["variant"])}</td>'
-                      f'<td class="num">{s["full"]:,.0f}%</td><td class="num">{s["h1"]:,.0f}%</td>'
-                      f'<td class="num">{s["h2"]:,.0f}%</td><td class="num">{s["sharpe"]}</td></tr>')
-        sweep_block = (f'<section><div class="shead"><h2>Rebuilding the ETF’s implicit filter</h2>'
-                       f'<span class="cnt">walk-forward: FULL / H1 / H2</span></div>'
-                       f'<p class="lede">The ETF version gets quality screening for free (index-inclusion rules drop nano-caps, '
-                       f'shells, illiquid junk). Finviz has no gatekeeper, so we rebuild it explicitly. The winner is a '
-                       f'<b>$300M minimum-size floor</b> (nano-caps were the value traps); a profitability gate and a liquidity '
-                       f'gate both <b>hurt</b> — the small-cap value winners are often cash-burning growth.</p>'
-                       f'<div class="tablecard"><div class="scrollx"><table>'
-                       f'<thead><tr><th class="l">Selection rule</th><th>FULL</th><th>H1</th><th>H2</th><th>Sharpe</th></tr></thead>'
-                       f'<tbody>{srows}</tbody></table></div></div></section>')
-    picks_block = (f'<section><div class="shead"><h2>Recent monthly picks</h2>'
-                   f'<span class="cnt">last {len(FINVIZ.get("picks_log", [])[-12:])} rebalances</span></div>'
-                   f'<div class="tablecard"><div class="scrollx"><table>'
-                   f'<thead><tr><th class="l">Month</th><th>N</th><th class="l">Picks (cheapest-P/B per top industry)</th>'
-                   f'<th>Basket</th><th>SPY</th></tr></thead><tbody>{prows}</tbody></table></div></div></section>'
-                   ) if prows else ""
+    fk = round(sec.get("final_100k_flagship", 0))
+    sk = round(sec.get("final_100k_spy", 0))
+    kpis = [("Total return", f'{f["total"]:,.0f}%', f'$100k → ${fk:,}'),
+            ("Sharpe", f'{f["sharpe"]}', f'{f.get("months","?")} months'),
+            ("Max drawdown", f'{f.get("dd","—")}%', "monthly"),
+            ("Industries used", f'{u.get("industries", "—")}', "of 149 (≥3 members)"),
+            ("Names traded", f'{sec.get("n_stocks","—")}', f'{u.get("with_fundamentals","—")} w/ fundamentals')]
+    kpi_html = "".join(kpi_tile(k, v, dd, hero=(i == 0)) for i, (k, v, dd) in enumerate(kpis))
+
+    # ── by-year calendar ──
+    cal_rows = "".join(
+        f'<tr><td class="l mono">{c["year"]}</td><td class="num">{pctp(c["strategy"])}</td>'
+        f'<td class="num">{pctp(c["spy"])}</td><td class="num">{pctp(c["excess"])}</td>'
+        f'<td class="num mut">{c["months"]}</td></tr>' for c in sec.get("calendar", []))
+
+    # ── leaderboard (top stocks by contribution) ──
+    lb_rows = "".join(
+        f'<tr><td class="l"><span class="tk">{esc(x["ticker"])}</span></td>'
+        f'<td class="l nm">{esc(x["company"])}</td><td class="l sec">{esc(x["industry"])}</td>'
+        f'<td class="num">{x["held"]}</td><td class="num">{winfmt(x["win"])}</td>'
+        f'<td class="num">{pctp(x["avg"])}</td><td class="num strong">{pctp(x["contrib"])}</td></tr>'
+        for x in sec.get("leaderboard", [])[:60])
+
+    # ── industries ──
+    ind_rows = "".join(
+        f'<tr><td class="l nm" style="max-width:none">{esc(x["industry"])}</td>'
+        f'<td class="num">{x["in_top"]}</td><td class="num">{x["picked"]}</td>'
+        f'<td class="num">{x["skipped"] or "<span class=mut>0</span>"}</td>'
+        f'<td class="num">{pctp(x["avg"]) if x["avg"] is not None else "<span class=mut>—</span>"}</td></tr>'
+        for x in sec.get("industries", []))
+
+    def bw_rows(lst):
+        return "".join(
+            f'<tr><td class="l mono">{esc(p["date"])}</td><td class="l"><span class="tk">{esc(p["ticker"])}</span></td>'
+            f'<td class="l nm">{esc(p.get("company",""))}</td><td class="l sec">{esc(p["industry"])}</td>'
+            f'<td class="num">{pbfmt(p.get("pb"))}</td><td class="num">{roefmt(p.get("roe"))}</td>'
+            f'<td class="num strong">{pctp(round((p["ret"] or 0)*100,1))}</td></tr>' for p in lst)
+
+    # ── full blotter (industry ranking strip + holdings) ──
+    def fv_chips(m):
+        pick_by = {p["industry"]: p for p in m["picks"]}
+        skip_ind = {s["industry"] for s in m["skipped"]}
+        out = []
+        for i, ts in enumerate(m["top_industries"], 1):
+            nm, acc, ir = ts["industry"], ts.get("accel"), ts.get("ind_ret")
+            head = (f'<span class="rk">#{i}</span><b>{esc(nm)}</b> '
+                    f'<span class="acc" title="acceleration — the ranking signal, NOT a return">accel '
+                    f'{acc*100:+.1f}%</span>' if acc is not None else f'<span class="rk">#{i}</span><b>{esc(nm)}</b>')
+            slv = "" if ir is None else f' <span class="slv">industry <span class="{"pos" if ir>=0 else "neg"}">{ir*100:+.1f}%</span></span>'
+            if nm in pick_by:
+                p = pick_by[nm]
+                _dv = ""
+                if p["ret"] is not None and ir is not None:
+                    _d = (p["ret"] - ir) * 100
+                    _dv = (f' <span class="dvs" title="Stock-selection edge = the stock we bought MINUS what the industry index alone returned.">'
+                           f'(<span class="{"pos" if _d>=0 else "neg"}">{_d:+.1f}pp</span> vs industry)</span>')
+                out.append(f'<span class="chip pick" title="Ranked #{i} because the industry accelerated (accel is the SELECTION signal, not a return). '
+                           f'Inside it we bought {esc(p["ticker"])} at P/B {p.get("pb")} on the {esc(m["date"])} close and sold on the {esc(m["ndate"])} close — that pick returned {(p["ret"] or 0)*100:+.1f}% (can differ from the industry; accel ≠ outcome).">'
+                           f'{head}{slv} → bought <span class="tk">{esc(p["ticker"])}</span> {pct((p["ret"] or 0))}{_dv}</span>')
+            elif nm in skip_ind:
+                out.append(f'<span class="chip skip" title="no qualifying small-cap value name; industry ETF-equivalent returned this month — not held">'
+                           f'{head} <span class="xm">⊘ skipped</span>{slv}</span>')
+            else:
+                out.append(f'<span class="chip">{head}{slv}</span>')
+        return "".join(out)
+
+    blot = []
+    for m in tmonths:
+        npos = len(m["picks"]); nskip = len(m["skipped"])
+        exc = ((m["basket_ret"] or 0) - (m["spy_ret"] or 0)) * 100
+        blot.append(
+            f'<tr class="mhdr"><td class="l mono" colspan="3"><b>bought {esc(m["date"])} close → sold {esc(m["ndate"])} close</b> · {npos} holding{"s" if npos!=1 else ""} · {nskip} skipped</td>'
+            f'<td class="num" colspan="2">SPY {pct(m["spy_ret"])}</td>'
+            f'<td class="num" colspan="2">basket <b>{pct(m["basket_ret"])}</b> <span class="{"pos" if exc>=0 else "neg"}">({exc:+.1f})</span></td></tr>'
+            f'<tr class="srow"><td colspan="7"><div class="chips">{fv_chips(m)}</div></td></tr>')
+        for p in sorted(m["picks"], key=lambda x: -(x["ret"] or -9)):
+            blot.append(
+                f'<tr><td class="l"><span class="tk">{esc(p["ticker"])}</span></td><td class="l nm">{esc(p.get("company",""))}</td>'
+                f'<td class="l sec">{esc(p["industry"])}</td><td class="num">{pbfmt(p.get("pb"))}</td>'
+                f'<td class="num">{roefmt(p.get("roe"))}</td><td class="num">{cap(p.get("mktcap"))}</td>'
+                f'<td class="num">{pct((p["ret"] or 0))}</td></tr>')
+
+    sweep = FINVIZ.get("tightening_sweep") or []
+    srows = "".join(
+        f'<tr style="{"font-weight:700;background:color-mix(in srgb,var(--gold) 12%,transparent)" if s["variant"].startswith("size floor $300M") else ""}">'
+        f'<td class="l sec" style="max-width:none">{esc(s["variant"])}</td><td class="num">{s["full"]:,.0f}%</td>'
+        f'<td class="num">{s["h1"]:,.0f}%</td><td class="num">{s["h2"]:,.0f}%</td><td class="num">{s["sharpe"]}</td></tr>'
+        for s in sweep)
+
     return f"""
   <div class="mpane" id="mpane-finviz" hidden>
     <header class="mast">
-      <p class="eyebrow">Finviz Version · Industry Rotation <span class="statuspill">v1 · iterating</span></p>
+      <p class="eyebrow">Finviz Version · Industry Rotation <span class="statuspill">v2</span></p>
       <h1>Rotating the Finviz Industry Map</h1>
-      <p class="sub">A separate engine that ranks all <b>149 Finviz industries</b> (11 sectors, 11,574 scraped names) by the same momentum acceleration, then buys the cheapest-P/B small-cap inside the hottest ones. Shares only the point-in-time data library with the ETF version — never its logic.</p>
+      <p class="sub">A separate engine that ranks all <b>149 Finviz industries</b> ({u.get("with_fundamentals","?")} names with fundamentals) by momentum <b>acceleration</b>{hint("accel")}, then buys the cheapest-P/B × analyst-upside <b>blend</b>{hint("blend")} small-cap inside the hottest ones. Shares only the point-in-time data library with the ETF version — never its logic.</p>
+      <div class="headline"><div class="bignum">+{f["total"]:,.0f}%</div>
+        <div class="bigsub"><span class="a">$100k → ${fk:,}</span><span class="b">{f.get("months","?")} months · Sharpe {f["sharpe"]} · vs SPY ${sk:,}</span></div>
+        <span class="codechip">v2 · $300M floor + blend</span></div>
     </header>
-    <div class="banner">
-      <b>Work in progress — kept intentionally.</b> This v1 sees only the ~{FINVIZ["universe"]["with_fundamentals"] if FINVIZ else 645} names that already have fundamentals; a backfill is loading the other ~9,000 US names so the industry breadth becomes real. v1 is also survivorship-optimistic (no delisted handling yet) and raw-P/B only (the analyst-upside blend + regime levers aren't ported yet). Numbers will move.
-    </div>
+    <div class="banner"><b>Honest read.</b> Full breadth realized ({sec.get("n_stocks","?")} names traded across {u.get("industries","?")} industries). It beats SPY on a totally separate universe — real cross-validation — but at ~1/10th the ETF flagship's return: the ETF's edge is its <b>curated thematic sleeves</b> (Gold/Clean-Energy/Uranium), which the generic GICS industry map fragments. Still survivorship-optimistic (no delisted handling yet).</div>
     <div class="kpis" style="grid-template-columns:repeat({len(kpis)},1fr)">{kpi_html}</div>
-    <section>
-      <div class="shead"><h2>Head-to-head — same window, same rules</h2><span class="cnt">total return · Sharpe</span></div>
-      <p class="lede">Both engines: rank momentum acceleration → buy the cheapest-P/B small-cap US/CA in the top sleeves, monthly. The only difference is the <b>rotation map</b> — 91 hand-picked ETFs vs 149 Finviz industries. Apples-to-apples is <b>ETF raw-P/B vs Finviz v1</b>; the ETF blend/regime rows show the tuned levers not yet ported.</p>
-      <div class="tablecard"><div class="scrollx"><table>
-        <thead><tr><th class="l">Method</th><th>Total</th><th>Sharpe</th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table></div></div>
-    </section>
-    {sweep_block}
-    {picks_block}
-    <footer class="foot">
-      <p><b>Finviz engine.</b> <span class="mono">finviz_rotation_study.py</span> + <span class="mono">finviz_config.py</span>, fed by <span class="mono">scrape_finviz_universe.py</span> (11 sectors → 149 industries → 11,574 US/CA-inclusive names, scraped from the Finviz screener, all pages). Industry momentum = equal-weight constituent index; pick = cheapest point-in-time P/B small-cap (&lt;$2B), $50M market-cap floor, monthly rebalance. v1 caveats: survivorship-optimistic (no delisted exits), FX unadjusted, fundamentals coverage still filling in. This tab will be enriched as the engine matures.</p>
-    </footer>
+
+    <section><div class="shead"><h2>Head-to-head vs the ETF flagship</h2><span class="cnt">total · Sharpe</span></div>
+      <p class="lede">Same rules (accel → cheap-value small-cap, monthly); the only difference is the <b>rotation map</b> (91 curated ETFs vs 149 Finviz industries) and, for the top rows, the ETF's tuned levers.</p>
+      <div class="tablecard"><div class="scrollx"><table><thead><tr><th class="l">Method</th><th>Total</th><th>Sharpe</th></tr></thead><tbody>{rows}</tbody></table></div></div></section>
+
+    <section><div class="shead"><h2>By year</h2><span class="cnt">Finviz vs S&amp;P 500</span></div>
+      <div class="tablecard"><div class="scrollx"><table class="sortable"><thead><tr><th class="l">Year</th><th>Finviz</th><th>S&amp;P 500</th><th>Excess</th><th>Mo</th></tr></thead><tbody>{cal_rows}</tbody></table></div></div></section>
+
+    <section><div class="shead"><h2>Rebuilding the ETF’s implicit filter</h2><span class="cnt">walk-forward: FULL / H1 / H2</span></div>
+      <p class="lede">The ETF gets quality screening free (index inclusion drops nano-caps/shells/illiquid junk). Finviz has no gatekeeper, so we rebuild it: the winner is a <b>$300M size floor</b> (nano-caps were the value traps); profit + liquidity gates <b>hurt</b>.</p>
+      <div class="tablecard"><div class="scrollx"><table><thead><tr><th class="l">Selection rule</th><th>FULL</th><th>H1</th><th>H2</th><th>Sharpe</th></tr></thead><tbody>{srows}</tbody></table></div></div></section>
+
+    <section><div class="shead"><h2>Stock leaderboard</h2><span class="cnt">{sec.get("n_stocks","?")} names · by contribution</span></div>
+      <div class="tablecard"><div class="scrolly"><table class="sortable"><thead><tr>{th("Ticker","l")}{th("Company","l")}{th("Industry","l")}{th("Held")}{th("Win%")}{th("Avg&nbsp;ret")}{th("Contrib.")}</tr></thead><tbody>{lb_rows}</tbody></table></div></div></section>
+
+    <section><div class="shead"><h2>Industries</h2><span class="cnt">ranked into the top-10</span></div>
+      <div class="tablecard"><div class="scrolly"><table class="sortable"><thead><tr>{th("Industry","l")}{th("In&nbsp;top-10")}{th("Picked")}{th("Skipped")}{th("Avg&nbsp;pick&nbsp;ret")}</tr></thead><tbody>{ind_rows}</tbody></table></div></div></section>
+
+    <section><div class="shead"><h2>Best &amp; worst single months</h2></div>
+      <div class="tablecard"><div class="scrollx"><table class="sortable"><thead><tr><th class="l" colspan="7" style="color:var(--pos)">▲ Best picks</th></tr><tr>{th("Month","l")}{th("Ticker","l")}{th("Company","l")}{th("Industry","l")}{th("P/B")}{th("ROE")}{th("Return")}</tr></thead><tbody>{bw_rows(sec.get("best",[]))}</tbody></table></div></div>
+      <div class="tablecard"><div class="scrollx"><table class="sortable"><thead><tr><th class="l" colspan="7" style="color:var(--neg)">▼ Worst picks</th></tr><tr>{th("Month","l")}{th("Ticker","l")}{th("Company","l")}{th("Industry","l")}{th("P/B")}{th("ROE")}{th("Return")}</tr></thead><tbody>{bw_rows(sec.get("worst",[]))}</tbody></table></div></div></section>
+
+    <section><div class="shead"><h2>Full blotter</h2><span class="cnt">{len(tmonths)} months</span></div>
+      <p class="lede">Bought at each month-end close, sold at the next. Each chip carries up to <b>three different numbers</b>: <b>accel ±x%</b> = the industry's momentum acceleration (the <i>ranking signal</i> — why it's in the top-10, <b>NOT a return</b>); <b>industry ±x%</b> = what that industry's equal-weight index actually returned that month; and <b>bought TICKER ±x%</b> = what the specific small-cap we bought returned. A high accel does <b>not</b> mean the pick went up — e.g. an industry can accelerate +95% and the pick still fall (acceleration is trailing; hot themes mean-revert). Over many months the selection wins on average; any single month is noisy.</p>
+      <div class="tablecard"><div class="scrolly"><table><thead><tr>{th("Ticker","l")}{th("Company","l")}{th("Industry","l")}{th("P/B")}{th("ROE")}{th("Mkt&nbsp;cap")}{th("Return")}</tr></thead><tbody>{"".join(blot)}</tbody></table></div></div></section>
+
+    <footer class="foot"><p><b>Finviz engine.</b> <span class="mono">finviz_rotation_study.py</span> + <span class="mono">finviz_config.py</span>, fed by <span class="mono">scrape_finviz_universe.py</span>. Industry momentum = equal-weight constituent index; pick = $300M-floor small-cap ranked 60% analyst-upside + 40% cheap-P/B, monthly. Survivorship-optimistic (no delisted exits yet), FX unadjusted. Shares only the data/PIT library with the ETF flagship.</p></footer>
   </div>
 """
 
@@ -248,16 +316,64 @@ TIP = {
     "Avg pick ret": "Average realized next-month return of picks drawn from this sleeve.",
     "Month": "Rebalance date the pick was bought.",
     "Return": "Realized next-month return of the pick (purchase-month close to next rebalance).",
+    # ── Finviz-tab headers ──
+    "Industry": "Finviz industry (of 149) whose equal-weight constituent index accelerated into the momentum top-10 when this name was picked.",
+    "Method": "The rotation engine / arm being compared head-to-head.",
+    "Total": "Total COMPOUNDED return over the full backtest window (not annualized). Leans on a few winners + 2020-21; read as a range, not a point.",
+    "Sharpe": "Annualized Sharpe = mean monthly return ÷ its standard deviation × √12. Risk-adjusted return; higher = smoother ride.",
+    "Year": "Calendar year.",
+    "Finviz": "The Finviz industry-rotation engine's compounded return that year.",
+    "S&P 500": "SPY total return over the same rebalance months.",
+    "Strategy": "The flagship's compounded return that year.",
+    "Excess": "Strategy return minus SPY that year — out- (green) or under- (red) performance.",
+    "Mo": "Number of monthly rebalances that year.",
+    "Selection rule": "The stock-selection filter/lever tested inside the top-accel industries (the ETF's 'implicit filter' rebuilt explicitly).",
+    "FULL": "Full backtest window (all months).",
+    "H1": "First walk-forward half (through 2022-12).",
+    "H2": "Second walk-forward half (2023-01 →). A lever must hold in BOTH halves to be trusted, not just full-sample.",
+    "In&nbsp;top-10": "How many months this sleeve/industry ranked into the momentum top-10 by acceleration.",
+    "Avg&nbsp;ret": "Average realized next-month return across every month this name was held.",
+    "Avg&nbsp;pick&nbsp;ret": "Average realized next-month return of picks drawn from this sleeve/industry.",
+    # ── KPI tiles ──
+    "Total return": "Total compounded return over the full window ($100k → final value). Not annualized; not a forward forecast.",
+    "Max drawdown": "Largest peak-to-trough drop of the monthly equity curve. Less negative = shallower worst loss.",
+    "Max DD": "Largest peak-to-trough drop of the monthly equity curve.",
+    "Industries used": "How many of the 149 Finviz industries had ≥3 members with price history, so a stable momentum index could be built.",
+    "Names traded": "Distinct stocks bought at least once across the backtest.",
+    "Names w/ fundamentals": "Universe names that have point-in-time quarterly financials (needed to compute P/B), of the US/CA total.",
+    "CAGR": "Compound annual growth rate — the constant yearly rate that compounds to the total return.",
+    # ── signals / terms (inline ?) ──
+    "accel": "ACCELERATION — the ranking signal, NOT a return or forecast. This period's 3-month momentum minus the prior 3-month's; high = money is rushing in right now. It's why a sleeve is in the top-10; it does not predict the pick's next-month return.",
+    "blend": "The selection rule: rank the qualifying small-caps 60% by analyst implied-upside (mean price target ÷ price − 1) + 40% by cheap P/B; pick the best combined rank.",
+    "regime": "SPY vs its own 200-day moving average. In the DEMOTED 'blend + regime' variant, a bear regime (SPY below 200-MA) tilts picks toward high-FCF-margin names. Dropped from production (didn't cross-validate).",
+    "conviction": "2× basket weight when the name shows Accumulation/Distribution accumulation into price weakness — smart money buying the dip.",
+    "deactivated": "A retired sleeve (ARKK/QTUM/SPLV/Nuclear/Grid) whose acceleration we still calculate and display for monitoring, but never trade.",
+    "sleeve": "The sector ETF (ETF tab) or equal-weight industry index (Finviz tab) whose acceleration defines a rotatable unit.",
+    "skipped": "The sleeve was in the top-10 but had no qualifying small-cap value stock (raw commodity/bond/foreign, or nothing cleared the filters) — the slot is passed and its weight redistributes to the other picks.",
 }
 
 
 def th(label, cls=""):
     """Header cell with a hover/focus '?' tooltip pulled from TIP (keyed by the plain label)."""
-    tip = TIP.get(label.replace("&nbsp;", " "), "")
+    tip = TIP.get(label.replace("&nbsp;", " "), "") or TIP.get(label, "")
     c = f' class="{cls}"' if cls else ""
     hint = (f'<span class="hint" title="{esc(tip)}" aria-label="{esc(tip)}" tabindex="0">?</span>'
             if tip else "")
     return f'<th{c}>{label}{hint}</th>'
+
+
+def hint(key, txt=None):
+    """Standalone '?' tooltip for inline use (KPI labels, signal terms). Looks up TIP by key unless txt given."""
+    tip = txt or TIP.get(key, "")
+    if not tip:
+        return ""
+    return f'<span class="hint" title="{esc(tip)}" aria-label="{esc(tip)}" tabindex="0">?</span>'
+
+
+def kpi_tile(k, v, dd, hero=False):
+    """A KPI tile with a '?' tooltip on its label (from TIP)."""
+    return (f'<div class="kpi{" hero" if hero else ""}"><div class="k">{esc(k)}{hint(k)}</div>'
+            f'<div class="v">{v}</div><div class="d">{esc(dd)}</div></div>')
 
 
 # ---------- equity curve ----------
@@ -376,27 +492,65 @@ def sector_chips(m):
     """One chip per top-10 accelerating sector this month: name + acceleration, then either the value name it
     resolved to (✓) or the reason the slot was skipped (⊘). This is the 'from the sector to the stock, and
     why skipped' trail the reader asked for."""
+    def sret(r):   # the sleeve ETF's own return this month (what it "would have made")
+        if r is None:
+            return ""
+        cls = "pos" if r >= 0 else "neg"
+        return f' <span class="slv">sleeve <span class="{cls}">{r*100:+.1f}%</span></span>'
+
+    def dvs(pr, sr):   # stock-selection edge: what we made on the stock MINUS just holding the sleeve ETF
+        if pr is None or sr is None:
+            return ""
+        d = (pr - sr) * 100
+        cls = "pos" if d >= 0 else "neg"
+        return (f' <span class="dvs" title="Stock-selection edge = the stock we bought MINUS what the sleeve ETF alone returned. '
+                f'Positive = picking the value stock beat just buying the sector ETF.">(<span class="{cls}">{d:+.1f}pp</span> vs ETF)</span>')
     pick_by_etf = {p["etf"]: p for p in m["picks"]}
     skip_by_etf = {sk["etf"]: sk for sk in m["skipped"]}
     chips = []
     for i, ts in enumerate(m["top_sectors"], 1):
-        etf, nm, acc = ts["etf"], ts["sector"], ts.get("accel")
+        etf, nm, acc, er = ts["etf"], ts["sector"], ts.get("accel"), ts.get("etf_ret")
         rank = f'<span class="rk">#{i}</span>'
-        head = f'{rank}<b>{esc(nm)}</b> <span class="acc">{acc_fmt(acc)}</span>'
+        head = f'{rank}<b>{esc(nm)}</b> <span class="acc" title="acceleration — the ranking signal (3-month momentum minus the prior 3-month), NOT a return">accel {acc_fmt(acc)}</span>'
         if etf in pick_by_etf:
             p = pick_by_etf[etf]
             rr = pct(p["ret"]) if p["ret"] is not None else '<span class="mut">held</span>'
-            chips.append(f'<span class="chip pick" title="Accelerated into the top-10 (accel {acc_fmt(acc)}); '
-                         f'cheapest qualifying value name = {esc(p["ticker"])} at P/B {p.get("pb") and round(p["pb"],2)}">'
-                         f'{head} → <span class="tk">{esc(p["ticker"])}</span> {rr}</span>')
+            chips.append(f'<span class="chip pick" title="Ranked here because the sleeve accelerated (accel {acc_fmt(acc)} — the SELECTION signal, not a return). '
+                         f'Bought {esc(p["ticker"])} at P/B {p.get("pb") and round(p["pb"],2)} on the {esc(m["date"])} close, sold on the {esc(m["ndate"])} close. '
+                         f'accel ≠ outcome: the pick can fall even when the sleeve accelerated hard.">'
+                         f'{head}{sret(er)} → bought <span class="tk">{esc(p["ticker"])}</span> {rr}{dvs(p["ret"], er)}</span>')
         elif etf in skip_by_etf:
             sk = skip_by_etf[etf]
             reason = sk.get("reason", "no qualifying value stock")
-            chips.append(f'<span class="chip skip" title="{esc(reason)}">{head} '
-                         f'<span class="xm">⊘ skipped</span> <span class="rsn">{esc(reason)}</span></span>')
+            chips.append(f'<span class="chip skip" title="Skipped — {esc(reason)}. The sleeve ETF itself returned '
+                         f'{"" if er is None else f"{er*100:+.1f}%"} this month; we did NOT hold it.">{head} '
+                         f'<span class="xm">⊘ skipped</span>{sret(er)}</span>')
         else:
-            chips.append(f'<span class="chip">{head}</span>')
-    return "".join(chips)
+            chips.append(f'<span class="chip">{head}{sret(er)}</span>')
+    for dz in m.get("deactivated", []):
+        der = dz.get("etf_ret")
+        der_txt = "" if der is None else f"{der*100:+.1f}%"
+        chips.append(f'<span class="chip deact" title="Deactivated sleeve — acceleration still calculated '
+                     f'(ranked #{dz.get("rank")}) but never traded. The ETF itself returned {der_txt} — we did NOT hold it.">'
+                     f'<span class="rk">#{dz.get("rank")}</span><b>{esc(dz["sector"])}</b> '
+                     f'<span class="acc">accel {acc_fmt(dz.get("accel"))}</span> '
+                     f'<span class="xm">⊘ deactivated</span>{sret(der)}</span>')
+    top_html = "".join(chips)
+    # COLD strip: every sleeve ranked #11+ (not in the pickable top-10), with its accel + own month return.
+    cold = [s for s in m.get("all_sectors", []) if not s.get("in_top")]
+    cchips = []
+    for s in cold:
+        er = s.get("etf_ret")
+        ertxt = "" if er is None else f"{er*100:+.1f}%"
+        ercls = "pos" if (er or 0) >= 0 else "neg"
+        cchips.append(f'<span class="chip cold" title="{esc(s["sector"])} ranked #{s["rank"]} by acceleration ({acc_fmt(s.get("accel"))}) — below the top-10 cutoff, so NOT eligible this month. '
+                      f'That month its ETF returned {ertxt}.">'
+                      f'<span class="rk">#{s["rank"]}</span>{esc(s["sector"])} '
+                      f'<b class="{ercls}">{ertxt}</b> <span class="acc">accel {acc_fmt(s.get("accel"))}</span></span>')
+    cold_html = (f'<details class="coldwrap"><summary>+ {len(cold)} colder sleeves ranked #11–{10+len(cold)} '
+                 f'(not eligible this month) — click to show all with their month return</summary>'
+                 f'<div class="chips cold-chips">{"".join(cchips)}</div></details>') if cchips else ""
+    return top_html + cold_html
 
 
 blotter = []
@@ -405,15 +559,21 @@ for m in D["months"]:
     npos = sum(1 for p in picks if p["ret"] is not None)
     nskip = len(m["skipped"])
     exc = (m["basket_ret"] - m["spy_ret"]) * 100
+    _mae = m.get("basket_mae")
+    _maetxt = (f' · <span class="ddw" title="Worst intra-month drawdown — the deepest the basket sank between the buy and sell dates before recovering. The real risk taken even when the month ended up.">worst −{abs(_mae)*100:.1f}%</span>'
+               if _mae is not None else "")
     blotter.append(f"""<tr class="mhdr">
-      <td class="l mono" colspan="6"><b>{esc(m['date'])}</b> · {npos} holdings · {nskip} sector{'s' if nskip!=1 else ''} skipped</td>
+      <td class="l mono" colspan="6"><b>bought {esc(m['date'])} close → sold {esc(m.get('ndate',''))} close</b> · {npos} holding{'s' if npos!=1 else ''} · {nskip} skipped{_maetxt}</td>
       <td class="num" colspan="3">SPY {pct(m['spy_ret'])}</td>
       <td class="num" colspan="4">basket <b>{pct(m['basket_ret'])}</b> <span class="{'pos' if exc>=0 else 'neg'}">({exc:+.1f} vs SPY)</span></td>
     </tr>
     <tr class="srow"><td colspan="{BLOTTER_COLS}"><div class="chips">{sector_chips(m)}</div></td></tr>""")
     for p in sorted(picks, key=lambda x: -(x["ret"] if x["ret"] is not None else -9)):
         conv = ' <span class="conv" title="A/D-conviction 2× weight">2×</span>' if p["conviction"] else ""
-        rr = pct(p["ret"]) if p["ret"] is not None else '<span class="mut">n/a</span>'
+        _pm = p.get("mae")
+        _pmtxt = (f' <span class="ddw" title="Worst intra-month point: this name was down {abs(_pm)*100:.1f}% at its lowest during the hold before finishing the month.">↓{abs(_pm)*100:.0f}%</span>'
+                  if _pm is not None and _pm < -0.001 else "")
+        rr = (pct(p["ret"]) + _pmtxt) if p["ret"] is not None else '<span class="mut">n/a</span>'
         wt = f'{p["weight"]:.0f}×' if p.get("weight") else '1×'
         why = (f'Best cheap-P/B × analyst-upside blend (P/B {p.get("pb") and round(p["pb"],2)}) among the '
                f'{"small-caps" if (p.get("mktcap_usd") or 0) < 2e9 else "holdings"} of {esc(p["sector"])}, '
@@ -464,6 +624,10 @@ body{{margin:0}}
   background:var(--paper); color:var(--ink); font-family:var(--sans); font-size:15px; line-height:1.55; padding:0 20px 100px;
 }}
 .wrap{{max-width:1180px; margin:0 auto}}
+.mpane#mpane-finviz .wrap, .mpane#mpane-finviz{{max-width:none}}
+#mpane-finviz .tablecard{{max-width:none}}
+/* wider content area for the Finviz tab so more columns/chips are visible */
+.doc:has(#mpane-finviz:not([hidden])) .wrap{{max-width:1600px}}
 .tk{{font-family:var(--mono); font-weight:600; letter-spacing:.02em; font-size:.9em}}
 .mono{{font-family:var(--mono); font-variant-numeric:tabular-nums}}
 .num{{text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap}}
@@ -552,8 +716,18 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 .chip.pick{{border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}}
 .chip.pick .tk{{color:var(--accent)}}
 .chip.skip{{opacity:.72}}
+.chip.deact{{opacity:.72; border-style:dashed; border-color:color-mix(in srgb,var(--mut) 55%,var(--line))}}
+.chip.deact .xm{{color:var(--mut)}}
 .chip .xm{{color:var(--neg); font-weight:700}}
 .chip .rsn{{color:var(--mut); font-size:10px; max-width:300px; overflow:hidden; text-overflow:ellipsis}}
+.chip .slv{{color:var(--mut); font-size:10px; font-family:var(--mono)}}
+.chip .dvs{{font-size:10px; font-family:var(--mono); color:var(--mut)}}
+.ddw{{font-family:var(--mono); font-size:10px; color:var(--warn); font-weight:600; cursor:help}}
+.chip.cold{{opacity:.6; font-size:10.5px; padding:2px 7px; border-style:dotted}}
+.coldwrap{{margin-top:8px}}
+.coldwrap summary{{font-family:var(--mono); font-size:11px; color:var(--mut); cursor:pointer; padding:4px 0; list-style:revert}}
+.coldwrap summary:hover{{color:var(--ink2)}}
+.coldwrap .cold-chips{{margin-top:8px}}
 .pane{{position:fixed; inset:0; z-index:60; display:flex; justify-content:flex-end}}
 .pane[hidden]{{display:none}}
 .pane-bd{{position:absolute; inset:0; background:color-mix(in srgb,#000 45%,transparent); backdrop-filter:blur(2px)}}
@@ -630,7 +804,7 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
   </nav>
 
   <div class="kpis">
-    {"".join(f'<div class="kpi{" hero" if i in (0,1) else ""}"><div class="k">{esc(k)}</div><div class="v">{v}</div><div class="d">{esc(dd)}</div></div>' for i,(k,v,dd) in enumerate(kpis))}
+    {"".join(kpi_tile(k, v, dd, hero=(i in (0,1))) for i,(k,v,dd) in enumerate(kpis))}
   </div>
   <div class="funda">
     {"".join(f'<div class="fu"><div class="k">{esc(k)}</div><div class="v">{v}</div><div class="d">{esc(dd)}</div></div>' for k,v,dd in funda)}
@@ -659,7 +833,7 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 
   <section id="how">
     <div class="shead"><h2>How a pick is made</h2></div>
-    <p class="lede">Each month the engine ranks ~149 sector ETFs by momentum <b>acceleration</b> (3-month change minus the prior 3-month change) and keeps the <b>top 10</b>. Inside each, it broadens to every US/Canada stock in that GICS sector, screens for positive book value and $5M+ daily liquidity, and buys the <b>cheapest price-to-book small-cap</b> (&lt;$2B). Names accumulating into weakness (A/D divergence) get double weight. Sectors with no qualifying value stock — raw commodities, bonds, foreign index sleeves — are <b>skipped</b>. Every fundamental below is the value <b>as filed and public on the purchase date</b>.</p>
+    <p class="lede">Each month the engine ranks ~149 sector ETFs by momentum <b>acceleration</b>{hint("accel")} (3-month change minus the prior 3-month change) and keeps the <b>top 10</b>. Inside each, it broadens to every US/Canada stock in that GICS sector, screens for positive book value and $5M+ daily liquidity, and buys the <b>cheapest price-to-book small-cap</b>{hint("P/B")} (&lt;$2B). Names accumulating into weakness (A/D divergence) get <b>double weight</b>{hint("conviction")}. Sectors with no qualifying value stock — raw commodities, bonds, foreign index sleeves — are <b>skipped</b>{hint("skipped")}. The live default adds the analyst-upside <b>blend</b>{hint("blend")}; a demoted variant adds a 200-MA <b>regime</b>{hint("regime")} switch, and retired sleeves stay <b>deactivated</b>{hint("deactivated")}. Every fundamental below is the value <b>as filed and public on the purchase date</b>.</p>
   </section>
 
   <section id="stocks">
@@ -705,7 +879,7 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
 
   <section id="blotter">
     <div class="shead"><h2>Full blotter</h2><span class="cnt">{S['total_picks']} picks across {S['months']} months</span></div>
-    <p class="lede">The complete month-by-month record. Each month opens with its rebalance date and basket return vs SPY, then a <b>sector-ranking strip</b> — the ten sleeves that accelerated into the momentum top-10 that month, each showing its acceleration and either the value name it resolved to (<span class="chip pick" style="padding:0 5px">→ ticker</span>) or <b>why the slot was skipped</b> (<span class="chip skip" style="padding:0 5px">⊘</span>, hover for the reason). Beneath are the holdings (best-to-worst) with their <b>point-in-time</b> fundamentals. Hover any pick row for the one-line rationale; <b>2×</b> = A/D-conviction weight.</p>
+    <p class="lede">The complete month-by-month record. Each month is bought at that month-end <b>close</b> and sold at the <b>next</b> month-end close (shown in the header). Then a <b>sector-ranking strip</b> — the ten sleeves that ranked highest by momentum <b>acceleration</b> that month. <b>The percentage labelled "accel" is the ranking signal (3-month momentum minus the prior 3-month), NOT a return.</b> Each chip then shows what actually happened: <span class="chip pick" style="padding:0 5px">→ bought TICKER +x%</span> is the small-cap we bought and <i>its</i> return; <span class="chip skip" style="padding:0 5px">⊘ skipped · sleeve +x%</span> means we did NOT hold it, and "sleeve +x%" is what that sector's own ETF returned (so you can see what we passed on). <span class="chip deact" style="padding:0 5px">⊘ deactivated</span> = a retired sleeve we still track but never trade. Beneath are the holdings with their <b>point-in-time</b> fundamentals; <b>2×</b> = A/D-conviction weight.</p>
     <div class="tablecard"><div class="scrolly"><table>
       <thead><tr>{th("Ticker","l")}{th("Company","l")}{th("Sector","l")}{th("Tier")}{th("P/B")}{th("P/E")}{th("ROE")}{th("GP/A")}{th("Rev&nbsp;g")}{th("D/E")}{th("Mkt&nbsp;cap")}{th("Weight")}{th("Return")}</tr></thead>
       <tbody>{"".join(blotter)}</tbody>

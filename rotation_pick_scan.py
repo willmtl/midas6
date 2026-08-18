@@ -137,11 +137,18 @@ def build():
     sectors = [(n, e) for n, e in Sector.objects.values_list("name", "etf") if e]
     etfs = [e for _, e in sectors]
     name_by_etf = {e: n for n, e in sectors}
+    # DEACTIVATED sleeves: accel still computed (for monitoring) but never traded — dropped from the pickable
+    # ranking and surfaced as "deactivated" in the output. (Live universe = DB Sector; config lists the deact set.)
+    import config as _cfg
+    DEACT_TK = set(getattr(_cfg, "DEACTIVATED_ETFS", {}).values())
+    for _n, _e in getattr(_cfg, "DEACTIVATED_ETFS", {}).items():
+        name_by_etf.setdefault(_e, _n)
+    all_etfs = etfs + [e for e in DEACT_TK if e not in etfs]
 
-    etf_daily = load_candles(etfs)
+    etf_daily = load_candles(all_etfs)
     HALF = LOOKBACK_D // 2          # ~3 trading months, for the acceleration signal
     mom, mom3, accel_val = {}, {}, {}
-    for _, etf in sectors:
+    for etf in all_etfs:
         df = etf_daily.get(etf)
         if df is None or len(df) < LOOKBACK_D + 1:
             continue
@@ -154,7 +161,15 @@ def build():
     # SECTOR SIGNAL = momentum ACCELERATION (3mo-now minus 3mo-3mo-ago). Split-corrected honest flagship
     # +313.2% total / +213pp vs SPY / Sharpe 1.50 / DD -15.5%. Replaces 6mo-momentum LEVEL, which ranked
     # sectors by what already ran (late) — acceleration catches the move at its inflection (turning up NOW).
-    ranked = sorted(accel_val.items(), key=lambda kv: -kv[1])[:TOP_N_SECTORS]
+    _all_sorted = [e for e, _ in sorted(accel_val.items(), key=lambda kv: -kv[1])]
+    ranked = [(e, v) for e, v in sorted(accel_val.items(), key=lambda kv: -kv[1]) if e not in DEACT_TK][:TOP_N_SECTORS]
+    # deactivated sleeves that WOULD have ranked in the top-N (monitored, not traded)
+    deactivated_now = [{"sector": name_by_etf.get(e, e), "etf": e, "acceleration": round(accel_val[e], 1),
+                        "rank": _all_sorted.index(e) + 1}
+                       for e in DEACT_TK if e in accel_val and _all_sorted.index(e) < TOP_N_SECTORS]
+    if deactivated_now:
+        print(f"DEACTIVATED in top-{TOP_N_SECTORS} (calculated, NOT traded): "
+              f"{[(d['etf'], d['rank']) for d in deactivated_now]}", flush=True)
     print(f"{len(mom)}/{len(etfs)} sectors ranked by ACCELERATION; top {len(ranked)} (inflecting up)", flush=True)
 
     holds_by_etf = {etf: [t for t in sector_holdings.get_holdings(name_by_etf.get(etf, etf))
@@ -199,10 +214,26 @@ def build():
     from profitability_guard import guard_flags
     gflags = guard_flags(univ)
 
-    # REMOVED the SPY-200MA→FCF bear-regime switch (2026-08-17, user): it was the least-trustworthy lever —
-    # small ~17-month bear sample, DID NOT cross-validate (regime/options work generally didn't generalize),
-    # and its +320pp is inside the ~500pp run-to-run noise. Production now runs the PURE BLEND regardless of
-    # regime; we set forward expectations on the robust core (raw cheapest-P/B) + blend tilt, not the switch.
+    # SPY-200MA→FCF bear-regime switch. DEMOTED from production (least-trustworthy lever: small ~17mo bear
+    # sample, didn't cross-validate, +320pp inside the ~500pp noise). Kept as an OPT-IN VARIANT: set
+    # ROTATION_REGIME=1 to run the "blend + regime" copy (saved to BacktestResult[rotation_picks_regime]).
+    # Default (production) = pure blend regardless of regime.
+    REGIME_ON = bool(os.environ.get("ROTATION_REGIME"))
+    spy_bull = True
+    fcf_margin = {}
+    if REGIME_ON:
+        spy_px = load_candles(["SPY"]).get("SPY")
+        if spy_px is not None and len(spy_px) >= 200:
+            spy_bull = float(spy_px["Close"].iloc[-1]) >= float(spy_px["Close"].rolling(200).mean().iloc[-1])
+        if not spy_bull:
+            from seq_fundamental_study import load_financial_reports
+            for tk, dfr in load_financial_reports(univ).items():
+                d = dfr.sort_values("period_end")
+                fcf = d["free_cash_flow"].dropna() if "free_cash_flow" in d.columns else None
+                rev = d["revenue"].dropna() if "revenue" in d.columns else None
+                if fcf is not None and len(fcf) >= 4 and rev is not None and len(rev) >= 4 and rev.tail(4).sum() > 0:
+                    fcf_margin[tk] = float(fcf.tail(4).sum() / rev.tail(4).sum())
+        print(f"REGIME VARIANT ON — SPY 200d-MA: {'BULL (pure blend)' if spy_bull else 'BEAR -> FCF-margin gate'}", flush=True)
     alt = _alt_signals(univ)          # insider / congress buying confirmation flags
 
     # LIVE analyst implied-upside (Benzinga): most-recent price target within 90d ÷ latest close − 1. Feeds the
@@ -268,6 +299,15 @@ def build():
             # survivorship + walk-forward robust (survivors-only-small = live universe: P/E +302pp). LARGE-CAP
             # fallback keeps cheapest raw P/B (P/E LOSES in large-cap: cheap-P/E = cyclical earnings peak).
             if is_small_tier:
+                # REGIME VARIANT (opt-in): when SPY<200d MA, keep only the top-half by FCF margin first.
+                # No-op in production (fcf_margin empty unless ROTATION_REGIME=1 and bear).
+                if (not spy_bull) and fcf_margin:
+                    fm = [(tk, pbv) for tk, pbv in use if fcf_margin.get(tk) is not None]
+                    if len(fm) >= 4:
+                        _med = float(np.median([fcf_margin[tk] for tk, _ in fm]))
+                        keep = [(tk, pbv) for tk, pbv in fm if fcf_margin[tk] >= _med]
+                        if keep:
+                            use = keep
                 # FLAGSHIP blend (2026-08-17): rank small-caps by 60% analyst implied-upside + 40% cheap-P/B
                 # (both pct-rank), among names with a recent analyst target (>=3 covered); else cheapest raw P/B.
                 # The one additive lever that beat raw-P/B in both halves + across weights + 4/6 years.
@@ -309,11 +349,26 @@ def build():
                 "revenue_growth": f.get("revenue_growth"),
                 "pick_sectors": sector_holdings.get_sectors_for_ticker(t)})
         else:
-            # No qualifying US/CA positive-P/B value stock (pure commodity/bond/crypto sector, or a
-            # foreign/index sleeve whose holdings lack P/B). SKIP THE SLOT — do NOT hold the raw ETF.
-            # Backtest (usca_small_proxy vs usca_small): holding these as ETF proxies SUBTRACTS -468.3pp
-            # total (322.1% vs 790.4%), Sharpe 1.34 vs 1.49 — the alpha is entirely in the value pick, a
-            # raw beta sleeve only dilutes it. Remaining picks renormalize to 100% in the conviction step.
+            # HYPERGROWTH FALLBACK (2026-08-18, user, backtest +120pp/all-windows): before skipping, try the
+            # highest revenue-growth US/CA name in the sleeve (>20% growth) — fills a would-be-skipped EQUITY
+            # slot with a growth pick instead of nothing. If none, skip (commodity/bond/foreign have no name).
+            gcands = [(t, funds.get(t, {}).get("revenue_growth")) for t in holds_by_etf[etf]
+                      if t not in held and _is_usca(t) and (funds.get(t, {}).get("revenue_growth") or 0) > 0.20]
+            if gcands:
+                t, rg = max(gcands, key=lambda x: x[1])
+                held.add(t); f = funds.get(t, {}); g = gflags.get(t, {}); dfp = px.get(t)
+                row.update({"pick": t, "is_etf_proxy": False, "pb_ratio": f.get("pb_ratio"),
+                            "selection_basis": "hypergrowth_fallback", "revenue_growth": rg,
+                            "last_close": round(float(dfp["Close"].iloc[-1]), 2) if dfp is not None and len(dfp) else None,
+                            "market_cap": f.get("market_cap"), "pe_ratio": f.get("pe_ratio"),
+                            "guard_status": g.get("status"),
+                            "pick_sectors": sector_holdings.get_sectors_for_ticker(t)})
+                print(f"  #{rank:>2} {name:22} ({etf}): no value stock -> HYPERGROWTH FALLBACK {t} "
+                      f"(rev-growth {rg*100:.0f}%)", flush=True)
+                picks.append(row)
+                continue
+            # No qualifying US/CA value OR hypergrowth stock (pure commodity/bond/foreign sleeve). SKIP THE
+            # SLOT — do NOT hold the raw ETF (proxy-hold backtests -468pp). Weights renormalize over the rest.
             skipped.append({"rank": rank, "sector": name, "etf": etf, "acceleration": round(acc, 1)})
             print(f"  #{rank:>2} {name:22} ({etf}): no qualifying US/CA value stock -> SLOT SKIPPED "
                   f"(proxy-hold backtests -468pp)", flush=True)
@@ -364,6 +419,7 @@ def build():
         "picks": picks,
         "n_sectors_skipped": len(skipped),
         "skipped_sectors": skipped,
+        "deactivated_sectors": deactivated_now,   # kept + accel calculated, but never traded (monitoring)
         "note": ("Value picks are the alpha; sectors with no qualifying US/CA value stock (pure commodity/"
                  "bond/foreign sleeves) are SKIPPED, not held via ETF — backtest: proxy-holding subtracts "
                  "-468pp (322% vs 790%). Weights renormalize over the remaining picks. Monthly-rebalance; "
@@ -375,7 +431,8 @@ def build():
 def main():
     global OUT
     from pathlib import Path
-    OUT = Path(__file__).resolve().parent / ".data" / "studies" / "rotation_picks.json"
+    _kind = "rotation_picks_regime" if os.environ.get("ROTATION_REGIME") else "rotation_picks"
+    OUT = Path(__file__).resolve().parent / ".data" / "studies" / f"{_kind}.json"
     payload = build()
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(payload, indent=2, default=str))
@@ -383,10 +440,10 @@ def main():
         from core.models import BacktestResult
         from django.utils import timezone
         BacktestResult.objects.update_or_create(
-            kind="rotation_picks",
+            kind=_kind,
             defaults={"payload": json.loads(json.dumps(payload, default=str)),
                       "computed_at": timezone.now()})
-        print("Saved BacktestResult[rotation_picks]", flush=True)
+        print(f"Saved BacktestResult[{_kind}]", flush=True)
     except Exception as e:
         print("DB save failed:", e, flush=True)
     print(f"\n=== ROTATION PICKS (cheapest-P/B per sector, div_2x conviction weight) — "
