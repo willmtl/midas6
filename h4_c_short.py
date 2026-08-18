@@ -106,6 +106,17 @@ def main():
         chg = ((cur / prev - 1) * 100) if (prev and cur is not None and prev > 0) else None
         return {"days_to_cover": dtc, "si_change_pct": chg}
 
+    # put/call OPEN INTEREST — reconstructed from ThetaData (.data/option_oi.jsonl, exact per-dip); fall back
+    # to the sparse live OptionSnapshot only if the archive is missing.
+    pcoi_theta = {}
+    if os.path.exists("/app/.data/option_oi.jsonl"):
+        for line in open("/app/.data/option_oi.jsonl"):
+            try:
+                r = json.loads(line)
+                if r.get("pc_oi") is not None:
+                    pcoi_theta[(r["ticker"], r["date"])] = r["pc_oi"]
+            except Exception:
+                pass
     opt = _asof_store(OptionSnapshot.objects.filter(ticker__in=names).exclude(pc_oi=None)
                       .values("ticker", "date", "pc_oi").order_by("ticker", "date"), ["pc_oi"])
 
@@ -130,9 +141,13 @@ def main():
             f1 = si_asof(tk, ts[i].date())
             if f1:
                 feats.update(f1)
-            f2 = _asof(opt, tk, ts[i].date(), ["pc_oi"])
-            if f2:
-                feats.update(f2)
+            pk = pcoi_theta.get((tk, ts[i].date().isoformat()))
+            if pk is not None:
+                feats["pc_oi"] = pk                          # ThetaData reconstructed put/call OI (exact)
+            else:
+                f2 = _asof(opt, tk, ts[i].date(), ["pc_oi"])
+                if f2:
+                    feats.update(f2)
             r3 = (c[i + 3] - c[i]) / c[i] * 100
             entries.append((r3, feats))
 
