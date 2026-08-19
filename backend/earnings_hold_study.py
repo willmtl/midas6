@@ -1,242 +1,204 @@
 #!/usr/bin/env python3
-"""EARNINGS-GATED HOLD — the splitter study showed the 1mo rotation clips winners (AVGO +6% booked ->
-+146% if held) but correctly cuts value-traps (EDPR). The user's hypothesis: a NEWS signal could tell
-them apart. Raw headlines aren't backfilled at the decision dates, but EARNINGS ARE (EarningsEvent, full
-history, eps_surprise + grounded beat/guidance label). So test the honest version:
+"""EARNINGS-BEAT HOLD-EXTENSION study (user hypothesis, 2026-08-19): the flagship rotates monthly, but if a
+name we're HOLDING reports a STRONG earnings beat during the hold month, maybe we should KEEP it a few more
+months to ride the post-earnings drift (PEAD) instead of rotating out.
 
-Across EVERY pick the deployed flagship makes (accel top-10 -> cheapest as-traded-P/B guard low-debt $5M
-div_2x, monthly), tag each pick by its EARNINGS SIGNAL as of the pick date (most recent report within
-100d): POS (grounded_score>0 i.e. beat & guided up), NEG (<0), or NONE. Then compare the forward-return
-curve (1/3/6/12mo) for each group.
+This is a DIAGNOSTIC (not a re-simulation): for every (month, held pick), we check whether an earnings report
+landed inside the hold window (date, ndate], classify it by the GROUNDED score (so a 'beat-guided-down' is not
+counted as a strong beat — see ground_earnings.py / grounded-earnings memory), and then measure the
+OPPORTUNITY-COST of keeping vs rotating:
 
-If POS picks keep climbing at 3-6-12mo while NEG/NONE decay, a "hold the beats, rotate the rest" gate has
-signal -> we could ride winners without the blanket hold-3mo that tanks the book (+53%/Sh0.53). We also
-score a simple event-level gate policy vs always-1mo (same opportunity-cost caveat as splitter_hold).
--> BacktestResult[earnings_hold] + JSON.
-Run: MSYS_NO_PATHCONV=1 docker exec rotation-backend-1 python -u /app/earnings_hold_study.py
+    keep_ret_N   = the SAME name's compounded return over the NEXT N months (starting at ndate = decision time)
+    rotate_ret_N = the flagship BASKET's compounded return over those same N months (what we actually earn)
+    delta_N      = keep_ret_N - rotate_ret_N      (>0 => keeping the beater beats rotating)
+
+Point-in-time: the beat is known at ndate (the rotation decision), and the extended hold runs ndate -> ndate+N,
+so there is no look-ahead. We bucket by grounded verdict (strong beat >=2 / mild beat ==1 / inline / miss <=-1 /
+no earnings this month = control) and compare forward continuation across buckets. If strong-beat delta is
+clearly positive AND beats the no-earnings control, the bet holds and a hold-extension overlay is worth wiring.
+
+Reads /app/.data/studies/flagship_history.json (the 112,950% adaptive flagship trace).
+-> BacktestResult[earnings_hold] + prints. Run: docker exec -w /app rotation-backend-1 python -u earnings_hold_study.py
 """
-import os, json, warnings
-from datetime import timedelta
+import os, sys, json, warnings
+sys.path.insert(0, "/app")
 warnings.filterwarnings("ignore")
-import numpy as np, pandas as pd
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "rotation.settings")
 import django
 django.setup()
-
+import numpy as np
+import pandas as pd
 from pathlib import Path
-import config, sector_holdings, price_basis
-from seq_fundamental_study import load_candles, load_financial_reports
-from trend_stock_studies import _pit_monthly_panel, _available_at, _ret_delist, CRYPTO
-from backtest_lowpb import _monthly_close, BENCH
+from collections import defaultdict
+from seq_fundamental_study import load_candles
 
-TOP_N = 10
-MIN_DVOL = 5e6
-HORIZONS = [1, 2, 3, 6, 12]
-EARN_LOOKBACK_D = 100          # a fresh print within ~1 quarter before the pick
-OUT = Path(__file__).resolve().parent / ".data" / "studies" / "earnings_hold.json"
+TRACE = Path("/app/.data/studies/flagship_history.json")
+FWD = [1, 2, 3, 4, 6]                 # forward hold-extension horizons (months) to test
+STRONG = 2.0                          # grounded_score >= STRONG = "strong beat" (beat + guided up, not guided-down)
 
 
-def _fwd(px_col, midx, i, h):
-    j = min(i + h, len(midx) - 1)
-    if j <= i:
-        return None
-    r = _ret_delist(px_col, midx[i], midx[j])
-    return float(r) if r is not None and np.isfinite(r) else None
-
-
-def load_earnings(tickers):
-    """ticker -> sorted list of (report_date(ts), grounded_score, eps_surprise_pct)."""
-    from core.models import EarningsEvent
-    out = {}
-    qs = EarningsEvent.objects.filter(ticker__in=list(tickers)).values(
-        "ticker", "report_date", "grounded_score", "eps_surprise_pct")
-    for r in qs:
-        if not r["report_date"]:
-            continue
-        out.setdefault(r["ticker"], []).append(
-            (pd.Timestamp(r["report_date"]), r["grounded_score"], r["eps_surprise_pct"]))
-    for t in out:
-        out[t].sort(key=lambda x: x[0])
-    return out
-
-
-def _classify(gs, eps):
-    if gs is not None:
-        return ("POS" if gs > 0 else "NEG" if gs < 0 else "NONE"), float(gs)
-    if eps is not None:
-        return ("POS" if eps > 1.0 else "NEG" if eps < -1.0 else "NONE"), float(eps)
-    return "NONE", None
-
-
-def earn_signal(events, date):
-    """POS / NEG / NONE using the most recent report within EARN_LOOKBACK_D before `date` (at-pick)."""
-    if not events:
-        return "NONE", None
-    lo = date - timedelta(days=EARN_LOOKBACK_D)
-    recent = [e for e in events if lo <= e[0] <= date]
-    if not recent:
-        return "NONE", None
-    rd, gs, eps = recent[-1]
-    return _classify(gs, eps)
-
-
-def earn_in_hold(events, date, hold_days=35):
-    """'News during the hold window' (buy -> rotate): earnings landing in (date, date+hold_days]."""
-    if not events:
-        return "NONE", None
-    hi = date + timedelta(days=hold_days)
-    inw = [e for e in events if date < e[0] <= hi]
-    if not inw:
-        return "NONE", None
-    rd, gs, eps = inw[-1]
-    return _classify(gs, eps)
-
-
-def _curve(events_list, horizons):
-    """avg forward return by hold across a list of pick-event dicts."""
-    out = {}
-    for h in horizons + ["end"]:
-        vals = [e["fwd"].get(h) for e in events_list if e["fwd"].get(h) is not None]
-        out[str(h)] = round(float(np.mean(vals)) * 100, 2) if vals else None
-    out["n"] = len(events_list)
-    return out
-
-
-def build():
-    etfs = {n: e for n, e in config.SECTOR_ETFS.items() if e not in CRYPTO}
-    sector_map, all_holds = {}, set()
-    for n, e in etfs.items():
-        h = [t for t in sector_holdings.get_holdings(n) if t not in (e, BENCH) and t not in CRYPTO]
-        sector_map[e] = (n, h); all_holds.update(h)
-    all_holds = sorted(all_holds)
-    etf_tk = list(etfs.values())
-    print(f"Loading {len(etf_tk)} ETFs + {len(all_holds)} stocks + {BENCH}...", flush=True)
-    etf_daily = load_candles(etf_tk + [BENCH])
-    etf_m = _monthly_close({t: d for t, d in etf_daily.items() if t in etf_tk})
-    midx = etf_m.index
-    accel = etf_m.pct_change(3) - etf_m.pct_change(3).shift(3)
-    stock_daily = load_candles(all_holds)
-    stock_m = _monthly_close(stock_daily).reindex(midx)
-    reps = load_financial_reports(all_holds)
-    sh, eq, ni, dt = (_pit_monthly_panel(reps, f, midx) for f in
-                      ("shares_outstanding", "total_equity", "net_income", "total_debt"))
-    common = stock_m.columns.intersection(sh.columns).intersection(eq.columns)
-    R = lambda p: p.reindex(index=midx, columns=common)
-    px = stock_m[common]; sh, eq, ni, dt = R(sh), R(eq), R(ni), R(dt)
-    pb = (price_basis.as_traded_close(px) * sh) / eq.where(eq != 0)
-    trap = (ni < 0) & (~(eq >= eq.shift(12))) & (~(ni > ni.shift(4)))
-    low = (dt / eq.where(eq != 0)) < 1.0
-    dvol = {}
-    for t in common:
-        d = stock_daily.get(t)
-        if d is None or "Volume" not in d or len(d) < 90:
-            continue
-        dvol[t] = (d["Close"] * d["Volume"]).rolling(20).mean().resample("ME").last().reindex(midx)
-    dvol = pd.DataFrame(dvol).reindex(index=midx, columns=common)
-    earn = load_earnings(common)
-    n_have_earn = sum(1 for t in common if earn.get(t))
-    print(f"months {len(midx)} | stocks {len(common)} | with earnings history {n_have_earn}", flush=True)
-
-    # walk the flagship, record EVERY pick with its forward returns + earnings signal at pick
-    all_picks = []
-    for i in range(9, len(midx) - 1):
-        date = midx[i]
-        top = accel.loc[date].dropna().sort_values(ascending=False).head(TOP_N).index
-        for etf in top:
-            name, holds = sector_map.get(etf, (etf, []))
-            c = [h for h in holds if h in px.columns and _available_at(px[h], date)
-                 and pd.notna(pb.loc[date, h]) and pb.loc[date, h] > 0 and not bool(trap.loc[date, h])
-                 and pd.notna(dvol.loc[date, h]) and dvol.loc[date, h] >= MIN_DVOL]
-            g = [x for x in c if bool(low.loc[date, x])] or c
-            if not g:
-                continue
-            pick = min(g, key=lambda h: pb.loc[date, h])
-            fwd = {h: _fwd(px[pick], midx, i, h) for h in HORIZONS}
-            fwd["end"] = _fwd(px[pick], midx, i, len(midx) - 1 - i)
-            if fwd.get(1) is None:
-                continue
-            sig, val = earn_signal(earn.get(pick), date)
-            hsig, hval = earn_in_hold(earn.get(pick), date)
-            all_picks.append({"ticker": pick, "date": str(date.date()), "i": i, "fwd": fwd,
-                              "earn_sig": sig, "earn_val": val, "hold_sig": hsig, "hold_val": hval})
-
-    groups = {g: [p for p in all_picks if p["earn_sig"] == g] for g in ("POS", "NEG", "NONE")}
-    curves = {g: _curve(v, HORIZONS) for g, v in groups.items()}
-    # user's refinement: NEWS DURING THE HOLD WINDOW (earnings that land between buy and rotate)
-    hgroups = {g: [p for p in all_picks if p["hold_sig"] == g] for g in ("POS", "NEG", "NONE")}
-    hcurves = {g: _curve(v, HORIZONS) for g, v in hgroups.items()}
-    curve_all = _curve(all_picks, HORIZONS)
-
-    # event-level policy scoring (avg per-event return; opportunity cost NOT modeled -- directional):
-    #   base    : always hold 1mo (the deployed rotation)
-    #   gate_H  : if earnings POS at pick, hold H months; else 1mo
-    def policy_gate(H, key):
-        rr = []
-        for p in all_picks:
-            r = p["fwd"].get(H) if p[key] == "POS" and p["fwd"].get(H) is not None else p["fwd"].get(1)
-            if r is not None:
-                rr.append(r)
-        return round(float(np.mean(rr)) * 100, 2)
-    base_avg = round(float(np.mean([p["fwd"][1] for p in all_picks])) * 100, 2)
-    gate = {f"gate_hold{H}mo_if_beat_atpick": policy_gate(H, "earn_sig") for H in (3, 6, 12)}
-    gate_hold = {f"gate_hold{H}mo_if_beat_inhold": policy_gate(H, "hold_sig") for H in (3, 6, 12)}
-
-    # how often does the signal even fire, and is POS-6mo separation real?
-    pos6 = curves["POS"]["6"]; non6 = curves["NONE"]["6"]; neg6 = curves["NEG"]["6"]
-    verdict = (
-        f"Across {len(all_picks)} flagship picks: POS-earnings picks (n={curves['POS']['n']}) fwd 6mo "
-        f"{pos6}% vs NONE {non6}% vs NEG {neg6}%. "
-        + ("Beat-picks DO keep climbing while the rest lag -> an earnings gate on the HOLD has signal. "
-           if (pos6 is not None and non6 is not None and pos6 > non6 + 3) else
-           "Beat vs non-beat 6mo returns are NOT separated -> earnings gate does NOT cleanly identify who to ride. ")
-        + f"Event-level: always-1mo avg {base_avg}%/pick; gate at-pick(hold6mo if beat) "
-          f"{gate['gate_hold6mo_if_beat_atpick']}%; gate in-hold(hold6mo if beat lands) "
-          f"{gate_hold['gate_hold6mo_if_beat_inhold']}%."
-    )
-    def _tbl(cv, title):
-        print(f"\n=== {title} ===", flush=True)
-        print(f"  {'group':<6}{'n':>5}   1mo    2mo    3mo    6mo    12mo   end", flush=True)
-        for g in ("POS", "NEG", "NONE"):
-            c = cv[g]
-            print(f"  {g:<6}{c['n']:>5}  " + "  ".join(f"{c[str(h)]}" if c[str(h)] is not None else "  NA " for h in [1,2,3,6,12]) + f"   {c['end']}", flush=True)
-    _tbl(curves, "forward return by hold, grouped by earnings signal AT PICK")
-    _tbl(hcurves, "forward return by hold, grouped by earnings landing DURING THE HOLD (buy->rotate)")
-    c = curve_all
-    print(f"\n  {'ALL':<6}{c['n']:>5}  " + "  ".join(f"{c[str(h)]}" for h in [1,2,3,6,12]) + f"   {c['end']}", flush=True)
-    print(f"\n  event-level avg return/pick:", flush=True)
-    print(f"    always-1mo (deployed) {base_avg}%", flush=True)
-    print(f"    gate at-pick : " + " | ".join(f"{k.split('_')[2]} {v}%" for k, v in gate.items()), flush=True)
-    print(f"    gate in-hold : " + " | ".join(f"{k.split('_')[2]} {v}%" for k, v in gate_hold.items()), flush=True)
-    print("\n" + verdict, flush=True)
-
-    return {
-        "computed_at": pd.Timestamp.utcnow().isoformat(),
-        "params": {"top_n": TOP_N, "min_dvol": MIN_DVOL, "earn_lookback_days": EARN_LOOKBACK_D,
-                   "horizons_months": HORIZONS, "benchmark": BENCH, "months": int(len(midx)),
-                   "signal": "grounded_score>0 (beat & guided up) within 100d of pick, else eps_surprise"},
-        "n_picks": len(all_picks), "curves_by_earn_signal_at_pick": curves,
-        "curves_by_earn_signal_in_hold": hcurves, "curve_all": curve_all,
-        "event_level_avg_return": {"always_1mo": base_avg, **gate, **gate_hold},
-        "verdict": verdict,
-        "caveat": "Forward returns = single-name buy-and-hold from pick date (delist-aware); event-level policy "
-                  "averages per-pick returns and does NOT model opportunity cost of the capital the rotation would "
-                  "redeploy -- directional, same caveat as splitter_hold. grounded_score is PIT (grounded at report). "
-                  "as-traded P/B, PIT, no fees, present-day-holdings survivorship. NewsItem headlines NOT used "
-                  "(not backfilled at pre-2025 decision dates -- separate history gap to fix).",
-    }
+def _prod(xs):
+    """Compound a list of monthly simple returns (skip Nones); None if nothing usable."""
+    xs = [x for x in xs if x is not None and np.isfinite(x)]
+    return float(np.prod([1 + x for x in xs]) - 1) if xs else None
 
 
 def main():
-    p = build()
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(p, indent=2, default=str))
+    from django.db import connection
+    with connection.cursor() as cur:
+        cur.execute("SET max_parallel_workers_per_gather = 0")   # /dev/shm=64MB -> avoid parallel Candle DiskFull
+
+    D = json.load(open(TRACE))
+    months = D["months"]
+    dates = [m["date"] for m in months]                          # buy dates (month-ends), sorted
+    didx = {d: i for i, d in enumerate(dates)}
+    basket = [m.get("basket_ret") for m in months]               # basket return over [date_i, ndate_i]
+    tickers = sorted({p["ticker"] for m in months for p in m.get("picks", []) if p.get("ticker")})
+    print(f"trace: {len(months)} months ({dates[0]}..{dates[-1]}), {len(tickers)} unique pick names, "
+          f"flagship total {D['perf']['total']}%", flush=True)
+
+    # ── per-name monthly return series, aligned to the trace's month-end dates ──
+    cand = load_candles(tickers)
+    dt_index = pd.to_datetime(dates)
+    name_ret = {}                                                # ticker -> list aligned to `dates`: ret[i]=[date_i,date_{i+1}]
+    for t in tickers:
+        df = cand.get(t)
+        if df is None or "Close" not in df or not len(df):
+            name_ret[t] = [None] * len(dates); continue
+        mc = df["Close"].resample("ME").last().reindex(dt_index)
+        r = mc.pct_change().shift(-1)                            # r[i] = close[i+1]/close[i]-1  (return of month i)
+        name_ret[t] = [float(x) if pd.notna(x) else None for x in r.values]
+
+    # ── earnings events for the pick names (full history, grounded) ──
+    from core.models import EarningsEvent
+    ev = defaultdict(list)
+    for e in (EarningsEvent.objects.filter(ticker__in=tickers)
+              .values("ticker", "report_date", "grounded_score", "grounded_label",
+                      "eps_surprise_pct", "guidance_eps_pct")):
+        ev[e["ticker"]].append(e)
+
+    def _beat_in_window(t, d0, d1):
+        """Return the grounded event with the max grounded_score whose report_date is in (d0, d1], or None."""
+        best = None
+        for e in ev.get(t, []):
+            rd = pd.Timestamp(e["report_date"])
+            if d0 < rd <= d1:
+                if best is None or (e.get("grounded_score") or -9) > (best.get("grounded_score") or -9):
+                    best = e
+        return best
+
+    # ── classify every held pick-month and record forward keep/rotate returns ──
+    buckets = {"huge_beat (surp>=50%)": [], "big_beat (surp 25-50%)": [], "beat (surp 0-25%)": [],
+               "miss/inline (surp<=0)": [], "beat/miss (no surp%)": [], "no_earnings (control)": []}
+    label_bkt = defaultdict(list)                                # grounded_label -> forward deltas (N=3)
+    Nmax = max(FWD)
+    rows = []                                                    # (bucket, i, ticker, {N: (keep,rotate,delta)})
+    for i, m in enumerate(months):
+        if i + 1 >= len(dates):
+            continue
+        d0 = pd.Timestamp(m["date"]); d1 = pd.Timestamp(m["ndate"]) if m.get("ndate") else None
+        if d1 is None:
+            continue
+        for p in m.get("picks", []):
+            t = p.get("ticker")
+            if not t:
+                continue
+            e = _beat_in_window(t, d0, d1)
+            # "STRONGLY beat" = large EPS surprise magnitude (grounded_score>=2 = beat-AND-guided-up is too rare,
+            # ~0.4% of events -> empty sample). Surprise percentiles among beats: p75=29% p90=73%.
+            sp = (e.get("eps_surprise_pct") if e else None)
+            if e is None:
+                bk = "no_earnings (control)"
+            elif sp is None:
+                bk = "beat/miss (no surp%)"
+            elif sp >= 50:
+                bk = "huge_beat (surp>=50%)"
+            elif sp >= 25:
+                bk = "big_beat (surp 25-50%)"
+            elif sp > 0:
+                bk = "beat (surp 0-25%)"
+            else:
+                bk = "miss/inline (surp<=0)"
+            perN = {}
+            for N in FWD:
+                if i + N >= len(dates):
+                    perN[N] = None; continue
+                kr = [name_ret[t][i + k] for k in range(1, N + 1)]               # hold name over next N months
+                br = [basket[i + k] for k in range(1, N + 1)]                    # rotate normally over same span
+                # MATCHED SPAN: require the FULL N months present for BOTH legs (a delisted name whose candles end
+                # mid-horizon would otherwise make keep span fewer months than rotate + drop its terminal move).
+                if any(x is None or not np.isfinite(x) for x in kr) or any(x is None or not np.isfinite(x) for x in br):
+                    perN[N] = None; continue
+                keep = float(np.prod([1 + x for x in kr]) - 1)
+                rot = float(np.prod([1 + x for x in br]) - 1)
+                perN[N] = (keep, rot, keep - rot)
+            buckets[bk].append(perN)
+            if e is not None and e.get("grounded_label"):
+                d3 = perN.get(3)
+                if d3 and d3[2] is not None:
+                    label_bkt[e["grounded_label"]].append(d3[2])
+            rows.append((bk, m["date"], t, perN))
+
+    # ── aggregate ──
+    def _agg(lst, N):
+        vals = [x[N] for x in lst if x.get(N) is not None]      # each is a full (keep,rot,delta) over matched span
+        if not vals:
+            return None
+        keeps = [v[0] for v in vals]; rots = [v[1] for v in vals]; dels = [v[2] for v in vals]
+        return dict(n=len(vals),
+                    keep=float(np.mean(keeps)) * 100, rotate=float(np.mean(rots)) * 100,
+                    delta=float(np.mean(dels)) * 100, delta_med=float(np.median(dels)) * 100,
+                    winrate=float(np.mean([d > 0 for d in dels])) * 100)
+
+    print("\n=== EARNINGS-BEAT HOLD-EXTENSION (keep the beater N more months vs rotate the basket) ===", flush=True)
+    print("    keep = same name's fwd N-mo return | rotate = flagship basket fwd N-mo | delta = keep-rotate (>0 keep wins)\n", flush=True)
+    hdr = f"  {'bucket':22}{'n':>5}"
+    for N in FWD:
+        hdr += f"  |  +{N}mo keep/rot/Δ  win%"
+    print(hdr, flush=True)
+    out = {}
+    for bk, lst in buckets.items():
+        line = f"  {bk:22}{len(lst):>5}"
+        out[bk] = {}
+        for N in FWD:
+            a = _agg(lst, N)
+            out[bk][N] = a
+            if a:
+                line += f"  | {a['keep']:>6.1f}/{a['rotate']:>5.1f}/{a['delta']:>+6.1f} {a['winrate']:>4.0f}"
+            else:
+                line += f"  |        n/a         "
+        print(line, flush=True)
+
+    print("\n  by grounded_label (mean +3mo delta, keep-minus-rotate; n):", flush=True)
+    for lab, ds in sorted(label_bkt.items(), key=lambda kv: -np.mean(kv[1]) if kv[1] else 0):
+        if len(ds) >= 3:
+            print(f"    {lab:22} {np.mean(ds)*100:>+7.1f}%   (n={len(ds)})", flush=True)
+
+    # verdict — the user's bet is on the STRONGEST beats (huge/big surprise)
+    ctrl = out.get("no_earnings (control)", {})
+    print("\n  VERDICT (does a STRONG beat identify names worth KEEPING vs rotating?):", flush=True)
+    for lab in ("huge_beat (surp>=50%)", "big_beat (surp 25-50%)"):
+        sb = out.get(lab, {})
+        for N in FWD:
+            a, c = sb.get(N), ctrl.get(N)
+            if a and c:
+                edge = a["delta"] - c["delta"]
+                verdict = "KEEP beats rotate AND control" if (a["delta"] > 0 and edge > 0) else \
+                          ("keep>rotate but not vs control" if a["delta"] > 0 else "rotate wins (keep hurts)")
+                print(f"    {lab:22} +{N}mo: Δ {a['delta']:>+6.1f}% (n={a['n']}) vs control Δ {c['delta']:>+6.1f}% "
+                      f"(edge {edge:>+6.1f}pp) -> {verdict}", flush=True)
+
     try:
         from core.models import BacktestResult
         from django.utils import timezone
+        payload = {"buckets": {k: {str(n): v for n, v in d.items()} for k, d in out.items()},
+                   "by_label": {k: {"mean_delta3_pct": float(np.mean(v) * 100), "n": len(v)} for k, v in label_bkt.items()},
+                   "fwd_horizons": FWD, "strong_threshold": STRONG, "flagship_total": D["perf"]["total"],
+                   "n_months": len(months), "n_pick_names": len(tickers)}
         BacktestResult.objects.update_or_create(
-            kind="earnings_hold", defaults={"payload": json.loads(json.dumps(p, default=str)),
+            kind="earnings_hold", defaults={"payload": json.loads(json.dumps(payload, default=str)),
                                             "computed_at": timezone.now()})
-        print("Saved BacktestResult[earnings_hold]", flush=True)
+        print("\nSaved BacktestResult[earnings_hold]", flush=True)
     except Exception as e:
         print("DB save failed:", e, flush=True)
 
