@@ -504,7 +504,7 @@ def build():
     # behind EVENT2_LAB so normal/flagship runs aren't slowed; empty by default so entry modes fall back to cheapest.
     _EMPTY = pd.DataFrame(index=midx, columns=stock_m.columns)
     sec13d_m = earn_beat_m = earn_soon_m = insider_net_m = congress_m = _EMPTY
-    if os.environ.get("EVENT2_LAB"):
+    if os.environ.get("EVENT2_LAB") or os.environ.get("PROPER_DATA"):
         _cols = set(stock_m.columns)
         _midx_i = np.array([pd.Timestamp(d).value for d in midx], dtype="int64")
         def _recent(rows, window_days, agg="sum"):
@@ -542,6 +542,31 @@ def build():
         congress_m = _recent(_cg, 120, "sum")                                 # net legislator buys, trailing 120d
         print(f"EVENT2 coverage: 13D {100*sec13d_m.notna().mean().mean():.0f}% | earn_beat {100*earn_beat_m.notna().mean().mean():.0f}%"
               f" | insider_net {100*insider_net_m.notna().mean().mean():.0f}% | congress {100*congress_m.notna().mean().mean():.0f}%", flush=True)
+    # OPTIONS panels (per-stock, 2022-09+; OptionSnapshot): IV skew (put-call), put/call OI ratio, dealer GEX.
+    opt_skew_m = opt_pc_m = opt_gex_m = _EMPTY
+    if os.environ.get("OPT_LAB") or os.environ.get("PROPER_DATA"):
+        _op = _option_panels(midx, list(stock_m.columns))
+        opt_skew_m, opt_pc_m, opt_gex_m = _op["iv_skew"], _op["pc_oi"], _op["gex"]
+        print(f"OPTIONS coverage: iv_skew {100*opt_skew_m.notna().mean().mean():.0f}% | pc_oi {100*opt_pc_m.notna().mean().mean():.0f}%"
+              f" | gex {100*opt_gex_m.notna().mean().mean():.0f}%  (2022-09+, liquid names only)", flush=True)
+    # ETF FUND-FLOW (sector-level, 2021-08+; ETFFlow): net creation/redemption $ trailing ~21 trading days per sector
+    # ETF, sampled at month-end. A SECTOR signal (not a within-sector stock tilt) -> used to gate/tilt sector selection.
+    sector_flow_m = _EMPTY
+    if os.environ.get("FLOW_LAB") or os.environ.get("PROPER_DATA"):
+        from core.models import ETFFlow as _EF
+        _fr = list(_EF.objects.exclude(flow_usd__isnull=True).values_list("ticker", "date", "flow_usd"))
+        from collections import defaultdict as _dd
+        _byt = _dd(list)
+        for _tk, _d, _fv in _fr:
+            if _fv is not None:
+                _byt[_tk].append((pd.Timestamp(_d), float(_fv)))
+        _out = {}
+        for _tk, _pts in _byt.items():
+            _s = pd.Series({_d: _v for _d, _v in _pts}).sort_index()
+            _s = _s.groupby(_s.index).sum()
+            _out[_tk] = _s.rolling("21D").sum().reindex(_s.index.union(midx)).sort_index().ffill().reindex(midx)
+        sector_flow_m = pd.DataFrame(_out).reindex(index=midx)
+        print(f"FLOW coverage: {sector_flow_m.notna().any().sum()} ETFs, {100*sector_flow_m.notna().mean().mean():.0f}% cells", flush=True)
     # VOLATILITY SQUEEZE (wedge/triangle proxy — Finviz patterns): trailing-6mo std of monthly returns, LOW = a
     # contracting/coiling range. Lower = tighter squeeze (pattern-breakout setups). Objectively computable (unlike H&S).
     squeeze_m = smret_m.rolling(6, min_periods=3).std()
@@ -974,7 +999,7 @@ def build():
             growth_fallback=False, top_n=None, size_mode="conv", cost_bps=0.0, lev=1.0, largecap_mode=None,
             defensive_riskoff=None, largecap_keep=None, sector_playbook=False, regime_switch=None,
             regime_lookback=6, regime_signal="vs", regime_hyst=0, no_cash=False, book="value",
-            conv=None, conc_regime=None, entry=None, entry_k=5):
+            conv=None, conc_regime=None, entry=None, entry_k=5, flow_gate=False):
         rets, spies, dl_picks, mrets = [], [], 0, []
         _conv = float(conv) if conv is not None else CONV   # A/D-divergence conviction weight (default div_2x)
         def _entry_pick(cands):
@@ -1012,6 +1037,10 @@ def build():
             if entry == "no_downgrade": return _pick_by(net_upg_m, hi=True, gate=lambda v: v >= 0)  # avoid net-downgraded
             if entry == "insider":      return _pick_by(insider_m, hi=True)     # most insider open-market buying (90d)
             if entry == "sec13d":       return _pick_by(sec13d_m, hi=True)      # activist 13D stake filed (catalyst)
+            if entry == "opt_pc":       return _pick_by(opt_pc_m, hi=False)     # low put/call OI ratio (bullish posn)
+            if entry == "opt_gex":      return _pick_by(opt_gex_m, hi=True)     # high dealer GEX (long gamma = stable)
+            if entry == "opt_skew_lo":  return _pick_by(opt_skew_m, hi=False)   # low put-call IV skew (less downside fear)
+            if entry == "opt_skew_hi":  return _pick_by(opt_skew_m, hi=True)    # high skew (contrarian: fear = opportunity)
             if entry == "earn_beat":    return _pick_by(earn_beat_m, hi=True)   # PEAD: recent positive EPS surprise
             if entry == "congress":     return _pick_by(congress_m, hi=True)    # net legislator buying
             if entry == "insider_net":  return _pick_by(insider_net_m, hi=True) # net insider $ (buy - sell)
@@ -1192,6 +1221,12 @@ def build():
                 top = _c.head(TOP_N).index
             else:
                 top = a.dropna().sort_values(ascending=False).head(TOP_N).index
+            if flow_gate and not sector_flow_m.empty:      # ETF FUND-FLOW confirm: from the accel ranking, keep only
+                _pos = [e for e in a.dropna().sort_values(ascending=False).index   # sectors with money flowing IN
+                        if e in sector_flow_m.columns and pd.notna(sector_flow_m.loc[date, e])
+                        and float(sector_flow_m.loc[date, e]) > 0]
+                if len(_pos) >= _tn:
+                    top = pd.Index(_pos[:_tn])
 
             # REGIME SWITCH (user): use the rotation system's own value/small-cap-leadership signal to pick the
             # config — AGGRESSIVE (skip large-cap-only, pure small-cap) when our regime is favorable; CORE (keep
@@ -2454,6 +2489,35 @@ def build():
         _row("tl_support (flagship ref)", dict(entry="tl_support"))
         for _e in ("sec13d", "earn_beat", "earn_avoid", "insider_net", "avoid_insider_sell", "congress"):
             _row(f"entry={_e}", dict(entry=_e))
+        sys.exit(0)
+
+    if os.environ.get("PROPER_DATA"):
+        # ── FAIR test of every PARTIAL-DATA signal on the window where its data is VALID (user: "we need proper
+        # data") — options 2022-09+, ETF-flows 2021-08+, insider/events/analyst 2020+ — each vs BASELINE on the
+        # SAME window, so the empty pre-data years don't dilute the signal to noise. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _blk(title, sd, arms):
+            r0 = run(True, True, **base, start_date=sd)
+            print(f"\n  {title} (from {sd}) — baseline {r0['total']:.0f}%/Sh{r0['sharpe']:.2f}:", flush=True)
+            for lab, kw in arms:
+                r = run(True, True, **base, start_date=sd, **kw)
+                _v = "WIN " if r['total'] > r0['total'] else "lose"
+                print(f"    {lab:26}{r['total']:>10.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}  {_v} vs base", flush=True)
+        print("\n=== PROPER_DATA (each signal on its VALID window vs baseline same-window; tl_support ref) ===", flush=True)
+        _blk("OPTIONS 2022-09+ (IV/skew/pc/GEX)", "2022-09-01",
+             [("tl_support (ref)", dict(entry="tl_support")), ("opt_pc (low P/C)", dict(entry="opt_pc")),
+              ("opt_gex (high GEX)", dict(entry="opt_gex")), ("opt_skew_lo", dict(entry="opt_skew_lo")),
+              ("opt_skew_hi (contrarian)", dict(entry="opt_skew_hi"))])
+        _blk("ETF FLOWS 2021-08+ (sector gate)", "2021-08-01",
+             [("tl_support (ref)", dict(entry="tl_support")), ("flow_gate (sector inflow)", dict(flow_gate=True)),
+              ("flow_gate + tl_support", dict(flow_gate=True, entry="tl_support"))])
+        _blk("INSIDER 2020+", "2020-01-01",
+             [("insider_net", dict(entry="insider_net")), ("avoid_insider_sell", dict(entry="avoid_insider_sell"))])
+        _blk("EVENTS/ANALYST 2020+", "2020-01-01",
+             [("no_downgrade", dict(entry="no_downgrade")), ("sec13d", dict(entry="sec13d")),
+              ("earn_beat (PEAD)", dict(entry="earn_beat")), ("congress", dict(entry="congress")),
+              ("upside_pb_60", dict(value_key="upside_pb_60"))])
         sys.exit(0)
 
     if os.environ.get("TL_TF"):
