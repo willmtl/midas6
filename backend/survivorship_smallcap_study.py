@@ -250,12 +250,12 @@ def _f(x):
         return None
 
 
-def _perf(r, spy):
+def _perf(r, spy, ppy=12.0):
     r = np.asarray(r, float); n = len(r)
     tot = float(np.prod(1 + r) - 1) * 100
     sp = float(np.prod(1 + np.asarray(spy)) - 1) * 100
-    ann = (float(np.prod(1 + r)) ** (12.0 / n) - 1) * 100 if n else 0.0
-    sh = float(r.mean() / r.std() * np.sqrt(12)) if r.std() > 1e-9 else 0.0
+    ann = (float(np.prod(1 + r)) ** (ppy / n) - 1) * 100 if n else 0.0
+    sh = float(r.mean() / r.std() * np.sqrt(ppy)) if r.std() > 1e-9 else 0.0
     eqc = np.cumprod(1 + r); dd = float(((eqc / np.maximum.accumulate(eqc)) - 1).min() * 100)
     t = _tstat_from_returns(list(r))
     return dict(total=round(tot, 1), annual=round(ann, 1), vs_spy=round(tot - sp, 1), sharpe=round(sh, 2),
@@ -1034,10 +1034,13 @@ def build():
             defensive_riskoff=None, largecap_keep=None, sector_playbook=False, regime_switch=None,
             regime_lookback=6, regime_signal="vs", regime_hyst=0, no_cash=False, book="value",
             conv=None, conc_regime=None, entry=None, entry_k=5, flow_gate=False, live=False, conv_signal="ad",
-            wait_entry=None, small_max=None, lev_regime=None):
+            wait_entry=None, small_max=None, lev_regime=None, small_min=0.0, min_dvol=None, rebal=1):
         rets, spies, dl_picks, mrets = [], [], 0, []
+        _step = int(rebal) if rebal else 1                 # rebalance cadence in months (1=monthly, 3=quarterly)
+        _min_dvol = float(min_dvol) if min_dvol is not None else MIN_DVOL   # $/day liquidity floor (executability)
         _conv = float(conv) if conv is not None else CONV   # A/D-divergence conviction weight (default div_2x)
-        _small_max = float(small_max) if small_max is not None else SMALL   # micro-cap depth: small-cap size ceiling
+        _small_max = float(small_max) if small_max is not None else SMALL   # small-cap size ceiling
+        _small_min = float(small_min)                                       # size FLOOR (drop the tiniest names)
         def _entry_pick(cands):
             """Flagship default pick = cheapest (drift-)P/B, with optional ENTRY-TIMING on the stock's own RSI(10).
             entry=None reproduces the flagship exactly. Modes gate/reorder the `entry_k` cheapest names."""
@@ -1197,14 +1200,17 @@ def build():
         traded = set(); banned = set()  # ban_first_loss: names whose FIRST-ever trade lost -> never buy again
         _sd = pd.Timestamp(start_date) if start_date else None
         _ed = pd.Timestamp(end_date) if end_date else None
-        for i in range(max(6, warmup), len(midx) - (0 if live else 1)):
-            date = midx[i]; ndate = midx[i + 1] if (i + 1) < len(midx) else None   # ndate None = LIVE pick month
+        _i0 = max(6, warmup)
+        for i in range(_i0, len(midx) - (0 if live else _step)):
+            if ((i - _i0) % _step) != 0:
+                continue                # REBAL cadence: only re-select on rebalance-boundary months (hold between)
+            date = midx[i]; ndate = midx[i + _step] if (i + _step) < len(midx) else None   # ndate None = LIVE pick month
             if (_sd is not None and date < _sd) or (_ed is not None and date > _ed):
                 continue                # window restriction (apples-to-apples sub-period walk-forward)
             if include_months is not None and date not in include_months:
                 continue                # regime-conditional: only accumulate months in this regime
             if ndate is not None:
-                sp = spy_m.iloc[i + 1] / spy_m.iloc[i] - 1
+                sp = spy_m.iloc[i + _step] / spy_m.iloc[i] - 1
                 if not np.isfinite(sp):
                     continue
             else:
@@ -1313,7 +1319,7 @@ def build():
             if trace is not None:
                 def _fwd(e):     # the sleeve ETF's OWN return over the hold month (buy date -> sell date)
                     try:
-                        return _f(etf_m[e].iloc[i + 1] / etf_m[e].iloc[i] - 1)
+                        return _f(etf_m[e].iloc[i + _step] / etf_m[e].iloc[i] - 1)
                     except Exception:
                         return None
                 # FULL ranking (every sleeve, not just top-10) with its accel + own month return, for the blotter
@@ -1343,10 +1349,11 @@ def build():
                          and (_mom_book or (pd.notna(pb.loc[date, h]) and pb.loc[date, h] > MIN_PB))
                          and pd.notna(as_traded_usd.loc[date, h]) and as_traded_usd.loc[date, h] >= min_price
                          and (_mom_book or not bool(trap.loc[date, h]))
-                         and pd.notna(dvol_usd.loc[date, h]) and dvol_usd.loc[date, h] >= MIN_DVOL
+                         and pd.notna(dvol_usd.loc[date, h]) and dvol_usd.loc[date, h] >= _min_dvol
                          and not (pharma and (pd.isna(mktcap_usd.loc[date, h]) or mktcap_usd.loc[date, h] < MICRO_PHARMA_MIN))]
                 g0 = [x for x in cands if bool(low.loc[date, x])] or cands
-                sm = [x for x in g0 if pd.notna(mktcap_usd.loc[date, x]) and mktcap_usd.loc[date, x] < _small_max]
+                sm = [x for x in g0 if pd.notna(mktcap_usd.loc[date, x])
+                      and _small_min <= mktcap_usd.loc[date, x] < _small_max]
                 _lc_only = (not sm) and bool(g0)       # sector offers ONLY large-caps -> the loss-prone fallback
                 _lc_mom = False
                 # commodity/miner exemption (user): a large-cap PRODUCER (ALB/SQM/MP) is a real cheap producer,
@@ -1413,7 +1420,7 @@ def build():
                         # proxy_etf True = hold ANY skipped ETF; or a set of types {"commodity","bond","foreign"}
                         _typ = "commodity" if etf in COMMODITY_ETFS else ("bond" if etf in BOND_ETFS else "foreign")
                         if (proxy_etf is True) or (_typ in proxy_etf):
-                            re = etf_m[etf].iloc[i + 1] / etf_m[etf].iloc[i] - 1 if etf in etf_m.columns else np.nan
+                            re = etf_m[etf].iloc[i + _step] / etf_m[etf].iloc[i] - 1 if etf in etf_m.columns else np.nan
                             if np.isfinite(re):
                                 proxy_hold[etf] += 1; proxy_contrib += float(re)
                                 wsum += 1.0; rr += 1.0 * float(re)
@@ -1650,7 +1657,7 @@ def build():
                         if e in BOND_ETFS and e in etf_m.columns:
                             _bond = e; break
                     if _bond is not None:
-                        _br = etf_m[_bond].iloc[i + 1] / etf_m[_bond].iloc[i] - 1
+                        _br = etf_m[_bond].iloc[i + _step] / etf_m[_bond].iloc[i] - 1
                         if np.isfinite(_br):
                             wsum = 1.0; rr = float(_br)
                             if tr is not None:
@@ -1672,7 +1679,7 @@ def build():
                 elif spy200 == "half":
                     _mret *= 0.5                         # de-risk to half exposure
                 if hedge is not None:                    # short `hedge` fraction of QQQ (long value / short growth)
-                    _qr = qqq_close_m.iloc[i + 1] / qqq_close_m.iloc[i] - 1
+                    _qr = qqq_close_m.iloc[i + _step] / qqq_close_m.iloc[i] - 1
                     if np.isfinite(_qr):
                         _mret -= hedge * float(_qr)
             if cost_bps > 0:            # transaction-cost drag: charge cost_bps on the fraction of the basket
@@ -1691,12 +1698,12 @@ def build():
                 tr["basket_mae"] = (sum(mv * wv for mv, wv in _mw) / sum(wv for _, wv in _mw)) if _mw else None
                 tr["basket_ret"] = float(rr / wsum); tr["spy_ret"] = float(sp)
                 try:                                   # QQQ (Nasdaq-100 / mega-cap growth) benchmark for the same month
-                    _qr = qqq_close_m.iloc[i + 1] / qqq_close_m.iloc[i] - 1
+                    _qr = qqq_close_m.iloc[i + _step] / qqq_close_m.iloc[i] - 1
                     tr["qqq_ret"] = float(_qr) if np.isfinite(_qr) else None
                 except Exception:
                     tr["qqq_ret"] = None
                 trace.append(tr)
-        perf = _perf(rets, spies); perf["delisted_picks"] = dl_picks; perf["mega_picks"] = mega_picks
+        perf = _perf(rets, spies, ppy=12.0 / _step); perf["delisted_picks"] = dl_picks; perf["mega_picks"] = mega_picks
         perf["monthly"] = mrets
         if proxy_etf:
             comm = {e: n for e, n in proxy_hold.items() if e in COMMODITY_ETFS}
@@ -2553,6 +2560,49 @@ def build():
             _row(f"entry={_e}", dict(entry=_e))
         sys.exit(0)
 
+    if os.environ.get("LIQ_LAB"):
+        # ── LIQUIDITY FLOOR sweep (user): raise the $/day dollar-volume floor for real-money executability. Higher
+        # floor = bigger, more tradeable names but drops the illiquid nano-cap tail (where some winners live). ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support")
+        def _row(lab, mv):
+            tr = []
+            r = run(True, True, **base, min_dvol=mv, trace=tr)
+            mc = sorted(p["mktcap_usd"] for t in tr for p in t.get("picks", []) if p.get("mktcap_usd"))
+            med = (mc[len(mc) // 2] / 1e6) if mc else 0
+            npk = len(mc)
+            print(f"  {lab:22}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}  picks {npk:>4}  median-mcap ${med:,.0f}M", flush=True)
+            return r
+        print("\n=== LIQ_LAB (honest 2016-2026, full universe): daily-$-volume liquidity floor ===", flush=True)
+        _row("$2M/day", 2e6)
+        _row("$5M/day (current)", 5e6)
+        _row("$10M/day", 1e7)
+        _row("$25M/day", 2.5e7)
+        _row("$50M/day", 5e7)
+        _row("$100M/day", 1e8)
+        sys.exit(0)
+
+    if os.environ.get("REBAL_LAB"):
+        # ── REBALANCE CADENCE sweep (user): hold the SAME selection logic but rotate every N months instead of
+        # monthly. Quarterly (3) / semi-annual (6) / annual (12) hold the book longer -> fewer trades, lower cost,
+        # but staler picks. Sharpe annualized per-cadence (ppy=12/N) so it's apples-to-apples with monthly. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support")
+        def _row(lab, nm):
+            tr = []
+            r = run(True, True, **base, rebal=nm, trace=tr)
+            print(f"  {lab:22}{r['total']:>12.0f}%  ann {r['annual']:>6.1f}%  DD{r['dd']:>6.1f}%  "
+                  f"Sh{r['sharpe']:>5.2f}  rebalances {r['months']:>4}", flush=True)
+            return r
+        print("\n=== REBAL_LAB (honest 2016-2026, full universe): rebalance cadence (hold longer, rotate less) ===", flush=True)
+        _row("1mo (current)", 1)
+        _row("2mo", 2)
+        _row("3mo (quarterly)", 3)
+        _row("4mo", 4)
+        _row("6mo (semi-annual)", 6)
+        _row("12mo (annual)", 12)
+        sys.exit(0)
+
     if os.environ.get("STRUCT_LAB"):
         # ── STRUCTURAL directions (user "fix all") on the div4x+drift+tl_support flagship, full 1973-name universe:
         #   (1) MICRO-CAP depth — lower the small-cap size ceiling (small_max) below the $2B default.
@@ -2574,6 +2624,15 @@ def build():
         _row("regime 1.5x-on / 1x-off", dict(lev_regime=(1.5, 1.0)))
         _row("regime 2.0x-on / 1x-off", dict(lev_regime=(2.0, 1.0)))
         _row("regime 1.5x-on / 0.5x-off", dict(lev_regime=(1.5, 0.5)))
+        print("  -- (3) SIZE FLOOR (drop the tiniest; keep <$2B ceiling) --", flush=True)
+        _row(">$500M ($0.5-2B)", dict(small_min=5e8))
+        _row(">$1B ($1-2B band)", dict(small_min=1e9))
+        _row(">$1.5B ($1.5-2B)", dict(small_min=1.5e9))
+        print("  -- (4) SIZE GRADIENT up to mega-cap (does the edge survive in bigger names?) --", flush=True)
+        _row("$1B-5T (all >=$1B, user)", dict(small_min=1e9, small_max=5e12))
+        _row("$2B-10B (mid-cap)", dict(small_min=2e9, small_max=1e10))
+        _row("$10B-100B (large-cap)", dict(small_min=1e10, small_max=1e11))
+        _row(">$100B (mega-cap)", dict(small_min=1e11, small_max=5e12))
         sys.exit(0)
 
     if os.environ.get("WAIT_LAB"):
