@@ -394,7 +394,7 @@ def kpi_tile(k, v, dd, hero=False):
 # ---------- equity curve ----------
 curve = D["curve"]
 curve_js = json.dumps([{"d": c["date"], "f": round(c["flagship"] * 100000), "s": round(c["spy"] * 100000),
-                        "r": c["ret"]} for c in curve])
+                        "q": round(c.get("qqq", c["spy"]) * 100000), "r": c["ret"]} for c in curve])
 configs_js = json.dumps([{"key": c["key"], "total": c["total"], "final_100k": c.get("final_100k"),
                           "cagr": c.get("cagr"), "sharpe": c["sharpe"], "dd": c["dd"], "curve": c.get("curve", [])}
                          for c in CONFIGS])
@@ -436,6 +436,7 @@ for c in D["calendar"]:
       <td class="l mono">{esc(c['year'])}</td>
       <td class="num strong">{pctp(c['strategy'])}</td>
       <td class="num">{pctp(c['spy'])}</td>
+      <td class="num">{pctp(c.get('qqq'))}</td>
       <td class="num">{pctp(c['excess'])}</td>
       <td class="num mut">{c['months']}</td>
     </tr>""")
@@ -776,7 +777,7 @@ section{{margin-top:60px; scroll-margin-top:60px}}
 .chartcard canvas{{width:100%; height:320px; display:block}}
 .legend{{display:flex; gap:22px; flex-wrap:wrap; margin:14px 2px 2px; font-size:13px; font-family:var(--mono)}}
 .legend i{{display:inline-block; width:22px; height:3px; border-radius:2px; margin-right:8px; vertical-align:middle}}
-.legend .fl{{background:var(--gold)}} .legend .sp{{background:var(--mut)}}
+.legend .fl{{background:var(--gold)}} .legend .sp{{background:var(--mut)}} .legend .qq{{background:var(--neg)}}
 .chart-note{{font-size:12px; color:var(--mut); margin:6px 2px 0}}
 .tablecard{{background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; box-shadow:var(--shadow); margin-top:20px}}
 .scrollx{{overflow-x:auto}}
@@ -939,14 +940,15 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
       <div class="chartcard">
         <canvas id="eq" aria-label="Equity curve: flagship vs S&amp;P 500"></canvas>
         <div class="legend">
-          <span><i class="fl"></i>usca_small — ${S['final_100k_flagship']:,}</span>
+          <span><i class="fl"></i>flagship — ${S['final_100k_flagship']:,}</span>
           <span><i class="sp"></i>S&amp;P 500 — ${S['final_100k_spy']:,}</span>
+          <span><i class="qq"></i>QQQ (Nasdaq-100) — ${S.get('final_100k_qqq', 0):,}</span>
         </div>
-        <p class="chart-note">Best month {bm['date']} {pct(bm['ret'])} · worst {wm['date']} {pct(wm['ret'])}. Monthly rebalance, equal-weight, 2× tilt on A/D-conviction names.</p>
+        <p class="chart-note">Best month {bm['date']} {pct(bm['ret'])} · worst {wm['date']} {pct(wm['ret'])}. Monthly rebalance. QQQ = the mega-cap-growth benchmark we lose to in hostile regimes.</p>
       </div>
       <div class="tablecard calcard" style="margin-top:0" id="years">
         <div class="scrollx"><table class="sortable">
-          <thead><tr><th class="l">Year</th><th>Strategy</th><th>S&amp;P 500</th><th>Excess</th><th>Mo</th></tr></thead>
+          <thead><tr><th class="l">Year</th><th>Strategy</th><th>S&amp;P 500</th><th>QQQ</th><th>Excess</th><th>Mo</th></tr></thead>
           <tbody>{"".join(cal_rows)}</tbody>
         </table></div>
       </div>
@@ -1086,7 +1088,7 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
     cv.width=w*dpr; cv.height=h*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
     var padL=64,padR=16,padT=14,padB=26;
     var gold=css('--gold'), mut=css('--mut'), line=css('--line');
-    var maxV=0; data.forEach(function(d){{maxV=Math.max(maxV,(d.lf||d.f),d.s);}}); var minV=100000;
+    var maxV=0; data.forEach(function(d){{maxV=Math.max(maxV,(d.lf||d.f),d.s,(d.q||d.s));}}); var minV=100000;
     function X(i){{return padL+(w-padL-padR)*(i/(data.length-1));}}
     function Y(v){{return padT+(h-padT-padB)*(1-(v-minV)/(maxV-minV));}}
     ctx.font='11px "SF Mono",Consolas,monospace'; ctx.textBaseline='middle';
@@ -1100,7 +1102,7 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
     ctx.lineTo(X(data.length-1),Y(minV)); ctx.lineTo(X(0),Y(minV)); ctx.closePath(); ctx.fillStyle=grad; ctx.fill();
     function plot(key,color,wd){{ ctx.beginPath(); ctx.lineWidth=wd; ctx.strokeStyle=color; ctx.lineJoin='round';
       data.forEach(function(d,i){{ var x=X(i),y=Y(key==='f'?(d.lf||d.f):d[key]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }}); ctx.stroke(); }}
-    plot('s',mut,1.6); plot('f',gold,2.4);
+    plot('q',css('--neg'),1.3); plot('s',mut,1.6); plot('f',gold,2.4);
     var last=data[data.length-1]; ctx.fillStyle=gold; ctx.beginPath(); ctx.arc(X(data.length-1),Y(last.f),4,0,7); ctx.fill();
   }}
   draw(); window.addEventListener('resize',draw);

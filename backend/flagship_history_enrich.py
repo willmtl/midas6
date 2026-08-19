@@ -53,15 +53,17 @@ def main():
     by_sector = defaultdict(lambda: {"sector": None, "etf": None, "in_top": 0, "picked": 0, "skipped": 0,
                                      "sum_ret": 0.0, "n_ret": 0})
     curve = []
-    eq_f = eq_s = 1.0
+    eq_f = eq_s = eq_q = 1.0
     all_picks = []
     n_conviction = total_picks = n_prof = n_small = 0
     allpb = []; allpe = []; allroe = []; allde = []; allmc = []
 
     for m in months:
         eq_f *= (1 + m["basket_ret"]); eq_s *= (1 + m["spy_ret"])
-        curve.append({"date": m["date"], "flagship": round(eq_f, 4), "spy": round(eq_s, 4),
-                      "ret": m["basket_ret"], "spy_ret": m["spy_ret"]})
+        _qr = m.get("qqq_ret")
+        eq_q *= (1 + (_qr if _qr is not None else m["spy_ret"]))   # QQQ curve (fall back to SPY if a month lacks it)
+        curve.append({"date": m["date"], "flagship": round(eq_f, 4), "spy": round(eq_s, 4), "qqq": round(eq_q, 4),
+                      "ret": m["basket_ret"], "spy_ret": m["spy_ret"], "qqq_ret": _qr})
         for s in m["top_sectors"]:
             bs = by_sector[s["etf"]]; bs["sector"] = s["sector"]; bs["etf"] = s["etf"]; bs["in_top"] += 1
         for sk in m["skipped"]:
@@ -158,8 +160,9 @@ def main():
         mm = years[y]
         s = float(np.prod([1 + x["basket_ret"] for x in mm]) - 1) * 100
         sp = float(np.prod([1 + x["spy_ret"] for x in mm]) - 1) * 100
-        cal.append({"year": y, "strategy": round(s, 1), "spy": round(sp, 1), "months": len(mm),
-                    "excess": round(s - sp, 1)})
+        qq = float(np.prod([1 + (x.get("qqq_ret") if x.get("qqq_ret") is not None else x["spy_ret"]) for x in mm]) - 1) * 100
+        cal.append({"year": y, "strategy": round(s, 1), "spy": round(sp, 1), "qqq": round(qq, 1),
+                    "months": len(mm), "excess": round(s - sp, 1)})
 
     best_m = max(curve, key=lambda c: c["ret"]); worst_m = min(curve, key=lambda c: c["ret"])
     out = {
@@ -177,7 +180,8 @@ def main():
                     "med_mktcap": med(allmc),
                     "best_month": {"date": best_m["date"], "ret": best_m["ret"]},
                     "worst_month": {"date": worst_m["date"], "ret": worst_m["ret"]},
-                    "final_100k_flagship": round(100000 * eq_f), "final_100k_spy": round(100000 * eq_s)},
+                    "final_100k_flagship": round(100000 * eq_f), "final_100k_spy": round(100000 * eq_s),
+                    "final_100k_qqq": round(100000 * eq_q)},
         "by_stock": stocks, "by_sector": sectors, "curve": curve, "calendar": cal,
         "best_picks": best_picks, "worst_picks": worst_picks, "months": months,
     }
