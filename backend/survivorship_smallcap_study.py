@@ -718,6 +718,39 @@ def build():
             return float(seg.min() / base - 1.0)
         except Exception:
             return None
+
+    def _wait_entry_ret(tk, d0, d1, spec):
+        """ENTRY-TIMING (user): the flagship picks tk at month-end d0, but WAIT for a short-horizon trigger in the
+        first N trading days before buying; hold to d1. spec = 'dip:PCT:DAYS' (limit-buy PCT% below d0 close, filled
+        on first touch else buy at window end), 'green:DAYS' (buy first up-day), 'low:DAYS' (look-ahead best-case
+        floor = ceiling reference), 'none' (buy at d0 close = baseline). Computed on LOCAL daily close (FX≈1 for the
+        mostly-US book; same for baseline so the comparison is apples-to-apples)."""
+        df = stock_daily.get(tk)
+        if df is None or "Close" not in df:
+            return None
+        c = df["Close"].dropna()
+        base = c.asof(d0); end = c.asof(d1)
+        if not (pd.notna(base) and base > 0 and pd.notna(end) and end > 0):
+            return None
+        parts = spec.split(":"); mode = parts[0]
+        win = c[c.index > d0]
+        if mode == "none" or len(win) == 0:
+            return float(end / base - 1.0)
+        if mode == "dip":
+            pct = float(parts[1]) / 100.0; days = int(parts[2]); win = win.iloc[:days]
+            lvl = base * (1 - pct); hit = win[win <= lvl]
+            entry = float(lvl) if len(hit) else float(win.iloc[-1])
+        elif mode == "green":
+            days = int(parts[1]); win = win.iloc[:days]; vals = win.values
+            entry = float(win.iloc[-1])
+            for _i in range(1, len(vals)):
+                if vals[_i] > vals[_i - 1]:
+                    entry = float(vals[_i]); break
+        elif mode == "low":
+            days = int(parts[1]); win = win.iloc[:days]; entry = float(win.min())   # look-ahead ceiling ref
+        else:
+            entry = float(base)
+        return float(end / entry - 1.0) if entry > 0 else None
     reps = load_financial_reports(universe)
     sh, eq, ni, dt = (_pit_monthly_panel(reps, f, midx) for f in
                       ("shares_outstanding", "total_equity", "net_income", "total_debt"))
@@ -937,6 +970,7 @@ def build():
     dvol_usd = dvol * ret_factor                   # $5M liquidity floor must be in USD (KRW 5M is ~$3.6k, not $5M)
     adl = pd.DataFrame(adl_m).reindex(index=midx, columns=common)
     ad_slope3 = adl - adl.shift(3); px_ret3 = px.pct_change(3)
+    rsi_slope3 = rsi10_m - rsi10_m.shift(3)   # 3mo change in monthly RSI(10) -> RSI divergence (rsi up while price down)
 
     # sector -> candidate tickers (survivors always; delisted optionally)
     def sector_cands(etf, include_delisted):
@@ -999,9 +1033,11 @@ def build():
             growth_fallback=False, top_n=None, size_mode="conv", cost_bps=0.0, lev=1.0, largecap_mode=None,
             defensive_riskoff=None, largecap_keep=None, sector_playbook=False, regime_switch=None,
             regime_lookback=6, regime_signal="vs", regime_hyst=0, no_cash=False, book="value",
-            conv=None, conc_regime=None, entry=None, entry_k=5, flow_gate=False, live=False):
+            conv=None, conc_regime=None, entry=None, entry_k=5, flow_gate=False, live=False, conv_signal="ad",
+            wait_entry=None, small_max=None, lev_regime=None):
         rets, spies, dl_picks, mrets = [], [], 0, []
         _conv = float(conv) if conv is not None else CONV   # A/D-divergence conviction weight (default div_2x)
+        _small_max = float(small_max) if small_max is not None else SMALL   # micro-cap depth: small-cap size ceiling
         def _entry_pick(cands):
             """Flagship default pick = cheapest (drift-)P/B, with optional ENTRY-TIMING on the stock's own RSI(10).
             entry=None reproduces the flagship exactly. Modes gate/reorder the `entry_k` cheapest names."""
@@ -1070,6 +1106,14 @@ def build():
             if entry == "tl_nodown":     # COMBINED: tl_support, but only among names NOT recently net-downgraded
                 pool = [h for h in _K if h not in net_upg_m.columns or pd.isna(net_upg_m.loc[date, h])
                         or float(net_upg_m.loc[date, h]) >= 0] or _K
+                return _tlpick(pool)
+            if entry == "rsi_div":       # RSI bullish divergence: RSI rising (3mo) while price falling -> strongest
+                q = [h for h in _K if h in rsi_slope3.columns and pd.notna(rsi_slope3.loc[date, h])
+                     and float(rsi_slope3.loc[date, h]) > 0 and pd.notna(px_ret3.loc[date, h]) and float(px_ret3.loc[date, h]) < 0]
+                return max(q, key=lambda h: float(rsi_slope3.loc[date, h])) if q else _K[0]
+            if entry == "tl_rsidiv":     # tl_support among RSI-divergence names (stack)
+                pool = [h for h in _K if h in rsi_slope3.columns and pd.notna(rsi_slope3.loc[date, h])
+                        and float(rsi_slope3.loc[date, h]) > 0 and pd.notna(px_ret3.loc[date, h]) and float(px_ret3.loc[date, h]) < 0] or _K
                 return _tlpick(pool)
             if entry == "improving":     # cheapest among IMPROVING-ROE names (droe_ttm>0), else cheapest
                 q = [h for h in _K if h in droe_ttm.columns and pd.notna(droe_ttm.loc[date, h])
@@ -1302,7 +1346,7 @@ def build():
                          and pd.notna(dvol_usd.loc[date, h]) and dvol_usd.loc[date, h] >= MIN_DVOL
                          and not (pharma and (pd.isna(mktcap_usd.loc[date, h]) or mktcap_usd.loc[date, h] < MICRO_PHARMA_MIN))]
                 g0 = [x for x in cands if bool(low.loc[date, x])] or cands
-                sm = [x for x in g0 if pd.notna(mktcap_usd.loc[date, x]) and mktcap_usd.loc[date, x] < SMALL]
+                sm = [x for x in g0 if pd.notna(mktcap_usd.loc[date, x]) and mktcap_usd.loc[date, x] < _small_max]
                 _lc_only = (not sm) and bool(g0)       # sector offers ONLY large-caps -> the loss-prone fallback
                 _lc_mom = False
                 # commodity/miner exemption (user): a large-cap PRODUCER (ALB/SQM/MP) is a real cheap producer,
@@ -1517,7 +1561,9 @@ def build():
                 held.add(p)
                 if pd.notna(mktcap_usd.loc[date, p]) and mktcap_usd.loc[date, p] > 5e10:
                     mega_picks += 1
-                r = _ret_delist(px_usd[p], date, ndate) if ndate is not None else 0.0   # LIVE: no fwd return
+                r = (0.0 if ndate is None else                                          # LIVE: no fwd return
+                     (_wait_entry_ret(p, date, ndate, wait_entry) if wait_entry          # ENTRY-TIMING overlay
+                      else _ret_delist(px_usd[p], date, ndate)))
                 if r is None or not np.isfinite(r):
                     if tr is not None:
                         tr["picks"].append({"sector": etf_name.get(etf, etf), "etf": etf, "ticker": p,
@@ -1531,7 +1577,13 @@ def build():
                     continue
                 if p in delisted_sector:
                     dl_picks += 1
-                w = _conv if accumulating(p, date) else 1.0
+                if conv_signal == "rsi" or conv_signal == "both":   # RSI-divergence as the conviction weight signal
+                    _rs = rsi_slope3.loc[date].get(p); _pr = px_ret3.loc[date].get(p)
+                    _rsi_cv = pd.notna(_rs) and pd.notna(_pr) and _rs > 0 and _pr < 0
+                    _cv = _rsi_cv if conv_signal == "rsi" else (accumulating(p, date) and _rsi_cv)
+                else:
+                    _cv = accumulating(p, date)                      # default: A/D-divergence (the wired signal)
+                w = _conv if _cv else 1.0
                 if size_mode == "accel":            # bigger bet on the hotter sector (weight ∝ 1+accel)
                     _ac = accel.loc[date, etf] if etf in accel.columns else np.nan
                     if pd.notna(_ac):
@@ -1627,8 +1679,11 @@ def build():
                 turnover = len(held ^ prev_held) / max(1, len(held))   # that turned over (symmetric diff ≈ two-way)
                 _mret -= (cost_bps / 10000.0) * turnover
             prev_held = set(held)
-            if lev != 1.0:              # leverage: scale the monthly return (return-additive; -100% floor = ruin month)
-                _mret = max(-0.99, lev * _mret)
+            _lev = lev
+            if lev_regime is not None:   # REGIME-CONDITIONAL leverage: lever UP only when our own factor leads
+                _lev = lev_regime[0] if (regime_switch and bool(_rsig.get(date, True))) else lev_regime[1]
+            if _lev != 1.0:              # leverage: scale the monthly return (return-additive; -100% floor = ruin month)
+                _mret = max(-0.99, _lev * _mret)
             rets.append(_mret); spies.append(float(sp)); mrets.append((str(pd.Timestamp(date).date()), float(_mret)))
             if tr is not None:
                 # basket worst intra-month drawdown = weighted mean of each holding's max adverse excursion
@@ -2496,6 +2551,84 @@ def build():
         _row("tl_support (flagship ref)", dict(entry="tl_support"))
         for _e in ("sec13d", "earn_beat", "earn_avoid", "insider_net", "avoid_insider_sell", "congress"):
             _row(f"entry={_e}", dict(entry=_e))
+        sys.exit(0)
+
+    if os.environ.get("STRUCT_LAB"):
+        # ── STRUCTURAL directions (user "fix all") on the div4x+drift+tl_support flagship, full 1973-name universe:
+        #   (1) MICRO-CAP depth — lower the small-cap size ceiling (small_max) below the $2B default.
+        #   (2) REGIME-CONDITIONAL leverage — lever UP only when our own factor leads (lev_regime=(on, off)). ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support")
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            print(f"  {lab:34}{r['total']:>12.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}", flush=True)
+            return r
+        print("\n=== STRUCT_LAB (honest 2016-2026, full universe): micro-cap depth + regime-conditional leverage ===", flush=True)
+        _row("BASELINE (<$2B small-cap)", dict())
+        print("  -- (1) MICRO-CAP depth (small-cap size ceiling) --", flush=True)
+        _row("<$1B", dict(small_max=1e9))
+        _row("<$500M (micro)", dict(small_max=5e8))
+        _row("<$300M (nano)", dict(small_max=3e8))
+        print("  -- (2) REGIME-CONDITIONAL leverage (lever up only when factor leads) --", flush=True)
+        _row("lev 1.5x always (ref)", dict(lev=1.5))
+        _row("regime 1.5x-on / 1x-off", dict(lev_regime=(1.5, 1.0)))
+        _row("regime 2.0x-on / 1x-off", dict(lev_regime=(2.0, 1.0)))
+        _row("regime 1.5x-on / 0.5x-off", dict(lev_regime=(1.5, 0.5)))
+        sys.exit(0)
+
+    if os.environ.get("WAIT_LAB"):
+        # ── ENTRY-TIMING (user): after the flagship picks a name, WAIT up to 1/2/3 weeks for a short-horizon
+        # trigger before buying (dip limit-buy, or first up-day), then hold to next month-end. Does a better entry
+        # PRICE beat buying at month-end? 'low' = look-ahead best-case (buy the window low) as the ceiling. All on
+        # the tl_support flagship; baseline = 'none' (buy at month-end), same LOCAL-ccy basis so it's apples-to-apples.
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support")
+        def _row(lab, we):
+            r = run(True, True, **base, wait_entry=we)
+            print(f"  {lab:34}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}", flush=True)
+            return r
+        print("\n=== WAIT_LAB (div4x+drift+tl_support): wait 1/2/3 weeks for an entry trigger vs buy-at-month-end ===", flush=True)
+        _row("BASELINE buy month-end (none)", "none")
+        print("  -- DIP limit-buy (fill X% below month-end close within N days, else buy at window end) --", flush=True)
+        _row("dip 2% / 1wk (5d)", "dip:2:5")
+        _row("dip 2% / 2wk (10d)", "dip:2:10")
+        _row("dip 2% / 3wk (15d)", "dip:2:15")
+        _row("dip 3% / 2wk (10d)", "dip:3:10")
+        _row("dip 5% / 3wk (15d)", "dip:5:15")
+        print("  -- buy first UP-day within window (confirm strength) --", flush=True)
+        _row("green / 1wk (5d)", "green:5")
+        _row("green / 2wk (10d)", "green:10")
+        print("  -- look-ahead ceiling (buy the window LOW; not tradeable, upper bound) --", flush=True)
+        _row("low / 2wk (10d)", "low:10")
+        sys.exit(0)
+
+    if os.environ.get("RSI_DIV_LAB"):
+        # ── RSI DIVERGENCE (user: "did we test that") — RSI(10) rising over 3mo while price falls (bullish
+        # momentum divergence), the RSI analog of the A/D-divergence conviction. Test BOTH ways: as an ENTRY
+        # selector (prefer divergence names / stack on tl_support) AND as the CONVICTION WEIGHT (vs A/D). ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            pr = r.get("monthly", [])
+            print(f"  {lab:30}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}  2023{_yr(pr,'2023'):>6.0f}%", flush=True)
+            return r
+        print("\n=== RSI_DIV_LAB (honest 2016-2026, div4x+drift base): RSI divergence as selector & conviction ===", flush=True)
+        _row("BASELINE (cheapest)", dict())
+        _row("tl_support (flagship)", dict(entry="tl_support"))
+        print("  -- RSI divergence as ENTRY selector --", flush=True)
+        _row("rsi_div (prefer divergence)", dict(entry="rsi_div"))
+        _row("tl_rsidiv (tl among divergence)", dict(entry="tl_rsidiv"))
+        print("  -- RSI divergence as CONVICTION WEIGHT (vs A/D default) --", flush=True)
+        _row("conv=ad (default, A/D)", dict(conv_signal="ad"))
+        _row("conv=rsi (RSI divergence)", dict(conv_signal="rsi"))
+        _row("conv=both (A/D & RSI)", dict(conv_signal="both"))
+        _row("tl_support + conv=rsi", dict(entry="tl_support", conv_signal="rsi"))
         sys.exit(0)
 
     if os.environ.get("PROPER_DATA"):
@@ -3454,7 +3587,7 @@ def build():
         # no forward return). Single-source => live picks match the backtest BY CONSTRUCTION. Built-in RECONCILE:
         # a non-live run must produce identical picks on the last COMMON month (proves the live guards didn't
         # alter the normal path). Writes .data/studies/live_flagship_picks.json for the dashboard/scanner. ──
-        import sys, json
+        import sys   # NOTE: use module-level json (a local `import json` here shadows it and breaks the delisted map)
         _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support")
         tr = []; run(True, True, live=True, trace=tr, **_base)               # includes the current (ndate=None) month
         tr2 = []; run(True, True, trace=tr2, **_base)                        # non-live backtest (stops one month short)
