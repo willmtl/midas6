@@ -105,15 +105,18 @@ def _short_interest_panel(midx, cols, stale_days=45):
     return pd.DataFrame(out).reindex(index=midx, columns=cols)
 
 
-def _analyst_upside_panel(midx, px_panel, stale_days=90):
-    """PIT monthly analyst implied-upside panel = (latest price_target within `stale_days` as of month-end) /
-    (month-end close) − 1, per ticker. Source: .data/analyst_ratings.jsonl (Benzinga, backfilled). Targets
-    older than stale_days are dropped (not 'current'). Ratio cancels currency (both quote-ccy)."""
+def _analyst_upside_panel(midx, px_panel, stale_days=180, consensus=True):
+    """PIT monthly analyst implied-upside panel = (CONSENSUS price target within `stale_days` as of month-end) /
+    (month-end close) − 1, per ticker. Source: .data/analyst_ratings.jsonl (Benzinga, 2011+). 2026-08-18 COVERAGE
+    FIX (was 19% cells): (1) stale_days 90→180 (a 6-month-old target is still a data point), (2) CONSENSUS = MEDIAN
+    of ALL analysts' targets in the trailing window (not just the single latest) — denser AND more robust to one
+    stale/outlier analyst. Ratio cancels currency (both quote-ccy)."""
     import json
     from collections import defaultdict
     p = Path("/app/.data/analyst_ratings.jsonl")
     if not p.exists():
         return pd.DataFrame(index=midx, columns=px_panel.columns)
+    cols = set(px_panel.columns)
     byt = defaultdict(list)
     for line in p.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -122,19 +125,22 @@ def _analyst_upside_panel(midx, px_panel, stale_days=90):
             r = json.loads(line)
         except Exception:
             continue
-        if r.get("price_target") and r.get("date") and r.get("ticker") in px_panel.columns:
-            byt[r["ticker"]].append((pd.Timestamp(r["date"]), float(r["price_target"])))
+        if r.get("price_target") and r.get("date") and r.get("ticker") in cols:
+            byt[r["ticker"]].append((pd.Timestamp(r["date"]).value, float(r["price_target"])))
+    midx_i = np.array([pd.Timestamp(d).value for d in midx], dtype="int64")
+    stale_ns = int(stale_days) * 86400 * 1_000_000_000
     out = {}
-    midx_ser = pd.Series(midx, index=midx)
     for tk, pts in byt.items():
-        s = pd.Series({d: v for d, v in pts}).sort_index()
-        s = s[~s.index.duplicated(keep="last")]
-        tgt = s.reindex(s.index.union(midx)).sort_index().ffill().reindex(midx)
-        li = s.index
-        last_date = pd.Series([li[li <= d][-1] if len(li[li <= d]) else pd.NaT for d in midx], index=midx)
-        age = (midx_ser - last_date).dt.days
-        out[tk] = tgt.where(age <= stale_days)
-    tgt_panel = pd.DataFrame(out).reindex(index=midx, columns=px_panel.columns)
+        arr = np.array(sorted(pts), dtype="float64")           # sorted by date (ns), cols [date, target]
+        di, tv = arr[:, 0], arr[:, 1]
+        col = np.full(len(midx), np.nan)
+        for j, d in enumerate(midx_i):
+            a = np.searchsorted(di, d - stale_ns, side="right")   # window (d-stale, d]
+            b = np.searchsorted(di, d, side="right")
+            if b > a:
+                col[j] = np.median(tv[a:b]) if consensus else tv[b - 1]
+        out[tk] = col
+    tgt_panel = pd.DataFrame(out, index=midx).reindex(columns=px_panel.columns)
     return (tgt_panel / px_panel.where(px_panel > 0)) - 1
 
 # exchange-suffix -> reporting/quote currency. Market cap is computed in the QUOTE currency (price*shares) then
@@ -190,7 +196,10 @@ def _is_usca(tk):
     """US (no exchange suffix) or Canada (.TO / .V)."""
     return ("." not in tk) or tk.rsplit(".", 1)[1] in ("TO", "V")
 
-TOP_N = 10; CONV = 2.0; MIN_DVOL = 5e6; SMALL = 2e9
+TOP_N = 10; CONV = 4.0; MIN_DVOL = 5e6; SMALL = 2e9   # CONV: A/D-divergence conviction weight. 2026-08-18 2.0->4.0
+# (div4x) — DEPLOY_LAB: steepening the *validated* A/D-divergence edge (keep all 10 sectors) lifts return 29472->43554%,
+# Sharpe 1.67->1.74, DD -24.9->-23.4% (better on all axes). Sweep is monotonic to 8x (no peak) so 4x = prudent stop,
+# not in-sample return-chasing. CONCENTRATING BY FEWER SECTORS (top5/3) instead was a disaster (return+DD both blow up).
 MIN_PRICE = 0.0   # NO price floor — a genuine low-priced name is FINE as long as it's on a major exchange
                   # (user policy: keep the penny, gate on LISTING not price). See MAJOR_EXCH below.
 MIN_PB = 0.1      # P/B SANITY FLOOR: reject sub-0.1 book multiples. These are ~always corrupt fundamentals
@@ -345,10 +354,269 @@ def build():
     regime_fav = regime_fav_by_w[6]        # default 6mo
     regime_fav_both = regime_favboth_by_w[6]
 
+    # ── EXTRA regime signals for the detection lab ──
+    MEGA_GROWTH = {"XLK", "QQQ", "MAGS", "SMH", "IGV", "SKYY", "FDN", "BOTZ", "CIBR", "SOCL", "VUG"}
+    # (1) COMMODITY leadership (12mo): avg momentum of miner/commodity ETFs vs SPY -> our miners are ripping
+    _commod = [e for e in ["GLD", "COPX", "XLE", "SLX", "URA", "SLV"] if e in etf_m.columns]
+    _commod_mom = etf_m[_commod].pct_change(12).mean(axis=1) if _commod else pd.Series(np.nan, index=midx)
+    _spy_mom12 = spy_m.pct_change(12)
+    commod_fav = (_commod_mom > _spy_mom12).reindex(midx)
+    # (2) TOP-10 COMPOSITION: how many of the top-10 accel sectors are mega-cap growth each month (the purest
+    # "detect the regime from the rotation system" — read which sector TYPES are accelerating).
+    _compo = {}
+    for _d in midx:
+        try:
+            _t10 = accel.loc[_d].dropna().sort_values(ascending=False).head(10).index
+            _compo[_d] = (sum(1 for e in _t10 if e in MEGA_GROWTH) <= 3)   # favorable if <=3 mega-growth in top-10
+        except Exception:
+            _compo[_d] = True
+    compo_fav = pd.Series(_compo).reindex(midx)
+    # (3) MULTI-SIGNAL: majority of {value>growth, small>large, commodity leading} (12mo)
+    _vg12 = (_rm("VTV", 12) - _rm("VUG", 12)) > 0
+    _sl12 = (_rm("IWM", 12) - _rm("IWB", 12)) > 0
+    multi_fav = ((_vg12.astype(int) + _sl12.astype(int) + commod_fav.astype(int)) >= 2).reindex(midx)
+
+    # (4) MACRO-LIQUIDITY regime (user: "large fundamental element like interest rate, m2 should help with regime").
+    # FRED series (MacroSeries): net liquidity (Fed assets − RRP − TGA), M2 money supply, 10y-2y curve slope. These
+    # are ORTHOGONAL to the price-leadership signals above (credit/liquidity typically LEADS equity). Each series is
+    # month-end sampled then LAGGED 1 month (FRED publication delay) so it is strictly look-ahead-safe. Each leg is a
+    # boolean "risk-on favorable"; majority (>=2/3) -> macro_fav. HY credit spread EXCLUDED (MacroSeries only 2023+).
+    from core.models import MacroSeries as _MS
+
+    def _macro(series):
+        rows = list(_MS.objects.filter(series=series).exclude(value__isnull=True).values_list("date", "value"))
+        if not rows:
+            return pd.Series(np.nan, index=midx)
+        s = pd.Series({pd.Timestamp(d): float(v) for d, v in rows}).sort_index()
+        return s.resample("ME").last().ffill().reindex(midx).shift(1)   # month-end, ffill gaps, 1-month PIT lag
+    _netliq = (_macro("WALCL") - _macro("RRPONTSYD") - _macro("WTREGEN"))   # Fed net liquidity ($bn)
+    _m2 = _macro("M2SL")                                                    # M2 money supply
+    _curve = _macro("T10Y2Y")                                              # 10y-2y slope (%)
+    macro_netliq_ok = (_netliq.pct_change(3) > 0).reindex(midx)            # net liquidity rising over trailing 3mo
+    macro_m2_ok = (_m2.pct_change(12) > 0).reindex(midx)                   # M2 expanding YoY (contraction = squeeze)
+    macro_curve_ok = (_curve > -0.25).reindex(midx)                       # curve not deeply inverted (>-25bps)
+    macro_fav = ((macro_netliq_ok.astype(int) + macro_m2_ok.astype(int)
+                  + macro_curve_ok.astype(int)) >= 2).reindex(midx)
+    # combined detectors: price-regime (value/small/commodity) stacked with the macro-liquidity regime
+    multi_macro_or = (multi_fav.astype(bool) | macro_fav.astype(bool)).reindex(midx)     # aggressive if EITHER
+    multi_macro_and = (multi_fav.astype(bool) & macro_fav.astype(bool)).reindex(midx)    # aggressive only if BOTH
+    six_fav = ((_vg12.astype(int) + _sl12.astype(int) + commod_fav.astype(int)           # 6-signal majority (>=4/6)
+                + macro_netliq_ok.astype(int) + macro_m2_ok.astype(int)
+                + macro_curve_ok.astype(int)) >= 4).reindex(midx)
+
+    def _hysteresis(sig, n):
+        """Require a signal to hold n consecutive months before flipping (kills whipsaw). n=0 -> passthrough."""
+        if n <= 0:
+            return sig
+        out = {}
+        state = True
+        run_len = 0
+        prev = None
+        for d in midx:
+            v = bool(sig.get(d, True))
+            if v == prev:
+                run_len += 1
+            else:
+                run_len = 1
+            prev = v
+            if run_len >= n:
+                state = v
+            out[d] = state
+        return pd.Series(out)
+
     universe = sorted(all_holds | set(delisted_sector))
     stock_daily = load_candles(universe)
     stock_m = _monthly_close(stock_daily).reindex(midx)
     smom6 = stock_m.pct_change(6)     # per-stock 6-month price momentum (for the growth-sector 'buy the winner' rule)
+    smret_m = stock_m.pct_change()    # per-stock MONTHLY returns (downside-correlation / diversification metric)
+    def _rsi10_monthly():
+        """RSI(10) sampled at each month-end per stock (Wilder EWM). Entry-timing overlay input (#110): the value
+        pick's edge is a DIP on its OWN price (memory entry-signal-value-pick: rsi10<45 = +5.68% lift)."""
+        out = {}
+        for _tk, _df in stock_daily.items():
+            if _df is None or "Close" not in _df:
+                continue
+            _c = _df["Close"].dropna()
+            if len(_c) < 15:
+                continue
+            _d = _c.diff()
+            _up = _d.clip(lower=0.0).ewm(alpha=1 / 10.0, adjust=False).mean()
+            _dn = (-_d).clip(lower=0.0).ewm(alpha=1 / 10.0, adjust=False).mean()
+            _rsi = 100.0 - 100.0 / (1.0 + _up / _dn.replace(0.0, np.nan))
+            out[_tk] = _rsi.resample("ME").last()
+        return pd.DataFrame(out).reindex(index=midx)
+    rsi10_m = _rsi10_monthly().reindex(columns=stock_m.columns)
+    # 52-week-LOW proximity (Finviz "New Low" edge; memory: new_52low→6m = +20.4% robust stock alpha): fraction the
+    # month-close sits ABOVE its trailing-12mo low. 0.0 = AT the low (max deep-value/oversold), higher = further above.
+    near_low_m = (stock_m / stock_m.rolling(12, min_periods=6).min() - 1.0)
+    def _upgrade_panel():
+        """Net analyst UPGRADES in the trailing 90d as of each month-end (Finviz Upgrades/Downgrades), PIT. From the
+        dated .data/analyst_ratings.jsonl archive (rating_action; 2011+). +1 upgrade / −1 downgrade, summed per 90d."""
+        import json
+        from collections import defaultdict
+        p = Path("/app/.data/analyst_ratings.jsonl")
+        if not p.exists():
+            return pd.DataFrame(index=midx, columns=stock_m.columns)
+        ev = defaultdict(list)
+        cols = set(stock_m.columns)
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            act = (r.get("rating_action") or "").lower(); tk = r.get("ticker"); d = r.get("date")
+            if tk in cols and d and ("upgrad" in act or "downgrad" in act):
+                ev[tk].append((pd.Timestamp(d), 1 if "upgrad" in act else -1))
+        out = {}
+        for tk, pts in ev.items():
+            s = pd.Series([v for _, v in pts], index=pd.to_datetime([d for d, _ in pts])).sort_index()
+            # rolling 90d net count, sampled at month-ends
+            daily = s.groupby(s.index).sum()
+            roll = daily.reindex(daily.index.union(midx)).sort_index().rolling("90D").sum().reindex(midx)
+            out[tk] = roll
+        return pd.DataFrame(out).reindex(index=midx, columns=stock_m.columns)
+    net_upg_m = _upgrade_panel()
+    def _insider_panel():
+        """Trailing-90d insider open-market PURCHASE $ (SEC Form 345, filed_date PIT; 2020+) at each month-end.
+        Finviz 'Recent Insider Buying'. Higher = more smart-money accumulation."""
+        try:
+            from core.models import InsiderBuy
+            rows = list(InsiderBuy.objects.filter(ticker__in=list(stock_m.columns))
+                        .values_list("ticker", "filed_date", "buy_value"))
+        except Exception:
+            rows = []
+        if not rows:
+            return pd.DataFrame(index=midx, columns=stock_m.columns)
+        from collections import defaultdict
+        ev = defaultdict(list)
+        for tk, d, bv in rows:
+            ev[tk].append((pd.Timestamp(d), float(bv or 0)))
+        out = {}
+        for tk, pts in ev.items():
+            s = pd.Series([v for _, v in pts], index=pd.to_datetime([d for d, _ in pts])).sort_index()
+            daily = s.groupby(s.index).sum()
+            out[tk] = daily.reindex(daily.index.union(midx)).sort_index().rolling("90D").sum().reindex(midx)
+        return pd.DataFrame(out).reindex(index=midx, columns=stock_m.columns)
+    insider_m = _insider_panel()
+    # VOLATILITY SQUEEZE (wedge/triangle proxy — Finviz patterns): trailing-6mo std of monthly returns, LOW = a
+    # contracting/coiling range. Lower = tighter squeeze (pattern-breakout setups). Objectively computable (unlike H&S).
+    squeeze_m = smret_m.rolling(6, min_periods=3).std()
+    # TRENDLINE (Finviz TL Support / TL Resistance): rolling OLS of log-price over trailing 9 months. tl_slope =
+    # trend direction; tl_resid = where the latest price sits vs the fitted line (<0 = below/at SUPPORT, >0 =
+    # above/breaking RESISTANCE), in log units (~fractional deviation). Objectively computable trendline proxy.
+    def _trendline(_L):
+        _logp = np.log(stock_m.clip(lower=1e-9)).values
+        _x = np.arange(_L, dtype=float); _xm = _x.mean(); _Sxx = ((_x - _xm) ** 2).sum()
+        _res = np.full(_logp.shape, np.nan); _slp = np.full(_logp.shape, np.nan)
+        for _t in range(_L - 1, _logp.shape[0]):
+            _Y = _logp[_t - _L + 1:_t + 1, :]
+            _ym = _Y.mean(axis=0)
+            _b = ((_x[:, None] - _xm) * (_Y - _ym)).sum(axis=0) / _Sxx
+            _res[_t, :] = _Y[-1, :] - (_ym - _b * _xm + _b * (_L - 1))
+            _slp[_t, :] = _b
+        return (pd.DataFrame(_res, index=stock_m.index, columns=stock_m.columns),
+                pd.DataFrame(_slp, index=stock_m.index, columns=stock_m.columns))
+    _TL_LS = (4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 18) if os.environ.get("TL_GRID") else (6, 9, 12)
+    _TL = {_L: _trendline(_L) for _L in _TL_LS}             # trendline fits at multiple lookbacks (finer under TL_GRID)
+    tl_resid_m, tl_slope_m = _TL[9]                          # default trendline = 9-month fit
+    # DAILY / WEEKLY trendline (user: "did you try day or weeks?"): fit the trendline on finer BARS instead of
+    # monthly closes, then sample resid/slope at month-end (ffill, no look-ahead — bar must end <= month-end).
+    _TLTF = {}
+    if os.environ.get("TL_TF"):
+        _pxd = pd.DataFrame({_tk: (_df["Close"] if _df is not None and "Close" in _df else None)
+                             for _tk, _df in stock_daily.items()}).dropna(how="all").sort_index()
+        def _tl_bars(rule, L):
+            _px = _pxd if rule == "D" else _pxd.resample(rule).last()
+            _lp = np.log(_px.clip(lower=1e-9)).values
+            _x = np.arange(L, dtype=float); _xm = _x.mean(); _Sxx = ((_x - _xm) ** 2).sum()
+            _res = np.full(_lp.shape, np.nan); _slp = np.full(_lp.shape, np.nan)
+            for _t in range(L - 1, _lp.shape[0]):
+                _Y = _lp[_t - L + 1:_t + 1, :]; _ym = _Y.mean(axis=0)
+                _b = ((_x[:, None] - _xm) * (_Y - _ym)).sum(axis=0) / _Sxx
+                _res[_t, :] = _Y[-1, :] - (_ym - _b * _xm + _b * (L - 1)); _slp[_t, :] = _b
+            _R = pd.DataFrame(_res, index=_px.index, columns=_px.columns)
+            _S = pd.DataFrame(_slp, index=_px.index, columns=_px.columns)
+            _r = _R.reindex(_R.index.union(midx)).ffill().reindex(midx).reindex(columns=stock_m.columns)
+            _s = _S.reindex(_S.index.union(midx)).ffill().reindex(midx).reindex(columns=stock_m.columns)
+            return _r, _s
+        for _rl, _Ls in (("W", (13, 26, 39)), ("D", (63, 126, 189))):
+            for _L in _Ls:
+                _TLTF[(_rl, _L)] = _tl_bars(_rl, _L)
+    # DOUBLE BOTTOM (Finviz pattern): a 'W' over trailing 12mo — two similar lows (1st-half vs recent) separated by
+    # a middle peak, price now bouncing off the 2nd low but not yet broken out. Value = bounce magnitude if the
+    # setup holds, else NaN. Objectively proxied (exact shape detection is discretionary/unreliable).
+    def _double_bottom():
+        _W = 12
+        _P = stock_m.values
+        _out = np.full(_P.shape, np.nan)
+        for _t in range(_W - 1, _P.shape[0]):
+            _seg = _P[_t - _W + 1:_t + 1, :]
+            _lo1 = np.nanmin(_seg[:6], axis=0); _lo2 = np.nanmin(_seg[6:], axis=0)
+            _himid = np.nanmax(_seg[3:9], axis=0); _cur = _seg[-1]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                _sim = np.abs(_lo2 - _lo1) / np.where(_lo1 > 0, _lo1, np.nan) < 0.12
+                _bounce = _cur / np.where(_lo2 > 0, _lo2, np.nan) - 1.0
+                _flag = _sim & (_bounce > 0.03) & (_himid > np.maximum(_lo1, _lo2) * 1.05) & (_cur < _himid)
+            _out[_t, :] = np.where(_flag, _bounce, np.nan)
+        return pd.DataFrame(_out, index=stock_m.index, columns=stock_m.columns)
+    dbot_m = _double_bottom()
+    # CANDLESTICK reversal (Finviz Candlestick): bullish ENGULFING or HAMMER in the last ~5 trading days before
+    # month-end, from daily OHLC. Value = count of bullish-reversal candles in that window (higher = stronger).
+    # Horizon-mismatched to a monthly book (1-3 day signals) — tested because the user asked; prior is low.
+    def _candle_panel():
+        out = {}
+        for _tk, _df in stock_daily.items():
+            if _df is None or not {"Open", "High", "Low", "Close"}.issubset(_df.columns):
+                continue
+            o, h, l, c = _df["Open"], _df["High"], _df["Low"], _df["Close"]
+            body = (c - o).abs()
+            losh = np.minimum(o, c) - l                          # lower shadow
+            upsh = h - np.maximum(o, c)                          # upper shadow
+            hammer = (losh >= 2 * body) & (upsh <= body) & (body > 0)
+            po, pc = o.shift(), c.shift()
+            beng = (pc < po) & (c > o) & (c >= po) & (o <= pc)   # bullish engulfing
+            bull = (hammer | beng).astype(float)
+            out[_tk] = bull.rolling(5, min_periods=1).sum().resample("ME").last()
+        return pd.DataFrame(out).reindex(index=midx, columns=stock_m.columns)
+    candle_bull_m = _candle_panel()
+    def _candle_bars(rule):
+        """Common bullish/bearish candlestick patterns on RESAMPLED bars (rule='W' weekly / 'ME' monthly), sampled
+        at month-end. Returns (bull_score, bear_score) DataFrames. Patterns: engulfing, hammer/shooting-star,
+        harami, 3-bar star (morning/evening), marubozu. The signal people quote on daily/weekly/monthly charts."""
+        bull_out, bear_out = {}, {}
+        for _tk, _df in stock_daily.items():
+            if _df is None or not {"Open", "High", "Low", "Close"}.issubset(_df.columns):
+                continue
+            g = _df[["Open", "High", "Low", "Close"]].resample(rule).agg(
+                {"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+            if len(g) < 4:
+                continue
+            o, h, l, c = g["Open"], g["High"], g["Low"], g["Close"]
+            rng = (h - l).replace(0, np.nan); body = (c - o); ab = body.abs()
+            up = h - np.maximum(o, c); lo = np.minimum(o, c) - l
+            po, pc, pab = o.shift(), c.shift(), ab.shift()
+            green, red = c > o, c < o
+            hammer = (lo >= 2 * ab) & (up <= ab) & green                       # bullish hammer
+            shoot = (up >= 2 * ab) & (lo <= ab) & red                          # bearish shooting star
+            beng = (pc < po) & green & (c >= po) & (o <= pc)                   # bullish engulfing
+            beareng = (pc > po) & red & (c <= po) & (o >= pc)                  # bearish engulfing
+            bharami = (pc < po) & green & (c <= po) & (o >= pc) & (ab < pab)   # bullish harami
+            bearharami = (pc > po) & red & (c >= po) & (o <= pc) & (ab < pab)  # bearish harami
+            marub_b = green & (ab > 0.9 * rng)                                # bullish marubozu
+            marub_r = red & (ab > 0.9 * rng)                                  # bearish marubozu
+            # 3-bar star: down bar, small-body star, strong up bar (morning) / mirror (evening)
+            morning = red.shift(2) & (ab.shift(1) < pab) & green & (c > (po.shift(1) + pc.shift(1)) / 2)
+            evening = green.shift(2) & (ab.shift(1) < pab) & red & (c < (po.shift(1) + pc.shift(1)) / 2)
+            bull = (hammer | beng | bharami | marub_b | morning).astype(float)
+            bear = (shoot | beareng | bearharami | marub_r | evening).astype(float)
+            bull_out[_tk] = bull.reindex(bull.index.union(midx)).ffill().reindex(midx)
+            bear_out[_tk] = bear.reindex(bear.index.union(midx)).ffill().reindex(midx)
+        R = lambda d: pd.DataFrame(d).reindex(index=midx, columns=stock_m.columns)
+        return R(bull_out), R(bear_out)
+    cw_bull, cw_bear = _candle_bars("W")      # weekly candlestick bull/bear (as of month-end)
+    cm_bull, cm_bear = _candle_bars("ME")     # monthly candlestick bull/bear
 
     def _pick_mae(tk, d0, d1):
         """Max ADVERSE excursion of a holding during its hold month: the worst intra-window drawdown from
@@ -400,6 +668,26 @@ def build():
     ttm_ni = R(_pit_ttm_ni(reps, midx))
     roe_ttm = ttm_ni / eq.where(eq != 0)                   # trailing-12m ROE (signed)
     pe_ttm = mktcap / ttm_ni.where(ttm_ni != 0)            # signed trailing P/E = Price / TTM-EPS
+    # STALE-BOOK DRIFT (user insight): quarterly book is stale between filings — a profitable name's true equity
+    # has quietly GROWN since its last 10-Q (cheaper than raw P/B shows), a cash-burner's has SHRUNK (illusory-
+    # cheap value trap). Nowcast book by accruing the last-reported TTM earnings run-rate for each month elapsed
+    # since the filing (PIT: uses only already-reported figures — no future data). Accrual capped at 6 months
+    # (older = genuinely stale); where accrued book goes <=0 (burned through equity) -> NaN (dropped downstream).
+    _filed = eq.ne(eq.shift()) & eq.notna()                # month a fresh equity value forward-filled (a filing)
+    _msf = pd.DataFrame(0, index=eq.index, columns=eq.columns)
+    for _c in eq.columns:
+        _gc = _filed[_c].cumsum()
+        _msf[_c] = _gc.groupby(_gc).cumcount().clip(upper=6)   # months since last filing (0 at the filing month)
+    _accr = (ttm_ni / 12.0).fillna(0.0) * _msf             # earnings accrued since filing (neg for loss-makers)
+    _adj_eq = eq + _accr
+    pb_drift = mktcap / _adj_eq.where(_adj_eq > 0)         # full nowcast (both directions)
+    pb_trap = pb.where(_accr >= 0, pb_drift)              # LOSS-MAKER penalty only (profitable names keep raw pb)
+    pb_hidden = pb.where(_accr <= 0, pb_drift)            # PROFITABLE discount only (loss-makers keep raw pb)
+    pb_raw = pb                                            # keep the raw quarterly-book P/B for reference/labs
+    pb = pb_drift                                          # DEFAULT 2026-08-18 (user): rank the flagship on the
+    # earnings-accrued (drift-adjusted) book, not raw quarterly book. DEPLOY_LAB: drift+div4x = 51177%/Sh1.80/
+    # DD-23.4% vs raw+div4x 43554%/1.74 — better on all axes. Where TTM earnings unknown -> accrual 0 -> == raw pb
+    # (no coverage loss); where accrued book <=0 (burned through equity) -> NaN -> that value-trap name is dropped.
     # TTM flow panels for the flagship VALUE-METRIC bake-off (does raw P/B still win the small-cap pick vs
     # properly-TTM P/E / P/S / EV-EBIT / FCF-yield? — audit finding #4 + "test everything"). All "lower=better".
     ttm_rev = R(_pit_ttm_panel(reps, "revenue", midx))
@@ -624,10 +912,121 @@ def build():
             include_months=None, spy200=None, bear_gate=None, hedge=None, growth_etfs=None, adaptive_growth=False,
             growth_fallback=False, top_n=None, size_mode="conv", cost_bps=0.0, lev=1.0, largecap_mode=None,
             defensive_riskoff=None, largecap_keep=None, sector_playbook=False, regime_switch=None,
-            regime_lookback=6):
+            regime_lookback=6, regime_signal="vs", regime_hyst=0, no_cash=False, book="value",
+            conv=None, conc_regime=None, entry=None, entry_k=5):
         rets, spies, dl_picks, mrets = [], [], 0, []
+        _conv = float(conv) if conv is not None else CONV   # A/D-divergence conviction weight (default div_2x)
+        def _entry_pick(cands):
+            """Flagship default pick = cheapest (drift-)P/B, with optional ENTRY-TIMING on the stock's own RSI(10).
+            entry=None reproduces the flagship exactly. Modes gate/reorder the `entry_k` cheapest names."""
+            if not cands:
+                return None
+            _K = sorted(cands, key=lambda h: pb.loc[date, h])
+            if entry is None:
+                return _K[0]
+            _K = _K[:entry_k]                                    # time the entry among the K cheapest
+            def _r(h):
+                v = rsi10_m.loc[date, h] if h in rsi10_m.columns else np.nan
+                return float(v) if pd.notna(v) else np.nan
+            if entry == "oversold_pref":                         # most oversold among the K cheapest
+                q = [h for h in _K if not np.isnan(_r(h))]
+                return min(q, key=_r) if q else _K[0]
+            if entry == "oversold_gate":                         # cheapest with RSI<45 (else cheapest)
+                q = [h for h in _K if not np.isnan(_r(h)) and _r(h) < 45]
+                return q[0] if q else _K[0]
+            if entry == "dip":                                   # pulled-back-not-crashed (40<=RSI<=55)
+                q = [h for h in _K if not np.isnan(_r(h)) and 40 <= _r(h) <= 55]
+                return q[0] if q else _K[0]
+            if entry == "strength":                              # ANTI-signal control: prefer HIGH RSI (buy strength)
+                q = [h for h in _K if not np.isnan(_r(h))]
+                return max(q, key=_r) if q else _K[0]
+            def _pick_by(panel, hi=True, gate=None):
+                q = [h for h in _K if h in panel.columns and pd.notna(panel.loc[date, h])]
+                if gate is not None:
+                    q = [h for h in q if gate(float(panel.loc[date, h]))]
+                if not q:
+                    return _K[0]
+                return (max if hi else min)(q, key=lambda h: float(panel.loc[date, h]))
+            if entry == "upgraded":     return _pick_by(net_upg_m, hi=True)     # most net analyst upgrades (90d)
+            if entry == "no_downgrade": return _pick_by(net_upg_m, hi=True, gate=lambda v: v >= 0)  # avoid net-downgraded
+            if entry == "insider":      return _pick_by(insider_m, hi=True)     # most insider open-market buying (90d)
+            if entry == "nearlow":      return _pick_by(near_low_m, hi=False)   # closest to 52-week low (deep value)
+            if entry == "newhigh":      return _pick_by(near_low_m, hi=True)    # breakout: furthest above 52w low
+            if entry == "squeeze":      return _pick_by(squeeze_m, hi=False)    # tightest coil (wedge/triangle proxy)
+            if entry == "tl_support" or (isinstance(entry, str) and entry.startswith("tl_support_")):
+                # UPTREND (slope>0) pulled back BELOW its trendline (buy the support test). Suffix = fit lookback.
+                _rm, _sm = _TL[int(entry.rsplit("_", 1)[1])] if entry.startswith("tl_support_") else (tl_resid_m, tl_slope_m)
+                q = [h for h in _K if h in _sm.columns and pd.notna(_sm.loc[date, h])
+                     and float(_sm.loc[date, h]) > 0 and pd.notna(_rm.loc[date, h])]
+                return min(q, key=lambda h: float(_rm.loc[date, h])) if q else _K[0]
+            if entry == "tl_break":     # pushing ABOVE the (resistance) trendline in an uptrend (breakout)
+                q = [h for h in _K if h in tl_slope_m.columns and pd.notna(tl_slope_m.loc[date, h])
+                     and float(tl_slope_m.loc[date, h]) > 0 and pd.notna(tl_resid_m.loc[date, h])]
+                return max(q, key=lambda h: float(tl_resid_m.loc[date, h])) if q else _K[0]
+            if entry == "dbot":         # double-bottom setup among the cheapest (strongest confirmed bounce)
+                return _pick_by(dbot_m, hi=True)
+            if entry == "pick2":  return _K[1] if len(_K) > 1 else _K[0]        # PLACEBO: 2nd cheapest (no signal)
+            if entry == "pick3":  return _K[2] if len(_K) > 2 else _K[-1]       # PLACEBO: 3rd cheapest (no signal)
+            if entry == "pick_rot":                                            # PLACEBO: deterministic rotation thru top-5
+                return _K[(date.year * 12 + date.month) % len(_K)]
+            if isinstance(entry, str) and entry.startswith("tl_crash"):   # tl_support ONLY in a SPY drawdown regime
+                _parts = entry.split("_")                                  # (crash-rebound specialist); else cheapest
+                _thr = -(float(_parts[2]) / 100) if len(_parts) >= 3 else -0.15
+                _dd = spy_dd.loc[date] if date in spy_dd.index else np.nan
+                if pd.notna(_dd) and float(_dd) < _thr:
+                    q = [h for h in _K if h in tl_slope_m.columns and pd.notna(tl_slope_m.loc[date, h])
+                         and float(tl_slope_m.loc[date, h]) > 0 and pd.notna(tl_resid_m.loc[date, h])]
+                    return min(q, key=lambda h: float(tl_resid_m.loc[date, h])) if q else _K[0]
+                return _K[0]
+            if isinstance(entry, str) and entry.startswith("tl_recov"):   # tl_support through a post-drawdown RECOVERY
+                _parts = entry.split("_")                                  # window (SPY dipped < -N% within trailing M mo)
+                _thr = -(float(_parts[2]) / 100) if len(_parts) >= 3 else -0.15
+                _M = int(_parts[3]) if len(_parts) >= 4 else 6
+                _win = spy_dd.loc[:date].iloc[-_M:]
+                if len(_win) and float(_win.min()) < _thr:
+                    q = [h for h in _K if h in tl_slope_m.columns and pd.notna(tl_slope_m.loc[date, h])
+                         and float(tl_slope_m.loc[date, h]) > 0 and pd.notna(tl_resid_m.loc[date, h])]
+                    return min(q, key=lambda h: float(tl_resid_m.loc[date, h])) if q else _K[0]
+                return _K[0]
+            if isinstance(entry, str) and entry.startswith("tltf:"):   # daily/weekly trendline support (tltf:W:26)
+                _, _rl, _Ls = entry.split(":"); _rm, _sm = _TLTF[(_rl, int(_Ls))]
+                q = [h for h in _K if h in _sm.columns and pd.notna(_sm.loc[date, h])
+                     and float(_sm.loc[date, h]) > 0 and pd.notna(_rm.loc[date, h])]
+                return min(q, key=lambda h: float(_rm.loc[date, h])) if q else _K[0]
+            if entry == "candle_d":     return _pick_by(candle_bull_m, hi=True)   # daily bullish candle (last 5d)
+            if entry == "cw_bull":      return _pick_by(cw_bull, hi=True)         # weekly bullish candle
+            if entry == "cm_bull":      return _pick_by(cm_bull, hi=True)         # monthly bullish candle
+            if entry == "cw_avoidbear":                                          # skip weekly BEARISH candle
+                q = [h for h in _K if h in cw_bear.columns and pd.notna(cw_bear.loc[date, h]) and cw_bear.loc[date, h] == 0]
+                return q[0] if q else _K[0]
+            if entry == "cm_avoidbear":                                          # skip monthly BEARISH candle
+                q = [h for h in _K if h in cm_bear.columns and pd.notna(cm_bear.loc[date, h]) and cm_bear.loc[date, h] == 0]
+                return q[0] if q else _K[0]
+            return _K[0]
         prev_held = set()          # last month's basket, for turnover-based transaction costs
         _base_lcm = largecap_mode  # base large-cap policy; regime_switch overrides it per-month
+        # resolve the regime signal ONCE (which detector + hysteresis) for this run
+        if regime_switch:
+            _fw = regime_lookback if regime_lookback in regime_fav_by_w else 6
+            if regime_signal == "multi":
+                _rsig = multi_fav
+            elif regime_signal == "macro":           # net-liquidity + M2 + yield-curve majority
+                _rsig = macro_fav
+            elif regime_signal == "multi+macro":     # aggressive if EITHER price- OR liquidity-regime is risk-on
+                _rsig = multi_macro_or
+            elif regime_signal == "multi&macro":     # aggressive only when BOTH price- AND liquidity-regime agree
+                _rsig = multi_macro_and
+            elif regime_signal == "six":             # 6-signal majority (value/small/commodity + netliq/M2/curve)
+                _rsig = six_fav
+            elif regime_signal == "compo":
+                _rsig = compo_fav
+            elif regime_signal == "compo+vs":       # favorable only if BOTH composition and value/small agree
+                _rsig = (compo_fav.astype(bool) & regime_fav_by_w[_fw].astype(bool))
+            elif regime_signal == "both":
+                _rsig = regime_favboth_by_w[_fw]
+            else:                                    # "vs" — value OR small leads (default)
+                _rsig = regime_fav_by_w[_fw]
+            _rsig = _hysteresis(_rsig, regime_hyst)
         proxy_hold = Counter()          # etf -> # months held as a no-value-stock proxy (the live fallback)
         proxy_contrib = 0.0             # sum of proxy monthly contributions to the basket (weighted)
         mega_picks = 0                  # picks with >$50B USD mktcap (does premium-normalization let mega-caps in?)
@@ -665,6 +1064,9 @@ def build():
             # SECTOR-STATE scenarios (2-D: momentum LEVEL × ACCELERATION). Default 'accel' = current flagship.
             _sr = sector_rule
             _tn = top_n or TOP_N                       # concentration: override the number of sectors held
+            if conc_regime is not None and regime_switch:   # REGIME-SCALED concentration: concentrate harder
+                _ron = bool(_rsig.get(date, True))          # (fewer sectors) when our own factor leads, wider else
+                _tn = conc_regime[0] if _ron else conc_regime[1]
             if _sr == "accel" or _sr is None:          # top-N by acceleration (CURRENT)
                 top = a.dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "mom6":                        # top-10 by 6mo momentum LEVEL (trend-following)
@@ -682,6 +1084,21 @@ def build():
             elif _sr == "mom_x_accel":                 # rank blend: momentum-rank + accel-rank
                 mr = m6.rank(pct=True); ar = a.rank(pct=True)
                 top = (mr + ar).dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "accel_inflect":               # CAPTURE SOONER: rank by CHANGE in accel (accel rising =
+                da = (accel.loc[date] - accel.iloc[i - 1]) if i >= 1 else a   # sector just STARTING to accelerate)
+                top = da.reindex(a.dropna().index).dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "early":                       # CAPTURE SOONER: accelerating (accel>0) but price hasn't run
+                _c = a[(a > 0)].dropna()               # yet (mom6 below median) — catch the turn, not the top
+                if len(_c):
+                    _med = m6.reindex(_c.index).median()
+                    _e = _c[m6.reindex(_c.index) <= _med]
+                    top = (_e if len(_e) >= TOP_N else _c).sort_values(ascending=False).head(TOP_N).index
+                else:
+                    top = a.dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "accel_cap":                   # CAPTURE SOONER: accel>0 but DROP the extreme blow-offs
+                _c = a[a > 0].dropna().sort_values(ascending=False)          # (top over-extended already ran)
+                _c = _c.iloc[2:] if len(_c) > TOP_N + 2 else _c              # skip the 2 most-extended sleeves
+                top = _c.head(TOP_N).index
             else:
                 top = a.dropna().sort_values(ascending=False).head(TOP_N).index
 
@@ -690,10 +1107,7 @@ def build():
             # large-cap) when mega-cap growth leads (2017/2018/2023). largecap_mode is set per-month here.
             largecap_mode = _base_lcm
             if regime_switch:
-                _fw = regime_lookback if regime_lookback in regime_fav_by_w else 6
-                _sig = regime_favboth_by_w[_fw] if regime_switch == "both" else regime_fav_by_w[_fw]
-                _fav = _sig.get(date, True)
-                largecap_mode = "skip" if bool(_fav) else None
+                largecap_mode = "skip" if bool(_rsig.get(date, True)) else None
 
             # DEFENSIVE ROTATION in risk-off (user): when SPY < 200d MA, don't de-risk to cash — ROTATE into
             # defensive sleeves (Gold miners / Consumer Staples / Utilities / Healthcare) and buy the cheap value
@@ -742,16 +1156,21 @@ def build():
                       "deactivated": [{"sector": etf_name.get(e, e), "etf": e, "accel": _f(v), "rank": rk,
                                        "etf_ret": _fwd(e)} for e, v, rk in _deact_show],
                       "picks": [], "skipped": []}
+            _mom_book = (book == "momentum")   # MOMENTUM SLEEVE: relax the VALUE gates (positive P/B, value-trap,
+            #   P/B-ceiling) so RKLB-style loss-making / richly-valued high-momentum names qualify. Keep the risk
+            #   gates (price, $-liquidity, country, micro-pharma) — those aren't value opinions.
             for etf in top:
                 pharma = etf in PHARMA_ETFS
                 cands = [h for h in sector_cands(etf, include_delisted) if h not in held
                          and (not ban_first_loss or h not in banned)
                          and (exclude_tickers is None or h not in exclude_tickers)
-                         and pbceil_ok(h)
+                         and (_mom_book or pbceil_ok(h))
                          and (country_ok is None or country_ok(h))
-                         and _available_at(px_usd[h], date) and pd.notna(pb.loc[date, h]) and pb.loc[date, h] > MIN_PB
+                         and _available_at(px_usd[h], date)
+                         and (_mom_book or (pd.notna(pb.loc[date, h]) and pb.loc[date, h] > MIN_PB))
                          and pd.notna(as_traded_usd.loc[date, h]) and as_traded_usd.loc[date, h] >= min_price
-                         and not bool(trap.loc[date, h]) and pd.notna(dvol_usd.loc[date, h]) and dvol_usd.loc[date, h] >= MIN_DVOL
+                         and (_mom_book or not bool(trap.loc[date, h]))
+                         and pd.notna(dvol_usd.loc[date, h]) and dvol_usd.loc[date, h] >= MIN_DVOL
                          and not (pharma and (pd.isna(mktcap_usd.loc[date, h]) or mktcap_usd.loc[date, h] < MICRO_PHARMA_MIN))]
                 g0 = [x for x in cands if bool(low.loc[date, x])] or cands
                 sm = [x for x in g0 if pd.notna(mktcap_usd.loc[date, x]) and mktcap_usd.loc[date, x] < SMALL]
@@ -838,7 +1257,20 @@ def build():
                     _r = [roe.loc[date, x] for x in _pool5 if pd.notna(roe.loc[date, x])]
                     _thr = 0.0 if adaptive_growth is True else float(adaptive_growth)
                     _use_mom = (len(_r) >= 2 and float(np.median(_r)) < _thr)
-                if sector_playbook and g:
+                if _mom_book:
+                    # MOMENTUM SLEEVE pick: highest trailing 6-month price momentum in the (value-gate-relaxed)
+                    # candidate pool. No cheapness input at all — the deliberately-different factor to the value
+                    # book. A name with no 6mo history has no momentum reading -> that sector is skipped.
+                    q = [x for x in g if pd.notna(smom6.loc[date, x])]
+                    if not q:
+                        if tr is not None:
+                            tr["skipped"].append({"sector": etf_name.get(etf, etf), "etf": etf,
+                                                  "reason": "no 6-month momentum reading (too new) for the momentum book",
+                                                  "n_holdings": len(sector_cands(etf, include_delisted)), "n_usca": None,
+                                                  "accel": _f(accel.loc[date, etf]) if etf in accel.columns else None})
+                        continue
+                    p = max(q, key=lambda h: smom6.loc[date, h])
+                elif sector_playbook and g:
                     # SECTOR PLAYBOOK: value the pick the way that TYPE of company is really valued.
                     if etf in PLAY_GROWTH:                 # growth/tech -> momentum leader (cheap P/B = trap)
                         q = [x for x in g if pd.notna(smom6.loc[date, x])]
@@ -952,7 +1384,7 @@ def build():
                         q = [x for x in g if pd.notna(roe_ttm.loc[date, x]) and roe_ttm.loc[date, x] > 0]
                         p = min(q, key=lambda h: pb.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
                 else:
-                    p = min(g, key=lambda h: pb.loc[date, h])
+                    p = _entry_pick(g)          # FLAGSHIP DEFAULT: cheapest (drift-)P/B, optional entry-timing overlay
                 held.add(p)
                 if pd.notna(mktcap_usd.loc[date, p]) and mktcap_usd.loc[date, p] > 5e10:
                     mega_picks += 1
@@ -970,7 +1402,7 @@ def build():
                     continue
                 if p in delisted_sector:
                     dl_picks += 1
-                w = CONV if accumulating(p, date) else 1.0
+                w = _conv if accumulating(p, date) else 1.0
                 if size_mode == "accel":            # bigger bet on the hotter sector (weight ∝ 1+accel)
                     _ac = accel.loc[date, etf] if etf in accel.columns else np.nan
                     if pd.notna(_ac):
@@ -985,6 +1417,12 @@ def build():
                         _ac = accel.loc[date, etf] if etf in accel.columns else np.nan
                         if pd.notna(_ac):
                             w *= max(0.5, min(2.0, 1.0 + float(_ac)))
+                elif size_mode in ("drift", "drift_steep"):   # bet MORE on names whose stale book most UNDERSTATES
+                    _pr = pb_raw.loc[date, p]; _pd = pb.loc[date, p]   # value (accrued earnings -> hidden-cheap);
+                    if pd.notna(_pr) and pd.notna(_pd) and _pr > 0:    # LESS on value-traps (book shrank since filing)
+                        _du = (float(_pr) - float(_pd)) / float(_pr)   # >0 hidden-cheap, <0 trap
+                        _k = 4.0 if size_mode == "drift_steep" else 2.0
+                        w *= max(0.4, min(3.0, 1.0 + _k * _du))
                 wsum += w; rr += w * float(r)
                 if ban_first_loss and p not in traded:   # record FIRST-ever trade; ban if it was a loss
                     traded.add(p)
@@ -1000,6 +1438,46 @@ def build():
                                         "weight": float(w), "ret": float(r), "delisted": p in delisted_sector,
                                         "mae": _pick_mae(p, date, ndate),
                                         "conviction": bool(accumulating(p, date))})
+            if wsum <= 0 and no_cash:
+                # NEVER sit in full cash (user): if the whole month would be cash, first take the best LARGE-CAP
+                # value pick from the top sectors; if there's still no equity anywhere (all bonds/commodities/
+                # foreign), park in the top-accelerating BOND ETF for the month rather than 0%.
+                _lc = []
+                for etf in top:
+                    for h in sector_cands(etf, include_delisted):
+                        if (country_ok is None or country_ok(h)) and _available_at(px_usd[h], date) \
+                           and pd.notna(pb.loc[date, h]) and pb.loc[date, h] > MIN_PB \
+                           and pd.notna(as_traded_usd.loc[date, h]) and as_traded_usd.loc[date, h] >= min_price \
+                           and pd.notna(dvol_usd.loc[date, h]) and dvol_usd.loc[date, h] >= MIN_DVOL:
+                            _lc.append(h)
+                if _lc:                                   # take the cheapest-P/B name regardless of size
+                    p = min(_lc, key=lambda h: pb.loc[date, h])
+                    r = _ret_delist(px_usd[p], date, ndate)
+                    if r is not None and np.isfinite(r):
+                        wsum = 1.0; rr = float(r)
+                        if tr is not None:
+                            tr["picks"].append({"sector": "large-cap fallback (no-cash)", "etf": "", "ticker": p,
+                                                "company": NAMEMAP.get(p), "pb": _f(pb.loc[date, p]),
+                                                "pe": _f(pe_ttm.loc[date, p]), "roe": _f(roe_ttm.loc[date, p]),
+                                                "de": None, "gpa": None, "rev_g": None, "ni": None, "revenue": None,
+                                                "mktcap_usd": _f(mktcap_usd.loc[date, p]), "weight": 1.0,
+                                                "ret": float(r), "delisted": p in delisted_sector,
+                                                "mae": _pick_mae(p, date, ndate), "conviction": False})
+                if wsum <= 0:                             # still nothing -> park in the top bond ETF
+                    _bond = None
+                    for e in accel.loc[date].dropna().sort_values(ascending=False).index:
+                        if e in BOND_ETFS and e in etf_m.columns:
+                            _bond = e; break
+                    if _bond is not None:
+                        _br = etf_m[_bond].iloc[i + 1] / etf_m[_bond].iloc[i] - 1
+                        if np.isfinite(_br):
+                            wsum = 1.0; rr = float(_br)
+                            if tr is not None:
+                                tr["picks"].append({"sector": f"bond parking ({_bond})", "etf": _bond, "ticker": _bond,
+                                                    "company": "cash-alternative", "pb": None, "pe": None, "roe": None,
+                                                    "de": None, "gpa": None, "rev_g": None, "ni": None, "revenue": None,
+                                                    "mktcap_usd": None, "weight": 1.0, "ret": float(_br),
+                                                    "delisted": False, "mae": None, "conviction": False})
             if wsum <= 0:
                 continue
             _mret = rr / wsum
@@ -1023,7 +1501,13 @@ def build():
                 # basket worst intra-month drawdown = weighted mean of each holding's max adverse excursion
                 _mw = [(pk.get("mae"), pk.get("weight") or 1.0) for pk in tr["picks"] if pk.get("mae") is not None]
                 tr["basket_mae"] = (sum(mv * wv for mv, wv in _mw) / sum(wv for _, wv in _mw)) if _mw else None
-                tr["basket_ret"] = float(rr / wsum); tr["spy_ret"] = float(sp); trace.append(tr)
+                tr["basket_ret"] = float(rr / wsum); tr["spy_ret"] = float(sp)
+                try:                                   # QQQ (Nasdaq-100 / mega-cap growth) benchmark for the same month
+                    _qr = qqq_close_m.iloc[i + 1] / qqq_close_m.iloc[i] - 1
+                    tr["qqq_ret"] = float(_qr) if np.isfinite(_qr) else None
+                except Exception:
+                    tr["qqq_ret"] = None
+                trace.append(tr)
         perf = _perf(rets, spies); perf["delisted_picks"] = dl_picks; perf["mega_picks"] = mega_picks
         perf["monthly"] = mrets
         if proxy_etf:
@@ -1202,6 +1686,650 @@ def build():
                 print(f"    {glab:18}{r['total']:>8.0f}%  Sh{r['sharpe']:>5.2f}  {tag}", flush=True)
         sys.exit(0)
 
+    if os.environ.get("CAPTURE_SOONER"):
+        # ── "capture the move SOONER" (user): high accel = the move already happened (Oil +62% -> pick fell).
+        # Test entry rules that catch the sector EARLIER — inflection (accel rising), not-yet-extended (accel>0
+        # but low momentum), cap the blow-offs (drop the 2 most-extended). On the ADAPTIVE flagship. WF. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        arms = [("accel LEVEL (current)", dict()),
+                ("accel INFLECTION (rising)", dict(sector_rule="accel_inflect")),
+                ("EARLY (accel>0, not yet run)", dict(sector_rule="early")),
+                ("CAP blow-offs (drop top-2 extended)", dict(sector_rule="accel_cap")),
+                ("up_and_accel", dict(sector_rule="up_and_accel")),
+                ("mom_x_accel blend", dict(sector_rule="mom_x_accel"))]
+        print("\n=== CAPTURE_SOONER (honest 2016-2026): earlier sector-entry rules on the adaptive flagship ===", flush=True)
+        print(f"  {'sector rule':38}{'FULL':>12}{'DD':>8}{'pre-2020':>10}{'Sharpe':>8}", flush=True)
+        for lab, kw in arms:
+            r = run(True, True, **base, **kw)
+            rp = run(True, True, end_date="2019-12-31", **base, **kw)
+            print(f"  {lab:38}{r['total']:>11.0f}%{r['dd']:>7.1f}%{rp['total']:>9.0f}%{r['sharpe']:>8.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("NOCASH_TEST"):
+        # ── "never sit in full cash" (user): full-cash month -> take large-cap; if all non-equity -> park in
+        # the top bond ETF. Only fires the ~2 full-cash months. On the ADAPTIVE flagship. Honest 2016-2026. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        for lab, kw in [("adaptive (cash months as-is)", dict()), ("adaptive + NO-CASH (bonds/large-cap)", dict(no_cash=True))]:
+            r = run(True, True, **base, **kw)
+            print(f"  {lab:38} FULL {r['total']:.0f}%  Sh{r['sharpe']}  DD{r['dd']}%  months {r['months']}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("REGIME_LAB"):
+        # ── REGIME-DETECTION LAB (user's 4 frontiers): multi-signal, top-10 composition, hysteresis, vs the
+        # current 12mo value/small switch. Honest 2016-2026 + the hostile years. Which detects the regime best? ──
+        import sys
+        from collections import defaultdict
+        arms = [
+            ("current: value/small 12mo", dict(regime_switch="either", regime_signal="multi")),
+            ("value/small 12mo + 2mo hysteresis", dict(regime_switch="either", regime_lookback=12, regime_hyst=2)),
+            ("MULTI (value+small+commodity)", dict(regime_switch="either", regime_signal="multi")),
+            ("COMPOSITION (top-10 mega-growth share)", dict(regime_switch="either", regime_signal="compo")),
+            ("COMPOSITION + hysteresis 2", dict(regime_switch="either", regime_signal="compo", regime_hyst=2)),
+            ("COMPOSITION ∩ value/small", dict(regime_switch="either", regime_signal="compo+vs", regime_lookback=12)),
+            ("MULTI + hysteresis 3", dict(regime_switch="either", regime_signal="multi", regime_hyst=3)),
+        ]
+        print("\n=== REGIME_LAB (honest 2016-2026): detection methods — FULL / DD / pre-2020 / 2018 / 2023 / Sharpe ===", flush=True)
+        print(f"  {'detector':40}{'FULL':>11}{'DD':>8}{'pre20':>8}{'2018':>7}{'2023':>7}{'Shrp':>7}", flush=True)
+        for lab, kw in arms:
+            r = run(True, True, country_ok=_is_usca, **kw)
+            rp = run(True, True, country_ok=_is_usca, end_date="2019-12-31", **kw)
+            yr = defaultdict(lambda: 1.0)
+            for d, rr in r.get("monthly", []):
+                yr[d[:4]] *= (1 + rr)
+            print(f"  {lab:40}{r['total']:>10.0f}%{r['dd']:>7.1f}%{rp['total']:>7.0f}%"
+                  f"{(yr['2018']-1)*100:>6.0f}%{(yr['2023']-1)*100:>6.0f}%{r['sharpe']:>7.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("MACRO_LAB"):
+        # ── MACRO-LIQUIDITY REGIME LAB (user: "large fundamental element like interest rate, m2 should help us
+        # with regime"). FRED net-liquidity + M2 + 10y-2y curve — ORTHOGONAL to the price-leadership detector.
+        # Does credit/liquidity, which leads equity, dodge the hostile years (2018 −36%, 2023 −7%) the current
+        # value/small/commodity detector eats? Honest 2016-2026 + year breakdown. ──
+        import sys
+        from collections import defaultdict
+        arms = [
+            ("BASELINE: multi (current default)", dict(regime_switch="either", regime_signal="multi")),
+            ("MACRO alone (netliq+M2+curve)", dict(regime_switch="either", regime_signal="macro")),
+            ("MACRO + 2mo hysteresis", dict(regime_switch="either", regime_signal="macro", regime_hyst=2)),
+            ("multi + macro (OR: either risk-on)", dict(regime_switch="either", regime_signal="multi+macro")),
+            ("multi & macro (AND: both agree)", dict(regime_switch="either", regime_signal="multi&macro")),
+            ("SIX-signal majority (>=4/6)", dict(regime_switch="either", regime_signal="six")),
+        ]
+        print("\n=== MACRO_LAB (honest 2016-2026): macro-liquidity regime — FULL / DD / pre-2020 / 2018 / 2023 / Sharpe ===", flush=True)
+        print(f"  {'detector':40}{'FULL':>11}{'DD':>8}{'pre20':>8}{'2018':>7}{'2023':>7}{'Shrp':>7}", flush=True)
+        for lab, kw in arms:
+            r = run(True, True, country_ok=_is_usca, **kw)
+            rp = run(True, True, country_ok=_is_usca, end_date="2019-12-31", **kw)
+            yr = defaultdict(lambda: 1.0)
+            for d, rr in r.get("monthly", []):
+                yr[d[:4]] *= (1 + rr)
+            print(f"  {lab:40}{r['total']:>10.0f}%{r['dd']:>7.1f}%{rp['total']:>7.0f}%"
+                  f"{(yr['2018']-1)*100:>6.0f}%{(yr['2023']-1)*100:>6.0f}%{r['sharpe']:>7.2f}", flush=True)
+        # references: pure static core (never aggressive) and pure aggressive (always skip large-cap)
+        for lab, kw in [("static CORE", dict()), ("static AGGRESSIVE", dict(largecap_mode="skip"))]:
+            r = run(True, True, country_ok=_is_usca, **kw)
+            rp = run(True, True, country_ok=_is_usca, end_date="2019-12-31", **kw)
+            yr = defaultdict(lambda: 1.0)
+            for d, rr in r.get("monthly", []):
+                yr[d[:4]] *= (1 + rr)
+            print(f"  {lab:40}{r['total']:>10.0f}%{r['dd']:>7.1f}%{rp['total']:>7.0f}%"
+                  f"{(yr['2018']-1)*100:>6.0f}%{(yr['2023']-1)*100:>6.0f}%{r['sharpe']:>7.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("MOMENTUM_BLEND"):
+        # ── SECOND SLEEVE (user): a monthly MOMENTUM book (highest 6mo momentum, value-gates relaxed -> RKLB-style
+        # names) run ALONGSIDE the value flagship and blended at the portfolio level. Value+momentum = the classic
+        # uncorrelated pair. Two questions: (1) does any blend beat value-alone on return/Sharpe/DD? (2) does the
+        # momentum book fill the scary <=2-name months (breadth insurance the user asked for)? Honest 2016-2026. ──
+        import sys
+        from collections import Counter
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        vtr, mtr = [], []
+        val = run(True, True, trace=vtr, **base)
+        mom = run(True, True, book="momentum", trace=mtr, **base)
+
+        def bstats(series):
+            s = np.asarray(series, dtype=float)
+            eq = np.cumprod(1 + s); total = (eq[-1] - 1) * 100
+            peak = np.maximum.accumulate(eq); dd = float((eq / peak - 1).min()) * 100
+            sharpe = float(np.mean(s) / np.std(s) * np.sqrt(12)) if np.std(s) > 0 else 0.0
+            return total, dd, sharpe
+
+        def yrprod(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+
+        vd = dict(val["monthly"]); md = dict(mom["monthly"])
+        dates = sorted(set(vd) & set(md))
+        vr = np.array([vd[d] for d in dates]); mr = np.array([md[d] for d in dates])
+        corr = float(np.corrcoef(vr, mr)[0, 1])
+        vt, vdd, vsh = bstats(vr); mt, mdd, msh = bstats(mr)
+        print("\n=== MOMENTUM_BLEND (honest 2016-2026): value flagship + monthly momentum sleeve ===", flush=True)
+        print(f"  value book    : {vt:>9.0f}%  DD{vdd:>6.1f}%  Sharpe {vsh:.2f}", flush=True)
+        print(f"  momentum book : {mt:>9.0f}%  DD{mdd:>6.1f}%  Sharpe {msh:.2f}   (monthly corr value~mom = {corr:+.2f})", flush=True)
+        print(f"  {'weight v/m':16}{'FULL':>11}{'DD':>8}{'pre20':>8}{'2018':>7}{'2023':>7}{'Shrp':>7}", flush=True)
+        for w in (1.0, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.0):
+            bl = w * vr + (1 - w) * mr
+            bt, bdd, bsh = bstats(bl)
+            pairs = list(zip(dates, bl))
+            pre = float(np.prod([1 + r for d, r in pairs if d < "2020"]) - 1) * 100
+            print(f"  {f'{w:.0%}/{1-w:.0%}':16}{bt:>10.0f}%{bdd:>7.1f}%{pre:>7.0f}%"
+                  f"{yrprod(pairs, '2018'):>6.0f}%{yrprod(pairs, '2023'):>6.0f}%{bsh:>7.2f}", flush=True)
+
+        # BREADTH: combined distinct holdings/month (value names ∪ momentum names) vs value-alone — the user's fear
+        vpick = {t["date"]: [p["ticker"] for p in t["picks"] if p.get("ret") is not None] for t in vtr}
+        mpick = {t["date"]: [p["ticker"] for p in t["picks"] if p.get("ret") is not None] for t in mtr}
+        cv = Counter(); cb = Counter()
+        for d in sorted(set(vpick) | set(mpick)):
+            if d in vpick:
+                cv[min(len(vpick[d]), 10)] += 1
+            cb[min(len(set(vpick.get(d, [])) | set(mpick.get(d, []))), 10)] += 1
+        thin_v = sum(c for k, c in cv.items() if k <= 2); thin_b = sum(c for k, c in cb.items() if k <= 2)
+        one_v = cv.get(1, 0); one_b = cb.get(1, 0)
+        print(f"\n  BREADTH (concentration fear): <=2-holding months  value-alone {thin_v} (single-name {one_v})  ->  "
+              f"value+momentum {thin_b} (single-name {one_b})   of {sum(cv.values())} months", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("CONC_LEV_LAB"):
+        # ── RETURN-ADDITIVE knobs (user 'do it', tasks #112/#113/#114): re-test on the HONEST 2016-2026 base
+        # (concentration.md's top5_div4x=+221pp was on the STALE 269% pre-multi config; must re-measure vs 29473%).
+        #   (1) CONCENTRATION: fewer sectors (top_n) x steeper conviction (conv)
+        #   (2) LEVERAGE: scale the whole book (lev); prior sweep 1.5x~doubles, 2x=ruin
+        #   (3) REGIME-SCALED concentration: top-N tight when our factor leads, wide when it doesn't (conc_regime)
+        # Snapshot the baseline first (HARD RULE). Columns FULL / DD / pre-2020 / 2018 / 2023 / Sharpe. ──
+        import sys
+        from collections import defaultdict
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _pre(pairs):
+            return float(np.prod([1 + r for d, r in pairs if d < "2020"]) - 1) * 100
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            pr = r.get("monthly", [])
+            print(f"  {lab:34}{r['total']:>10.0f}%{r['dd']:>8.1f}%{_pre(pr):>8.0f}%"
+                  f"{_yr(pr,'2018'):>7.0f}%{_yr(pr,'2023'):>7.0f}%{r['sharpe']:>7.2f}", flush=True)
+            return r
+        hdr = f"  {'arm':34}{'FULL':>11}{'DD':>8}{'pre20':>8}{'2018':>7}{'2023':>7}{'Shrp':>7}"
+        print("\n=== CONC_LEV_LAB (honest 2016-2026): concentration + leverage + regime-scaled concentration ===", flush=True)
+        print("\n--- (1) CONCENTRATION: sectors (top_n) x conviction weight (conv) ---", flush=True)
+        print(hdr, flush=True)
+        _row("BASELINE top10 div2x (default)", dict())
+        _row("top7  div2x", dict(top_n=7))
+        _row("top5  div2x", dict(top_n=5))
+        _row("top5  div4x", dict(top_n=5, conv=4.0))
+        _row("top3  div2x", dict(top_n=3))
+        _row("top3  div4x", dict(top_n=3, conv=4.0))
+        _row("top10 div4x (conviction only)", dict(conv=4.0))
+        print("\n--- (2) LEVERAGE: scale the whole book (honest DD; 2x historically = ruin) ---", flush=True)
+        print(hdr, flush=True)
+        for L in (1.0, 1.25, 1.5, 1.75, 2.0):
+            _row(f"lev {L:.2f}x (top10 div2x)", dict(lev=L))
+        print("\n--- (3) REGIME-SCALED concentration (conc_regime = (tight_riskon, wide_riskoff)) ---", flush=True)
+        print(hdr, flush=True)
+        _row("regime 3/8 (tight-on / wide-off)", dict(conc_regime=(3, 8)))
+        _row("regime 3/10", dict(conc_regime=(3, 10)))
+        _row("regime 5/10", dict(conc_regime=(5, 10)))
+        _row("regime 5/10 + div4x", dict(conc_regime=(5, 10), conv=4.0))
+        print("\n--- (4) STACKS: best concentration + leverage together ---", flush=True)
+        print(hdr, flush=True)
+        _row("top5 div4x + lev1.5x", dict(top_n=5, conv=4.0, lev=1.5))
+        _row("top5 div4x + lev1.25x", dict(top_n=5, conv=4.0, lev=1.25))
+        _row("regime 3/8 + div4x + lev1.5x", dict(conc_regime=(3, 8), conv=4.0, lev=1.5))
+        sys.exit(0)
+
+    if os.environ.get("DEPLOY_LAB"):
+        # ── FOLLOW-UP (user 'do it'): CONC_LEV_LAB showed fewer-sectors DESTROYS return but STEEPER A/D-divergence
+        # CONVICTION (top10 div4x) beat baseline on return AND Sharpe AND DD. (a) find the conviction optimum (is it
+        # monotonic = overfit-suspect, or does it peak?), (b) stack the best conviction with mild leverage, (c) the
+        # STALE-BOOK DRIFT study (user's own insight): rank on earnings-accrued book instead of raw quarterly book.
+        # Honest 2016-2026. Columns FULL / DD / pre-2020 / 2018 / 2023 / Sharpe. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _pre(pairs):
+            return float(np.prod([1 + r for d, r in pairs if d < "2020"]) - 1) * 100
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            pr = r.get("monthly", [])
+            print(f"  {lab:34}{r['total']:>11.0f}%{r['dd']:>8.1f}%{_pre(pr):>8.0f}%"
+                  f"{_yr(pr,'2018'):>7.0f}%{_yr(pr,'2023'):>7.0f}%{r['sharpe']:>7.2f}", flush=True)
+            return r
+        hdr = f"  {'arm':34}{'FULL':>11}{'DD':>8}{'pre20':>8}{'2018':>7}{'2023':>7}{'Shrp':>7}"
+        print("\n=== DEPLOY_LAB (honest 2016-2026): conviction optimum + leverage stack + stale-book drift ===", flush=True)
+        print("\n--- (a) CONVICTION SWEEP (top10, A/D-divergence weight) — peak or monotonic? ---", flush=True)
+        print(hdr, flush=True)
+        for C in (2.0, 3.0, 4.0, 5.0, 6.0, 8.0):
+            _row(f"div{C:.0f}x", dict(conv=C))
+        print("\n--- (b) best conviction + leverage dial (Sharpe-invariant under lev) ---", flush=True)
+        print(hdr, flush=True)
+        _row("div4x + lev1.25x", dict(conv=4.0, lev=1.25))
+        _row("div4x + lev1.5x", dict(conv=4.0, lev=1.5))
+        print("\n--- (c) STALE-BOOK DRIFT (rank on earnings-accrued book vs raw quarterly book) ---", flush=True)
+        print(hdr, flush=True)
+        pb = pb_raw;    _row("BASELINE raw P/B (div2x)", dict(conv=2.0))
+        pb = pb_drift;  _row("drift-adjusted (full)", dict(conv=2.0))
+        pb = pb_trap;   _row("drift: loss-maker penalty only", dict(conv=2.0))
+        pb = pb_hidden; _row("drift: profitable discount only", dict(conv=2.0))
+        print("  (stale-book drift on the div4x base:)", flush=True)
+        pb = pb_raw;    _row("BASELINE div4x (raw P/B)", dict(conv=4.0))
+        pb = pb_drift;  _row("drift-adjusted + div4x", dict(conv=4.0))
+        pb = pb_drift   # restore the new default (drift)
+        sys.exit(0)
+
+    if os.environ.get("ENTRY_DIV_LAB"):
+        # ── (A) ENTRY-TIMING (#110): time the value pick on the stock's OWN RSI(10) — oversold gate/pref, dip-in-
+        # uptrend, and a BUY-STRENGTH anti-control (memory entry-signal-value-pick says confirmation SUBTRACTS).
+        # (B) DOWNSIDE DIVERSIFICATION diagnostic (user idea): the Sortino-analog for diversification — DDR =
+        # avg(downside-dev) / basket-downside-dev, and downside Effective-N (participation ratio of the down-month
+        # correlation eigenvalues), on the flagship's held basket each month. Honest 2016-2026, div4x+drift base. ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _pre(pairs):
+            return float(_np.prod([1 + r for d, r in pairs if d < "2020"]) - 1) * 100
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            pr = r.get("monthly", [])
+            print(f"  {lab:34}{r['total']:>11.0f}%{r['dd']:>8.1f}%{_pre(pr):>8.0f}%"
+                  f"{_yr(pr,'2018'):>7.0f}%{_yr(pr,'2023'):>7.0f}%{r['sharpe']:>7.2f}", flush=True)
+            return r
+        hdr = f"  {'arm':34}{'FULL':>11}{'DD':>8}{'pre20':>8}{'2018':>7}{'2023':>7}{'Shrp':>7}"
+        print("\n=== ENTRY_DIV_LAB (honest 2016-2026, div4x+drift base) ===", flush=True)
+        print("\n--- (A) ENTRY-TIMING: RSI(10) of the value pick's own price (among the 5 cheapest) ---", flush=True)
+        print(hdr, flush=True)
+        _row("BASELINE (cheapest, no timing)", dict())
+        for _e in ("oversold_gate", "oversold_pref", "dip", "strength"):
+            _row(f"entry={_e}", dict(entry=_e))
+
+        print("\n--- (B) DOWNSIDE DIVERSIFICATION of the flagship basket (Sortino-analog) ---", flush=True)
+        tr = []
+        run(True, True, trace=tr, **base)
+        def _basket_div(held, date):
+            win = smret_m.loc[:date]
+            win = win.iloc[-24:] if len(win) > 24 else win
+            cols = [h for h in held if h in win.columns]
+            sub = win[cols].dropna(how="all")
+            if sub.shape[1] < 2 or sub.shape[0] < 6:
+                return (1.0, float(max(1, sub.shape[1])))
+            R = sub.fillna(0.0).values
+            sd = _np.array([_np.std(R[:, j][R[:, j] < 0]) if (R[:, j] < 0).sum() > 1 else _np.std(R[:, j])
+                            for j in range(R.shape[1])])
+            b = R.mean(axis=1); down = b < 0
+            sdb = _np.std(b[down]) if down.sum() > 1 else _np.std(b)
+            ddr = float(_np.mean(sd) / sdb) if sdb > 0 else 1.0
+            Rd = R[down] if down.sum() >= 4 else R
+            try:
+                C = _np.nan_to_num(_np.corrcoef(Rd, rowvar=False), nan=0.0)
+                ev = _np.linalg.eigvalsh(C); ev = ev[ev > 0]
+                enb = float((ev.sum() ** 2) / (ev ** 2).sum()) if ev.size else 1.0
+            except Exception:
+                enb = 1.0
+            return (ddr, enb)
+        rows = []
+        for t in tr:
+            held = [p["ticker"] for p in t["picks"] if p.get("ret") is not None]
+            ddr, enb = _basket_div(held, pd.Timestamp(t["date"]))
+            rows.append((t["date"], len(held), ddr, enb, t.get("basket_ret")))
+        ddrs = _np.array([r[2] for r in rows]); enbs = _np.array([r[3] for r in rows])
+        ns = _np.array([r[1] for r in rows]); brets = _np.array([(r[4] if r[4] is not None else _np.nan) for r in rows])
+        thin = ns <= 2
+        print(f"  months traced        : {len(rows)}", flush=True)
+        print(f"  avg holdings/month   : {ns.mean():.1f}   (median {int(_np.median(ns))})", flush=True)
+        print(f"  DDR  avg / min / p25 : {ddrs.mean():.2f} / {ddrs.min():.2f} / {_np.percentile(ddrs,25):.2f}   (1.0 = no downside diversification)", flush=True)
+        print(f"  down-ENB avg / min   : {enbs.mean():.2f} / {enbs.min():.2f}   (effective independent bets in a crash; nominal = {ns.mean():.1f})", flush=True)
+        print(f"  thin months (<=2)    : {int(thin.sum())}   their DDR avg {ddrs[thin].mean() if thin.any() else float('nan'):.2f}  vs non-thin {ddrs[~thin].mean():.2f}", flush=True)
+        # does LOW downside-diversification predict a WORSE month? (corr of DDR with same-month basket return)
+        _m = ~_np.isnan(brets)
+        if _m.sum() > 5:
+            print(f"  corr(DDR, basket_ret): {float(_np.corrcoef(ddrs[_m], brets[_m])[0,1]):+.2f}   (>0 => more-diversified months returned more)", flush=True)
+        # worst 6 DDR months (the fake-diversification / all-sink-together months)
+        worst = sorted(rows, key=lambda r: r[2])[:6]
+        print("  lowest-DDR months (all-sink-together risk):", flush=True)
+        for d, n, ddr, enb, br in worst:
+            print(f"    {d}  n={n:>2}  DDR={ddr:.2f}  down-ENB={enb:.2f}  ret={('%+.1f%%'%(br*100)) if br is not None else 'NA'}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("DRIFT_SIZE_LAB"):
+        # ── NEW IDEA (return-additive): SIZE by drift magnitude — bet harder on names whose stale quarterly book
+        # most UNDERSTATES value (earnings accrued since filing => hidden-cheap), lighter on drift-flagged traps.
+        # Extends the proven stale-book-drift SELECTION win to POSITION SIZING. div4x+drift base. Honest 2016-2026. ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _pre(pairs):
+            return float(_np.prod([1 + r for d, r in pairs if d < "2020"]) - 1) * 100
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            pr = r.get("monthly", [])
+            print(f"  {lab:34}{r['total']:>11.0f}%{r['dd']:>8.1f}%{_pre(pr):>8.0f}%"
+                  f"{_yr(pr,'2018'):>7.0f}%{_yr(pr,'2023'):>7.0f}%{r['sharpe']:>7.2f}", flush=True)
+            return r
+        print("\n=== DRIFT_SIZE_LAB (honest 2016-2026, div4x+drift base): size by book-drift magnitude ===", flush=True)
+        print(f"  {'arm':34}{'FULL':>11}{'DD':>8}{'pre20':>8}{'2018':>7}{'2023':>7}{'Shrp':>7}", flush=True)
+        _row("BASELINE (conviction sizing)", dict())
+        _row("size=drift (k2)", dict(size_mode="drift"))
+        _row("size=drift_steep (k4)", dict(size_mode="drift_steep"))
+        sys.exit(0)
+
+    if os.environ.get("FACTOR_BAKEOFF"):
+        # ── Finviz factor zoo (user): bake off every FUNDAMENTAL selector we have PIT data for, each as the
+        # within-cohort pick on the honest div4x+drift base. Value ratios, quality (ROE/ROA/GPA), improving-quality,
+        # growth (revenue), premium-normalized fair value. The TA zoo (RSI/MA/pattern/ATR/beta) is skipped — already
+        # refuted (indicator-bakeoff). Objective = ABSOLUTE return per return-priority. ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _pre(pairs):
+            return float(_np.prod([1 + r for d, r in pairs if d < "2020"]) - 1) * 100
+        def _row(lab, kw):
+            try:
+                r = run(True, True, **base, **kw)
+            except Exception as e:
+                print(f"  {lab:30}  ERROR {type(e).__name__}: {e}", flush=True); return None
+            pr = r.get("monthly", [])
+            print(f"  {lab:30}{r['total']:>11.0f}%{r['dd']:>8.1f}%{_pre(pr):>8.0f}%"
+                  f"{_yr(pr,'2018'):>7.0f}%{_yr(pr,'2023'):>7.0f}%{r['sharpe']:>7.2f}", flush=True)
+            return r
+        print("\n=== FACTOR_BAKEOFF (honest 2016-2026, div4x+drift base): fundamental selectors ===", flush=True)
+        print(f"  {'selector (value_key)':30}{'FULL':>11}{'DD':>8}{'pre20':>8}{'2018':>7}{'2023':>7}{'Shrp':>7}", flush=True)
+        for lab, vk in [
+            ("pb  (FLAGSHIP, drift)", "pb"), ("pe_ttm", "pe_ttm"), ("ps_ttm", "ps_ttm"),
+            ("evebit_ttm", "evebit_ttm"), ("fcfy_ttm", "fcfy_ttm"), ("pb_roe (=P/E proxy)", "pb_roe"),
+            ("roe_gate (quality gate)", "roe_gate"), ("gpa_gate (gross-prof gate)", "gpa_gate"),
+            ("pb_prof (cheap among profitable)", "pb_prof"), ("justified (P/B vs ROE-g)", "justified"),
+            ("residual (below P/B~ROE line)", "residual"), ("resid_rk (robust)", "resid_rk"),
+            ("upside (analyst target)", "upside"), ("upside_pb_60 (blend)", "upside_pb_60")]:
+            _row(lab, dict(value_key=vk))
+        sys.exit(0)
+
+    if os.environ.get("EVENT_LAB"):
+        # ── Finviz EVENT & PATTERN signals (user) as tilts on the value pick (among the 5 cheapest): analyst
+        # Upgrades/Downgrades (dated 2011+), Insider open-market buying (SEC Form345, 2020+), 52w-Low/New-High
+        # (Finviz New Low/High), volatility SQUEEZE (wedge/triangle proxy). Discretionary shapes (H&S) can't be
+        # detected reliably -> proxied. Prior is low (short-horizon signals on a monthly value book) but test it. ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _pre(pairs):
+            return float(_np.prod([1 + r for d, r in pairs if d < "2020"]) - 1) * 100
+        def _row(lab, kw):
+            try:
+                r = run(True, True, **base, **kw)
+            except Exception as e:
+                print(f"  {lab:30}  ERROR {type(e).__name__}: {e}", flush=True); return None
+            pr = r.get("monthly", [])
+            print(f"  {lab:30}{r['total']:>11.0f}%{r['dd']:>8.1f}%{_pre(pr):>8.0f}%"
+                  f"{_yr(pr,'2018'):>7.0f}%{_yr(pr,'2023'):>7.0f}%{r['sharpe']:>7.2f}", flush=True)
+            return r
+        # coverage report so we know how much of the window each event signal actually informs
+        print("\n=== EVENT_LAB (honest 2016-2026, div4x+drift base): Finviz event & pattern tilts ===", flush=True)
+        print(f"  coverage: upgrades {100*net_upg_m.notna().mean().mean():.0f}% | insider {100*insider_m.notna().mean().mean():.0f}%"
+              f" | 52w-low {100*near_low_m.notna().mean().mean():.0f}% | squeeze {100*squeeze_m.notna().mean().mean():.0f}%", flush=True)
+        print(f"  {'tilt':30}{'FULL':>11}{'DD':>8}{'pre20':>8}{'2018':>7}{'2023':>7}{'Shrp':>7}", flush=True)
+        _row("BASELINE (cheapest, no tilt)", dict())
+        for _e in ("upgraded", "no_downgrade", "insider", "nearlow", "newhigh", "squeeze"):
+            _row(f"tilt={_e}", dict(entry=_e))
+        sys.exit(0)
+
+    if os.environ.get("TREND_LAB"):
+        # ── Finviz TRENDLINE + DOUBLE-BOTTOM patterns (user) as tilts on the value pick, + re-confirm no_downgrade
+        # (the one event tilt that added return) with a sub-period read. div4x+drift base. Honest 2016-2026. ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _pre(pairs):
+            return float(_np.prod([1 + r for d, r in pairs if d < "2020"]) - 1) * 100
+        def _post(pairs):
+            return float(_np.prod([1 + r for d, r in pairs if d >= "2022"]) - 1) * 100
+        def _row(lab, kw):
+            try:
+                r = run(True, True, **base, **kw)
+            except Exception as e:
+                print(f"  {lab:26}  ERROR {type(e).__name__}: {e}", flush=True); return None
+            pr = r.get("monthly", [])
+            print(f"  {lab:26}{r['total']:>11.0f}%{r['dd']:>8.1f}%{_pre(pr):>8.0f}%{_post(pr):>9.0f}%"
+                  f"{_yr(pr,'2018'):>7.0f}%{_yr(pr,'2023'):>7.0f}%{r['sharpe']:>7.2f}", flush=True)
+            return r
+        print("\n=== TREND_LAB (honest 2016-2026, div4x+drift base): trendline + double-bottom + no_downgrade ===", flush=True)
+        print(f"  coverage: tl_resid {100*tl_resid_m.notna().mean().mean():.0f}% | dbot {100*dbot_m.notna().mean().mean():.0f}%", flush=True)
+        print(f"  {'tilt':26}{'FULL':>11}{'DD':>8}{'pre20':>8}{'post22':>9}{'2018':>7}{'2023':>7}{'Shrp':>7}", flush=True)
+        _row("BASELINE (no tilt)", dict())
+        _row("tilt=tl_support", dict(entry="tl_support"))
+        _row("tilt=tl_break", dict(entry="tl_break"))
+        _row("tilt=dbot (double bottom)", dict(entry="dbot"))
+        _row("tilt=no_downgrade", dict(entry="no_downgrade"))
+        sys.exit(0)
+
+    if os.environ.get("TL_VERIFY"):
+        # ── tl_support looked spectacular (112950%/Sh1.93) but pre-2020-loaded. VERIFY robustness: per-year
+        # baseline vs tl_support, and a true OUT-OF-SAMPLE 2020-start run (trade only 2020-2026). If the edge is
+        # only pre-2020 it's dead; if it holds trading forward from 2020 it's real. ──
+        import sys
+        import numpy as _np
+        from collections import defaultdict
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _peryear(r):
+            yr = defaultdict(lambda: 1.0)
+            for d, rr in r.get("monthly", []):
+                yr[d[:4]] *= (1 + rr)
+            return {y: (v - 1) * 100 for y, v in yr.items()}
+        b = run(True, True, **base); s = run(True, True, **base, entry="tl_support")
+        yb, ys = _peryear(b), _peryear(s)
+        print("\n=== TL_VERIFY: per-year baseline vs tl_support (which years drive it?) ===", flush=True)
+        print(f"  {'year':6}{'baseline':>12}{'tl_support':>14}{'diff':>10}", flush=True)
+        for y in sorted(set(yb) | set(ys)):
+            d = ys.get(y, 0) - yb.get(y, 0)
+            print(f"  {y:6}{yb.get(y,0):>11.0f}%{ys.get(y,0):>13.0f}%{d:>+9.0f}%", flush=True)
+        print("\n  OUT-OF-SAMPLE (trade only 2020-01+ forward):", flush=True)
+        for lab, kw in [("baseline 2020+", dict()), ("tl_support 2020+", dict(entry="tl_support"))]:
+            r = run(True, True, **base, start_date="2020-01-01", **kw)
+            print(f"    {lab:20}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sharpe {r['sharpe']:.2f}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("TL_ROBUST"):
+        # ── FINAL GATE before wiring tl_support: is it robust to the trendline LOOKBACK (6/9/12mo) and the cheap-
+        # cohort size K (3/5/8)? If it wins across all, it's structural; if only at 9mo/K5 it's overfit. Also the
+        # OUT-OF-SAMPLE 2020+ for each. div4x+drift base, honest 2016-2026. ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            ro = run(True, True, **base, start_date="2020-01-01", **kw)
+            print(f"  {lab:22}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}   |  2020+: "
+                  f"{ro['total']:>9.0f}%  Sh{ro['sharpe']:>5.2f}", flush=True)
+        print("\n=== TL_ROBUST: tl_support sensitivity to trendline lookback (L) and cohort size (K) ===", flush=True)
+        print(f"  {'arm':22}{'FULL':>11}{'':>10}{'':>8}      {'OOS 2020+':>9}", flush=True)
+        _row("BASELINE (no tilt)", dict())
+        _row("tl_support L9  K5", dict(entry="tl_support"))
+        _row("tl_support L6  K5", dict(entry="tl_support_6"))
+        _row("tl_support L12 K5", dict(entry="tl_support_12"))
+        _row("tl_support L9  K3", dict(entry="tl_support", entry_k=3))
+        _row("tl_support L9  K8", dict(entry="tl_support", entry_k=8))
+        sys.exit(0)
+
+    if os.environ.get("TL_GRID"):
+        # ── "WHY 9 MONTHS?" (user): map the FULL trendline-lookback curve (4..18mo) — full-period AND out-of-sample
+        # 2020+ — to see if 9 is a smooth PLATEAU (trustworthy) or a lone SPIKE (overfit). K5 throughout. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        b = run(True, True, **base); bo = run(True, True, **base, start_date="2020-01-01")
+        print("\n=== TL_GRID: tl_support edge vs trendline lookback L (K5) ===", flush=True)
+        print(f"  {'L (months)':12}{'FULL':>11}{'Sharpe':>8}{'vs base':>9}   |{'OOS 2020+':>11}{'Sharpe':>8}{'vs base':>9}", flush=True)
+        print(f"  {'BASELINE':12}{b['total']:>10.0f}%{b['sharpe']:>8.2f}{'—':>9}   |{bo['total']:>10.0f}%{bo['sharpe']:>8.2f}{'—':>9}", flush=True)
+        for _L in (4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 18):
+            r = run(True, True, **base, entry=f"tl_support_{_L}")
+            ro = run(True, True, **base, start_date="2020-01-01", entry=f"tl_support_{_L}")
+            _wv = "WIN " if r['total'] > b['total'] else "lose"
+            _wo = "WIN " if ro['total'] > bo['total'] else "lose"
+            print(f"  {('L='+str(_L)):12}{r['total']:>10.0f}%{r['sharpe']:>8.2f}{_wv:>9}   |{ro['total']:>10.0f}%{ro['sharpe']:>8.2f}{_wo:>9}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("SURVIVOR_LAB"):
+        # ── SURVIVORSHIP test (user) on the tl_support flagship: with-delisted (the honest de-biased book — trades
+        # names that later delisted, exiting at last/deal price) vs SURVIVORS-ONLY (optimistic — only names alive
+        # today). Gap = survivorship inflation. Run for baseline AND tl_support to see if the 112950% edge leans on
+        # survivors. div4x+drift base, honest 2016-2026. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _row(lab, incl_del, kw):
+            r = run(incl_del, True, **base, **kw)
+            print(f"  {lab:34}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}  delisted-picks {r.get('delisted_picks', '?')}", flush=True)
+            return r
+        print("\n=== SURVIVOR_LAB (honest 2016-2026): survivorship bias on the tl_support flagship ===", flush=True)
+        bd = _row("BASELINE  with-delisted (honest)", True, dict())
+        bs = _row("BASELINE  survivors-only", False, dict())
+        td = _row("tl_support with-delisted (honest)", True, dict(entry="tl_support"))
+        ts = _row("tl_support survivors-only", False, dict(entry="tl_support"))
+        print(f"\n  survivorship gap (survivors/ delisted): baseline {bs['total']/max(1,bd['total']):.2f}x | "
+              f"tl_support {ts['total']/max(1,td['total']):.2f}x   (>1 = survivors-only inflated)", flush=True)
+        print(f"  tl_support edge WITH delisted: {td['total']/max(1,bd['total']):.2f}x baseline "
+              f"({td['total']:.0f}% vs {bd['total']:.0f}%)", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("CANDLE_LAB"):
+        # ── CANDLESTICK patterns (user) as entry tilts on the value pick, across DAILY/WEEKLY/MONTHLY bars: prefer
+        # bullish (hammer/engulfing/harami/marubozu/morning-star) or avoid bearish (shooting-star/engulfing/evening).
+        # Monthly is the relevant timeframe for a monthly hold; daily/weekly are shorter/noisier. Prior LOW. base=
+        # tl_support flagship reference too, but tilts replace the entry so tested vs cheapest baseline. ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            pr = r.get("monthly", [])
+            print(f"  {lab:26}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}  2023 {_yr(pr,'2023'):>5.0f}%", flush=True)
+            return r
+        print("\n=== CANDLE_LAB (honest 2016-2026, div4x+drift base): candlestick tilts (daily/weekly/monthly) ===", flush=True)
+        print(f"  coverage: daily {100*candle_bull_m.notna().mean().mean():.0f}% | wk-bull {100*cw_bull.notna().mean().mean():.0f}%"
+              f" | mo-bull {100*cm_bull.notna().mean().mean():.0f}%", flush=True)
+        _row("BASELINE (cheapest, no tilt)", dict())
+        _row("tl_support (current flagship)", dict(entry="tl_support"))
+        for _e in ("candle_d", "cw_bull", "cm_bull", "cw_avoidbear", "cm_avoidbear"):
+            _row(f"tilt={_e}", dict(entry=_e))
+        sys.exit(0)
+
+    if os.environ.get("CRASH_LAB"):
+        # ── tl_support as a REGIME-CONDITIONAL CRASH overlay (user: "keep it anyway in case of a crash"): apply the
+        # trendline-dip pick ONLY when SPY is in a drawdown (< -N% from its trailing-12mo high), else the normal
+        # cheapest pick. Goal: capture the crash-rebound boost (2020) WITHOUT dragging normal years. Test thresholds
+        # + per-year (is the lift crash-timed?) + 2021+ (does it stay neutral in the calm recent stretch?). ──
+        import sys
+        from collections import defaultdict
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _peryear(r):
+            yr = defaultdict(lambda: 1.0)
+            for d, rr in r.get("monthly", []):
+                yr[d[:4]] *= (1 + rr)
+            return {y: (v - 1) * 100 for y, v in yr.items()}
+        def _row(lab, kw, sd=None):
+            r = run(True, True, **base, start_date=sd, **kw)
+            print(f"  {lab:28}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}", flush=True)
+            return r
+        _nmonths = int((spy_dd < -0.10).sum()), int((spy_dd < -0.15).sum()), int((spy_dd < -0.20).sum())
+        print("\n=== CRASH_LAB (honest 2016-2026, div4x+drift base): tl_support as a SPY-drawdown crash overlay ===", flush=True)
+        print(f"  crash-active months: <-10%: {_nmonths[0]} | <-15%: {_nmonths[1]} | <-20%: {_nmonths[2]}  (of {len(spy_dd.dropna())})", flush=True)
+        b = _row("BASELINE (always cheapest)", dict())
+        _row("tl_support (ALWAYS on)", dict(entry="tl_support"))
+        c10 = _row("tl_crash <-10%", dict(entry="tl_crash_10"))
+        c15 = _row("tl_crash <-15%", dict(entry="tl_crash_15"))
+        c20 = _row("tl_crash <-20%", dict(entry="tl_crash_20"))
+        print("\n  2021+ forward (must stay ~neutral vs baseline in the calm stretch):", flush=True)
+        _row("baseline 2021+", dict(), sd="2021-01-01")
+        _row("tl_crash<-15% 2021+", dict(entry="tl_crash_15"), sd="2021-01-01")
+        print("\n  per-year baseline vs tl_crash<-15% (lift should be crash-timed only):", flush=True)
+        yb, yc = _peryear(b), _peryear(c15)
+        for y in sorted(set(yb) | set(yc)):
+            d = yc.get(y, 0) - yb.get(y, 0)
+            _mk = "  <-- crash lift" if abs(d) > 3 else ""
+            print(f"    {y}  base {yb.get(y,0):>7.0f}%   crash15 {yc.get(y,0):>7.0f}%   diff {d:>+7.0f}%{_mk}", flush=True)
+
+        print("\n  RECOVERY-persistent gate (tl_support for M months AFTER a < -N% drawdown):", flush=True)
+        for _e in ("tl_recov_15_6", "tl_recov_15_12", "tl_recov_10_6", "tl_recov_10_12", "tl_recov_20_12"):
+            _row(_e, dict(entry=_e))
+        rc = run(True, True, **base, entry="tl_recov_15_12")
+        yr2 = _peryear(rc)
+        print("\n  per-year baseline vs tl_recov_15_12 (should lift 2020-2021 recovery, neutral else):", flush=True)
+        for y in sorted(set(yb) | set(yr2)):
+            d = yr2.get(y, 0) - yb.get(y, 0)
+            _mk = "  <-- recovery lift" if abs(d) > 3 else ""
+            print(f"    {y}  base {yb.get(y,0):>7.0f}%   recov {yr2.get(y,0):>7.0f}%   diff {d:>+7.0f}%{_mk}", flush=True)
+        _row("tl_recov_15_12  2021+", dict(entry="tl_recov_15_12"), sd="2021-01-01")
+        sys.exit(0)
+
+    if os.environ.get("TL_VALIDATE"):
+        # ── HARDER VALIDATION of tl_support before trusting it as flagship (user: "validate more"):
+        #   (1) PLACEBO — does a NON-signal pick from the same top-5 (2nd/3rd cheapest, rotating) do as well? If so
+        #       the "edge" is just variance from not-always-buying-the-cheapest, NOT the trendline signal.
+        #   (2) COST — tl_support changes picks (more turnover); does the edge survive 25/50 bps transaction cost?
+        #   (3) EXCLUDE-2020 — is the edge just the 2020 COVID rebound (+137pp year)? Test 2021-01+ forward.
+        #   (4) SIGN — buying ABOVE the trendline (tl_break) should be WORSE if the signal is real (monotonic). ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _row(lab, kw, sd=None):
+            r = run(True, True, **base, start_date=sd, **kw)
+            print(f"  {lab:30}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}", flush=True)
+            return r
+        print("\n=== TL_VALIDATE (honest 2016-2026, div4x+drift base): is tl_support a real signal? ===", flush=True)
+        print("\n  (1) PLACEBO — signal vs non-signal picks from the SAME top-5 cheapest:", flush=True)
+        _row("BASELINE (cheapest)", dict())
+        _row("tl_support (the signal)", dict(entry="tl_support"))
+        _row("PLACEBO 2nd cheapest", dict(entry="pick2"))
+        _row("PLACEBO 3rd cheapest", dict(entry="pick3"))
+        _row("PLACEBO rotating top-5", dict(entry="pick_rot"))
+        _row("SIGN-FLIP: above trendline", dict(entry="tl_break"))
+        print("\n  (2) COST sensitivity (turnover drag):", flush=True)
+        _row("baseline + 25bps", dict(cost_bps=25))
+        _row("tl_support + 25bps", dict(entry="tl_support", cost_bps=25))
+        _row("tl_support + 50bps", dict(entry="tl_support", cost_bps=50))
+        print("\n  (3) EXCLUDE-2020 (trade 2021-01+ forward — is the edge just the COVID rebound?):", flush=True)
+        _row("baseline 2021+", dict(), sd="2021-01-01")
+        _row("tl_support 2021+", dict(entry="tl_support"), sd="2021-01-01")
+        sys.exit(0)
+
+    if os.environ.get("TL_TF"):
+        # ── tl_support trendline on DAILY vs WEEKLY vs MONTHLY bars (user: "did you try day or weeks?"). The current
+        # flagship fits 9 MONTHLY bars. Test weekly (13/26/39wk) and daily (63/126/189d) fits — full + OOS 2020+. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        b = run(True, True, **base); bo = run(True, True, **base, start_date="2020-01-01")
+        print("\n=== TL_TF: tl_support trendline on daily/weekly bars vs the monthly-9 flagship ===", flush=True)
+        print(f"  {'trendline fit':22}{'FULL':>11}{'Sharpe':>8}   |{'OOS 2020+':>11}{'Sharpe':>8}", flush=True)
+        print(f"  {'BASELINE (no tilt)':22}{b['total']:>10.0f}%{b['sharpe']:>8.2f}   |{bo['total']:>10.0f}%{bo['sharpe']:>8.2f}", flush=True)
+        _r = run(True, True, **base, entry="tl_support"); _ro = run(True, True, **base, start_date="2020-01-01", entry="tl_support")
+        print(f"  {'MONTHLY 9 (flagship)':22}{_r['total']:>10.0f}%{_r['sharpe']:>8.2f}   |{_ro['total']:>10.0f}%{_ro['sharpe']:>8.2f}", flush=True)
+        for _rl, _Ls in (("W", (13, 26, 39)), ("D", (63, 126, 189))):
+            for _L in _Ls:
+                _e = f"tltf:{_rl}:{_L}"
+                r = run(True, True, **base, entry=_e); ro = run(True, True, **base, start_date="2020-01-01", entry=_e)
+                _nm = f"{'WEEKLY' if _rl=='W' else 'DAILY'} {_L}"
+                print(f"  {_nm:22}{r['total']:>10.0f}%{r['sharpe']:>8.2f}   |{ro['total']:>10.0f}%{ro['sharpe']:>8.2f}", flush=True)
+        sys.exit(0)
+
     if os.environ.get("REGIME_SPEED_TEST"):
         # ── does the regime switch lag? (user: "bad results because we're not catching the regime quickly
         # enough"). Test detection SPEED: 1/2/3/6/12-month lookback on the value/small leadership signal. Fast
@@ -1256,7 +2384,7 @@ def build():
             ("middle", "Middle — commodity exemption", "Skip large-cap-only sectors EXCEPT commodity/miners (keep the real producer). Robust + lower DD.",
              dict(largecap_mode="skip", largecap_keep=MINER)),
             ("adaptive", "Adaptive — regime switch (12mo)", "Detects value/small-cap leadership from the rotation system's own 12-month momentum (regimes are multi-year, so a slow signal avoids whipsaw); aggressive in our regime, core when mega-cap growth leads. Best risk-adjusted config.",
-             dict(regime_switch="either", regime_lookback=12)),
+             dict(regime_switch="either", regime_signal="multi")),
             ("aggressive", "Aggressive — regime bet", "Skip ALL large-cap-only sectors (pure small-cap). Levered long the post-2020 small-cap/commodity regime.",
              dict(largecap_mode="skip")),
         ]
@@ -2112,7 +3240,7 @@ def build():
         # CONFIG-parameterized trace so each setup gets its own full doc (subtabs -> per-config trades).
         # FLAGSHIP default = ADAPTIVE: raw-value core + 12-month regime switch. Best risk-adjusted (28447%).
         _cfgkw = {
-            "adaptive": dict(regime_switch="either", regime_lookback=12),
+            "adaptive": dict(regime_switch="either", regime_signal="multi"),
             "core": dict(),
             "middle": dict(largecap_mode="skip", largecap_keep={"GLD", "SLV", "PPLT", "USO", "UNG", "URA", "LIT",
                                                                  "COPX", "SLX", "REMX", "XLE", "XLB"}),
@@ -2120,7 +3248,7 @@ def build():
         }
         _ck = os.environ.get("CONFIG", "adaptive")
         _kw = _cfgkw.get(_ck, _cfgkw["adaptive"])
-        perf = run(True, True, country_ok=_is_usca, trace=tr, **_kw)
+        perf = run(True, True, country_ok=_is_usca, trace=tr, entry="tl_support", **_kw)  # tl_support VALIDATED (placebo/cost/sign pass; crash-rebound option, gating strictly worse)
         out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": f"usca_small_{_ck}", "config": _ck,
                "perf": {k: perf.get(k) for k in ("total", "annual", "vs_spy", "sharpe", "dd", "t_stat", "months",
                                                  "delisted_picks")},
@@ -2157,7 +3285,8 @@ def build():
         # when value/small-cap leads, core when mega-cap growth leads). Best risk-adjusted config: 28447% Sh1.61
         # DD−24.9% (core-level DD, 2.4× the core return), +72% pre-2020. Detects regime from the rotation
         # system's own 12mo value/small leadership signal (slow = matches the multi-year regime, no whipsaw).
-        "usca_small_adaptive": run(True, True, country_ok=_is_usca, regime_switch="either", regime_lookback=12),
+        "usca_small_adaptive": run(True, True, country_ok=_is_usca, regime_switch="either", regime_signal="multi",
+                                   entry="tl_support"),   # 2026-08-18: dip-in-9mo-uptrend, VALIDATED (placebo/cost/sign)
         # the demoted aggressive stack (kept for reference; overfit the 2020 recovery, DD−42%)
         "usca_small_upside_pb": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True,
                                     top_n=7, size_mode="upside", largecap_mode="skip"),
