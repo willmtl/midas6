@@ -999,7 +999,7 @@ def build():
             growth_fallback=False, top_n=None, size_mode="conv", cost_bps=0.0, lev=1.0, largecap_mode=None,
             defensive_riskoff=None, largecap_keep=None, sector_playbook=False, regime_switch=None,
             regime_lookback=6, regime_signal="vs", regime_hyst=0, no_cash=False, book="value",
-            conv=None, conc_regime=None, entry=None, entry_k=5, flow_gate=False):
+            conv=None, conc_regime=None, entry=None, entry_k=5, flow_gate=False, live=False):
         rets, spies, dl_picks, mrets = [], [], 0, []
         _conv = float(conv) if conv is not None else CONV   # A/D-divergence conviction weight (default div_2x)
         def _entry_pick(cands):
@@ -1153,15 +1153,18 @@ def build():
         traded = set(); banned = set()  # ban_first_loss: names whose FIRST-ever trade lost -> never buy again
         _sd = pd.Timestamp(start_date) if start_date else None
         _ed = pd.Timestamp(end_date) if end_date else None
-        for i in range(max(6, warmup), len(midx) - 1):
-            date, ndate = midx[i], midx[i + 1]
+        for i in range(max(6, warmup), len(midx) - (0 if live else 1)):
+            date = midx[i]; ndate = midx[i + 1] if (i + 1) < len(midx) else None   # ndate None = LIVE pick month
             if (_sd is not None and date < _sd) or (_ed is not None and date > _ed):
                 continue                # window restriction (apples-to-apples sub-period walk-forward)
             if include_months is not None and date not in include_months:
                 continue                # regime-conditional: only accumulate months in this regime
-            sp = spy_m.iloc[i + 1] / spy_m.iloc[i] - 1
-            if not np.isfinite(sp):
-                continue
+            if ndate is not None:
+                sp = spy_m.iloc[i + 1] / spy_m.iloc[i] - 1
+                if not np.isfinite(sp):
+                    continue
+            else:
+                sp = np.nan             # LIVE: no forward month yet -> select only, no return
             a = accel.loc[date]; m6 = mom6.loc[date]; m3 = mom3.loc[date]
             if drop_sectors:
                 for e in drop_sectors:
@@ -1275,7 +1278,7 @@ def build():
                 all_sectors = [{"rank": rk, "sector": etf_name.get(e, e), "etf": e,
                                 "accel": _f(a[e]), "etf_ret": _fwd(e), "in_top": (e in _topset)}
                                for rk, e in enumerate(_all_rank.index, 1)]
-                tr = {"date": str(pd.Timestamp(date).date()), "ndate": str(pd.Timestamp(ndate).date()),
+                tr = {"date": str(pd.Timestamp(date).date()), "ndate": (str(pd.Timestamp(ndate).date()) if ndate is not None else None),
                       "top_sectors": [{"sector": etf_name.get(e, e), "etf": e, "accel": _f(accel.loc[date, e]),
                                        "etf_ret": _fwd(e)} for e in top],
                       "all_sectors": all_sectors,
@@ -1514,7 +1517,7 @@ def build():
                 held.add(p)
                 if pd.notna(mktcap_usd.loc[date, p]) and mktcap_usd.loc[date, p] > 5e10:
                     mega_picks += 1
-                r = _ret_delist(px_usd[p], date, ndate)      # return on the USD-translated series -> includes FX P&L
+                r = _ret_delist(px_usd[p], date, ndate) if ndate is not None else 0.0   # LIVE: no fwd return
                 if r is None or not np.isfinite(r):
                     if tr is not None:
                         tr["picks"].append({"sector": etf_name.get(etf, etf), "etf": etf, "ticker": p,
@@ -1561,8 +1564,8 @@ def build():
                                         "de": _f(de.loc[date, p]), "gpa": _f(gpa.loc[date, p]),
                                         "rev_g": _f(rev_g.loc[date, p]), "ni": _f(ttm_ni.loc[date, p]),
                                         "revenue": _f(revp.loc[date, p]), "mktcap_usd": _f(mktcap_usd.loc[date, p]),
-                                        "weight": float(w), "ret": float(r), "delisted": p in delisted_sector,
-                                        "mae": _pick_mae(p, date, ndate),
+                                        "weight": float(w), "ret": (float(r) if ndate is not None else None), "delisted": p in delisted_sector,
+                                        "mae": (_pick_mae(p, date, ndate) if ndate is not None else None),
                                         "conviction": bool(accumulating(p, date))})
             if wsum <= 0 and no_cash:
                 # NEVER sit in full cash (user): if the whole month would be cash, first take the best LARGE-CAP
@@ -1605,6 +1608,10 @@ def build():
                                                     "mktcap_usd": None, "weight": 1.0, "ret": float(_br),
                                                     "delisted": False, "mae": None, "conviction": False})
             if wsum <= 0:
+                continue
+            if ndate is None:              # LIVE pick month: picks recorded in tr, no forward return -> emit & stop
+                if tr is not None:
+                    trace.append(tr)
                 continue
             _mret = rr / wsum
             if not bool(bull_200.get(date, True)):       # SPY below 200d MA -> risk-off overlays
@@ -3439,6 +3446,34 @@ def build():
             b = base[name]
             print(f"  {name:20} {r['total']:8.1f}%  (baseline {b:7.1f}%  {r['total']-b:+7.1f}pp)  "
                   f"Sharpe {r['sharpe']:.2f}  DD {r['dd']:.1f}%  t {r['t_stat']}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("LIVE_PICK"):
+        # ── LIVE-SCANNER PORT (user): emit the CURRENT-month flagship picks using the EXACT validated engine
+        # (div4x + stale-book drift + tl_support), via live=True (loop runs one extra month for selection only,
+        # no forward return). Single-source => live picks match the backtest BY CONSTRUCTION. Built-in RECONCILE:
+        # a non-live run must produce identical picks on the last COMMON month (proves the live guards didn't
+        # alter the normal path). Writes .data/studies/live_flagship_picks.json for the dashboard/scanner. ──
+        import sys, json
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support")
+        tr = []; run(True, True, live=True, trace=tr, **_base)               # includes the current (ndate=None) month
+        tr2 = []; run(True, True, trace=tr2, **_base)                        # non-live backtest (stops one month short)
+        live_month = tr[-1]
+        _lv = {t["date"]: [x["ticker"] for x in t["picks"] if x.get("ticker")] for t in tr}
+        _bt = {t["date"]: [x["ticker"] for x in t["picks"] if x.get("ticker")] for t in tr2}
+        _common = sorted(set(_lv) & set(_bt))[-1]
+        _ok = _lv[_common] == _bt[_common]
+        print(f"\n=== LIVE FLAGSHIP PICKS for {live_month['date']} (div4x + drift + tl_support; SAME engine as backtest) ===", flush=True)
+        for p in live_month["picks"]:
+            if not p.get("ticker"):
+                continue
+            _mc = p.get("mktcap_usd"); _mc = f"${_mc/1e6:.0f}M" if _mc else "?"
+            print(f"  {str(p.get('sector'))[:24]:24} {p['ticker']:8} P/B {p.get('pb')}  {_mc}  conv={p.get('conviction')}", flush=True)
+        print(f"\nRECONCILE last common month {_common}: live {'== backtest ✓' if _ok else 'DIFFERS ✗ ' + str((_lv[_common], _bt[_common]))}", flush=True)
+        Path("/app/.data/studies/live_flagship_picks.json").write_text(
+            json.dumps({"date": live_month["date"], "reconciled": _ok, "reconcile_month": _common,
+                        "picks": live_month["picks"]}, indent=2, default=str))
+        print("wrote /app/.data/studies/live_flagship_picks.json", flush=True)
         sys.exit(0)
 
     if os.environ.get("FLAGSHIP_TRACE"):
