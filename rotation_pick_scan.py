@@ -4,7 +4,7 @@
 The backtest verdict: rotating sector ETFs LOSES to SPY (-27% to -82% vs SPY). The edge is using the
 rotation as a SECTOR-SELECTION FILTER feeding a VALUE stock-pick: rank the sector ETFs by momentum
 ACCELERATION, take the top-N inflecting sectors, and in EACH pick the CHEAPEST positive-P/B stock,
-profit-guard + low-debt, size-tilted small, div_2x conviction-weighted.
+profit-guard + low-debt, size-tilted small, div_4x conviction-weighted.
 
 FLAGSHIP = usca_small (survivorship-de-biased, USD-incl-FX, point-in-time, no-penny, $50M-pharma floor,
 delisting-audited): +790.4% total / Sharpe 1.49 / DD -20.5% / t3.34 (survivorship_smallcap_study.py).
@@ -378,10 +378,13 @@ def build():
             continue
         picks.append(row)
 
-    # WEIGHTING (2026-08-18 flagship): div_2x conviction (A/D divergence) × ANALYST-UPSIDE sizing (bet more on
+    # WEIGHTING (2026-08-18 flagship): div_4x conviction (A/D divergence) × ANALYST-UPSIDE sizing (bet more on
     # higher implied-upside names — backtest +2081pp, better Sharpe AND lower DD, all windows), then renormalize.
     # Size multiplier = clamp(1 + implied_upside, 0.3, 3.0), matching the backtest size_mode="upside".
-    CONVICTION_MULT = 2.0
+    # 2026-08-18: CONVICTION_MULT 2.0->4.0 (div4x) — DEPLOY_LAB: steeper A/D-divergence conviction lifts the
+    # backtest 29472->43554% / Sharpe 1.67->1.74 / better DD (monotonic to 8x; 4x = prudent stop). Weight-only
+    # change (reweights allocation, does NOT change which names are picked).
+    CONVICTION_MULT = 4.0
     for p in picks:
         w = CONVICTION_MULT if p.get("accumulating") else 1.0
         up = upside_by_ticker.get(p["pick"])
@@ -403,8 +406,8 @@ def build():
                                 "the big sector ETFs don't hold — the flagship's biggest lever)"),
                    "sector_signal": "momentum ACCELERATION (3mo-now minus 3mo-3ago) — catches the inflection, not the 6mo run",
                    "size_tilt": f"prefer cheapest-P/B among <${SMALL_CAP_USD/1e9:g}B USD names (small-cap size premium); fall back to all-cap if none",
-                   "conviction_weighting": ("div_2x: equal-weight basket, but A/D-divergence names (ADL rising ~3mo "
-                                            "while price fell ~3mo = accumulation into weakness) get 2x weight, "
+                   "conviction_weighting": ("div_4x: equal-weight basket, but A/D-divergence names (ADL rising ~3mo "
+                                            "while price fell ~3mo = accumulation into weakness) get 4x weight, "
                                             "renormalized; pct_alloc per pick is the deployable weight."),
                    "value_metric": ("CAP-AWARE: small-cap tier = top-5 cheapest raw P/B then cheapest trailing "
                                     "P/E among profitable (P/E>P/B is small-cap-specific, +196pp backtest, "
@@ -451,7 +454,7 @@ def main():
         print(f"Saved BacktestResult[{_kind}]", flush=True)
     except Exception as e:
         print("DB save failed:", e, flush=True)
-    print(f"\n=== ROTATION PICKS (cheapest-P/B per sector, div_2x conviction weight) — "
+    print(f"\n=== ROTATION PICKS (cheapest-P/B per sector, div_4x conviction weight) — "
           f"{payload['n_accumulating']} accumulating ===", flush=True)
     for p in payload["picks"]:
         pb = f"{p['pb_ratio']:>5}" if p.get("pb_ratio") is not None else "  ETF"

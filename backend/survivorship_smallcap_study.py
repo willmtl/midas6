@@ -500,6 +500,48 @@ def build():
             out[tk] = daily.reindex(daily.index.union(midx)).sort_index().rolling("90D").sum().reindex(midx)
         return pd.DataFrame(out).reindex(index=midx, columns=stock_m.columns)
     insider_m = _insider_panel()
+    # ── EVENT-SIGNAL panels (13D/13G activist, earnings PEAD/proximity, net insider buy-sell, congress) — gated
+    # behind EVENT2_LAB so normal/flagship runs aren't slowed; empty by default so entry modes fall back to cheapest.
+    _EMPTY = pd.DataFrame(index=midx, columns=stock_m.columns)
+    sec13d_m = earn_beat_m = earn_soon_m = insider_net_m = congress_m = _EMPTY
+    if os.environ.get("EVENT2_LAB"):
+        _cols = set(stock_m.columns)
+        _midx_i = np.array([pd.Timestamp(d).value for d in midx], dtype="int64")
+        def _recent(rows, window_days, agg="sum"):
+            """rows = [(ticker, date_ts_ns, value)] -> PIT panel: trailing-window sum/last at each month-end."""
+            from collections import defaultdict
+            byt = defaultdict(list)
+            for tk, dt, v in rows:
+                byt[tk].append((dt, v))
+            _wns = window_days * 86400 * 1_000_000_000
+            out = {}
+            for tk, pts in byt.items():
+                arr = np.array(sorted(pts), dtype="float64"); di, tv = arr[:, 0], arr[:, 1]
+                col = np.full(len(midx), np.nan)
+                for j, d in enumerate(_midx_i):
+                    a = np.searchsorted(di, d - _wns, "right"); b = np.searchsorted(di, d, "right")
+                    if b > a:
+                        col[j] = tv[a:b].sum() if agg == "sum" else tv[b - 1]
+                out[tk] = col
+            return pd.DataFrame(out, index=midx).reindex(columns=stock_m.columns)
+        from core.models import SecFiling as _SF, EarningsEvent as _EE, CongressTrade as _CT, InsiderBuy as _IB
+        _s13 = [(t, pd.Timestamp(d).value, 1.0) for t, d in _SF.objects.filter(form_group="13D", ticker__in=_cols)
+                .values_list("ticker", "filed_date")]
+        sec13d_m = _recent(_s13, 180, "sum")                                  # activist 13D count, trailing 180d
+        _eb = [(t, pd.Timestamp(d).value, float(s)) for t, d, s in _EE.objects.filter(ticker__in=_cols)
+               .exclude(eps_surprise_pct__isnull=True).values_list("ticker", "report_date", "eps_surprise_pct")]
+        earn_beat_m = _recent(_eb, 90, "last")                                # latest EPS surprise % in last 90d (PEAD)
+        _es = [(t, pd.Timestamp(d).value) for t, d in _EE.objects.filter(ticker__in=_cols)
+               .values_list("ticker", "report_date")]
+        earn_soon_m = _recent([(t, dt - 30 * 86400 * 1_000_000_000, 1.0) for t, dt in _es], 30, "sum")  # reports in NEXT 30d
+        _in = [(t, pd.Timestamp(d).value, float(bv or 0) - float(sv or 0)) for t, d, bv, sv in
+               _IB.objects.filter(ticker__in=_cols).values_list("ticker", "filed_date", "buy_value", "sell_value")]
+        insider_net_m = _recent(_in, 90, "sum")                               # net insider $ (buy - sell), trailing 90d
+        _cg = [(t, pd.Timestamp(d).value, (1.0 if str(tt).lower().startswith("buy") else -1.0)) for t, d, tt in
+               _CT.objects.filter(ticker__in=_cols).values_list("ticker", "report_date", "transaction_type")]
+        congress_m = _recent(_cg, 120, "sum")                                 # net legislator buys, trailing 120d
+        print(f"EVENT2 coverage: 13D {100*sec13d_m.notna().mean().mean():.0f}% | earn_beat {100*earn_beat_m.notna().mean().mean():.0f}%"
+              f" | insider_net {100*insider_net_m.notna().mean().mean():.0f}% | congress {100*congress_m.notna().mean().mean():.0f}%", flush=True)
     # VOLATILITY SQUEEZE (wedge/triangle proxy — Finviz patterns): trailing-6mo std of monthly returns, LOW = a
     # contracting/coiling range. Lower = tighter squeeze (pattern-breakout setups). Objectively computable (unlike H&S).
     squeeze_m = smret_m.rolling(6, min_periods=3).std()
@@ -580,17 +622,21 @@ def build():
             bull = (hammer | beng).astype(float)
             out[_tk] = bull.rolling(5, min_periods=1).sum().resample("ME").last()
         return pd.DataFrame(out).reindex(index=midx, columns=stock_m.columns)
-    candle_bull_m = _candle_panel()
+    _EMPTY_C = pd.DataFrame(index=midx, columns=stock_m.columns)
+    candle_bull_m = _candle_panel() if os.environ.get("CANDLE_LAB") else _EMPTY_C
     def _candle_bars(rule):
         """Common bullish/bearish candlestick patterns on RESAMPLED bars (rule='W' weekly / 'ME' monthly), sampled
         at month-end. Returns (bull_score, bear_score) DataFrames. Patterns: engulfing, hammer/shooting-star,
         harami, 3-bar star (morning/evening), marubozu. The signal people quote on daily/weekly/monthly charts."""
-        bull_out, bear_out = {}, {}
+        bull_out, bear_out, doji_out = {}, {}, {}
         for _tk, _df in stock_daily.items():
             if _df is None or not {"Open", "High", "Low", "Close"}.issubset(_df.columns):
                 continue
-            g = _df[["Open", "High", "Low", "Close"]].resample(rule).agg(
-                {"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+            if rule == "D":
+                g = _df[["Open", "High", "Low", "Close"]].dropna()
+            else:
+                g = _df[["Open", "High", "Low", "Close"]].resample(rule).agg(
+                    {"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
             if len(g) < 4:
                 continue
             o, h, l, c = g["Open"], g["High"], g["Low"], g["Close"]
@@ -598,25 +644,39 @@ def build():
             up = h - np.maximum(o, c); lo = np.minimum(o, c) - l
             po, pc, pab = o.shift(), c.shift(), ab.shift()
             green, red = c > o, c < o
+            mid = (po + pc) / 2
             hammer = (lo >= 2 * ab) & (up <= ab) & green                       # bullish hammer
             shoot = (up >= 2 * ab) & (lo <= ab) & red                          # bearish shooting star
+            invhammer = (up >= 2 * ab) & (lo <= ab) & green                    # bullish inverted hammer
+            hangman = (lo >= 2 * ab) & (up <= ab) & red                        # bearish hanging man
             beng = (pc < po) & green & (c >= po) & (o <= pc)                   # bullish engulfing
             beareng = (pc > po) & red & (c <= po) & (o >= pc)                  # bearish engulfing
             bharami = (pc < po) & green & (c <= po) & (o >= pc) & (ab < pab)   # bullish harami
             bearharami = (pc > po) & red & (c >= po) & (o <= pc) & (ab < pab)  # bearish harami
             marub_b = green & (ab > 0.9 * rng)                                # bullish marubozu
             marub_r = red & (ab > 0.9 * rng)                                  # bearish marubozu
-            # 3-bar star: down bar, small-body star, strong up bar (morning) / mirror (evening)
-            morning = red.shift(2) & (ab.shift(1) < pab) & green & (c > (po.shift(1) + pc.shift(1)) / 2)
-            evening = green.shift(2) & (ab.shift(1) < pab) & red & (c < (po.shift(1) + pc.shift(1)) / 2)
-            bull = (hammer | beng | bharami | marub_b | morning).astype(float)
-            bear = (shoot | beareng | bearharami | marub_r | evening).astype(float)
+            morning = red.shift(2) & (ab.shift(1) < pab) & green & (c > mid.shift(1))   # morning star
+            evening = green.shift(2) & (ab.shift(1) < pab) & red & (c < mid.shift(1))   # evening star
+            pierce = (pc < po) & green & (o < l.shift(1)) & (c > mid) & (c < po)         # piercing line (bull)
+            darkcloud = (pc > po) & red & (o > h.shift(1)) & (c < mid) & (c > po)        # dark cloud cover (bear)
+            soldiers = green & green.shift(1) & green.shift(2) & (c > pc) & (pc > pc.shift(1))   # 3 white soldiers
+            crows = red & red.shift(1) & red.shift(2) & (c < pc) & (pc < pc.shift(1))    # 3 black crows
+            doji = ab <= 0.1 * rng                                             # doji (tiny body = indecision)
+            dragonfly = doji & (lo >= 2 * rng.mul(0.4)) & (up <= 0.1 * rng)    # dragonfly doji (bullish)
+            gravestone = doji & (up >= 2 * rng.mul(0.4)) & (lo <= 0.1 * rng)   # gravestone doji (bearish)
+            bull = (hammer | invhammer | beng | bharami | marub_b | morning | pierce | soldiers | dragonfly).astype(float)
+            bear = (shoot | hangman | beareng | bearharami | marub_r | evening | darkcloud | crows | gravestone).astype(float)
             bull_out[_tk] = bull.reindex(bull.index.union(midx)).ffill().reindex(midx)
             bear_out[_tk] = bear.reindex(bear.index.union(midx)).ffill().reindex(midx)
+            doji_out[_tk] = doji.astype(float).reindex(g.index.union(midx)).ffill().reindex(midx)
         R = lambda d: pd.DataFrame(d).reindex(index=midx, columns=stock_m.columns)
-        return R(bull_out), R(bear_out)
-    cw_bull, cw_bear = _candle_bars("W")      # weekly candlestick bull/bear (as of month-end)
-    cm_bull, cm_bear = _candle_bars("ME")     # monthly candlestick bull/bear
+        return R(bull_out), R(bear_out), R(doji_out)
+    if os.environ.get("CANDLE_LAB"):
+        cd_bull, cd_bear, cd_doji = _candle_bars("D")  # DAILY candlestick full-set bull/bear/doji (as of month-end)
+        cw_bull, cw_bear, cw_doji = _candle_bars("W")  # WEEKLY
+        cm_bull, cm_bear, cm_doji = _candle_bars("ME")  # MONTHLY
+    else:
+        cd_bull = cd_bear = cd_doji = cw_bull = cw_bear = cw_doji = cm_bull = cm_bear = cm_doji = _EMPTY_C
 
     def _pick_mae(tk, d0, d1):
         """Max ADVERSE excursion of a holding during its hold month: the worst intra-window drawdown from
@@ -667,6 +727,7 @@ def build():
     # loss-making. This does NOT feed any ranking (usca_small ranks on raw pb; pb_roe is unchanged).
     ttm_ni = R(_pit_ttm_ni(reps, midx))
     roe_ttm = ttm_ni / eq.where(eq != 0)                   # trailing-12m ROE (signed)
+    droe_ttm = roe_ttm - roe_ttm.shift(12)                  # YoY change in TTM ROE (improving-profitability catalyst)
     pe_ttm = mktcap / ttm_ni.where(ttm_ni != 0)            # signed trailing P/E = Price / TTM-EPS
     # STALE-BOOK DRIFT (user insight): quarterly book is stale between filings — a profitable name's true equity
     # has quietly GROWN since its last 10-Q (cheaper than raw P/B shows), a cash-burner's has SHRUNK (illusory-
@@ -950,6 +1011,20 @@ def build():
             if entry == "upgraded":     return _pick_by(net_upg_m, hi=True)     # most net analyst upgrades (90d)
             if entry == "no_downgrade": return _pick_by(net_upg_m, hi=True, gate=lambda v: v >= 0)  # avoid net-downgraded
             if entry == "insider":      return _pick_by(insider_m, hi=True)     # most insider open-market buying (90d)
+            if entry == "sec13d":       return _pick_by(sec13d_m, hi=True)      # activist 13D stake filed (catalyst)
+            if entry == "earn_beat":    return _pick_by(earn_beat_m, hi=True)   # PEAD: recent positive EPS surprise
+            if entry == "congress":     return _pick_by(congress_m, hi=True)    # net legislator buying
+            if entry == "insider_net":  return _pick_by(insider_net_m, hi=True) # net insider $ (buy - sell)
+            if entry == "avoid_insider_sell":                                   # skip names with NET insider selling
+                q = [h for h in _K if h in insider_net_m.columns and pd.notna(insider_net_m.loc[date, h])
+                     and float(insider_net_m.loc[date, h]) < 0]
+                _ok = [h for h in _K if h not in q]
+                return _ok[0] if _ok else _K[0]
+            if entry == "earn_avoid":                                          # skip names reporting within next 30d
+                q = [h for h in _K if h in earn_soon_m.columns and pd.notna(earn_soon_m.loc[date, h])
+                     and float(earn_soon_m.loc[date, h]) > 0]
+                _ok = [h for h in _K if h not in q]
+                return _ok[0] if _ok else _K[0]
             if entry == "nearlow":      return _pick_by(near_low_m, hi=False)   # closest to 52-week low (deep value)
             if entry == "newhigh":      return _pick_by(near_low_m, hi=True)    # breakout: furthest above 52w low
             if entry == "squeeze":      return _pick_by(squeeze_m, hi=False)    # tightest coil (wedge/triangle proxy)
@@ -959,6 +1034,22 @@ def build():
                 q = [h for h in _K if h in _sm.columns and pd.notna(_sm.loc[date, h])
                      and float(_sm.loc[date, h]) > 0 and pd.notna(_rm.loc[date, h])]
                 return min(q, key=lambda h: float(_rm.loc[date, h])) if q else _K[0]
+            def _tlpick(pool):   # tl_support applied to an arbitrary candidate subset
+                q = [h for h in pool if h in tl_slope_m.columns and pd.notna(tl_slope_m.loc[date, h])
+                     and float(tl_slope_m.loc[date, h]) > 0 and pd.notna(tl_resid_m.loc[date, h])]
+                return min(q, key=lambda h: float(tl_resid_m.loc[date, h])) if q else pool[0]
+            if entry == "tl_nodown":     # COMBINED: tl_support, but only among names NOT recently net-downgraded
+                pool = [h for h in _K if h not in net_upg_m.columns or pd.isna(net_upg_m.loc[date, h])
+                        or float(net_upg_m.loc[date, h]) >= 0] or _K
+                return _tlpick(pool)
+            if entry == "improving":     # cheapest among IMPROVING-ROE names (droe_ttm>0), else cheapest
+                q = [h for h in _K if h in droe_ttm.columns and pd.notna(droe_ttm.loc[date, h])
+                     and float(droe_ttm.loc[date, h]) > 0]
+                return q[0] if q else _K[0]
+            if entry == "tl_improving":  # tl_support among improving-ROE names
+                pool = [h for h in _K if h in droe_ttm.columns and pd.notna(droe_ttm.loc[date, h])
+                        and float(droe_ttm.loc[date, h]) > 0] or _K
+                return _tlpick(pool)
             if entry == "tl_break":     # pushing ABOVE the (resistance) trendline in an uptrend (breakout)
                 q = [h for h in _K if h in tl_slope_m.columns and pd.notna(tl_slope_m.loc[date, h])
                      and float(tl_slope_m.loc[date, h]) > 0 and pd.notna(tl_resid_m.loc[date, h])]
@@ -993,15 +1084,15 @@ def build():
                 q = [h for h in _K if h in _sm.columns and pd.notna(_sm.loc[date, h])
                      and float(_sm.loc[date, h]) > 0 and pd.notna(_rm.loc[date, h])]
                 return min(q, key=lambda h: float(_rm.loc[date, h])) if q else _K[0]
-            if entry == "candle_d":     return _pick_by(candle_bull_m, hi=True)   # daily bullish candle (last 5d)
-            if entry == "cw_bull":      return _pick_by(cw_bull, hi=True)         # weekly bullish candle
-            if entry == "cm_bull":      return _pick_by(cm_bull, hi=True)         # monthly bullish candle
-            if entry == "cw_avoidbear":                                          # skip weekly BEARISH candle
-                q = [h for h in _K if h in cw_bear.columns and pd.notna(cw_bear.loc[date, h]) and cw_bear.loc[date, h] == 0]
-                return q[0] if q else _K[0]
-            if entry == "cm_avoidbear":                                          # skip monthly BEARISH candle
-                q = [h for h in _K if h in cm_bear.columns and pd.notna(cm_bear.loc[date, h]) and cm_bear.loc[date, h] == 0]
-                return q[0] if q else _K[0]
+            if entry == "candle_d":     return _pick_by(candle_bull_m, hi=True)   # daily bullish (old: hammer+engulf, 5d)
+            _CANDLE = {"cd": (cd_bull, cd_bear, cd_doji), "cw": (cw_bull, cw_bear, cw_doji), "cm": (cm_bull, cm_bear, cm_doji)}
+            if isinstance(entry, str) and ("_" in entry) and (entry[:2] in _CANDLE):
+                _bp, _br, _dj = _CANDLE[entry[:2]]; _kind = entry.split("_", 1)[1]
+                if _kind == "bull":     return _pick_by(_bp, hi=True)            # prefer bullish full-set candle
+                if _kind == "doji":     return _pick_by(_dj, hi=True)            # prefer doji (indecision/reversal)
+                if _kind == "avoidbear":                                        # skip bearish full-set candle
+                    q = [h for h in _K if h in _br.columns and pd.notna(_br.loc[date, h]) and _br.loc[date, h] == 0]
+                    return q[0] if q else _K[0]
             return _K[0]
         prev_held = set()          # last month's basket, for turnover-based transaction costs
         _base_lcm = largecap_mode  # base large-cap policy; regime_switch overrides it per-month
@@ -2225,11 +2316,15 @@ def build():
             print(f"  {lab:26}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}  2023 {_yr(pr,'2023'):>5.0f}%", flush=True)
             return r
         print("\n=== CANDLE_LAB (honest 2016-2026, div4x+drift base): candlestick tilts (daily/weekly/monthly) ===", flush=True)
-        print(f"  coverage: daily {100*candle_bull_m.notna().mean().mean():.0f}% | wk-bull {100*cw_bull.notna().mean().mean():.0f}%"
-              f" | mo-bull {100*cm_bull.notna().mean().mean():.0f}%", flush=True)
+        print(f"  coverage: cd_bull {100*cd_bull.notna().mean().mean():.0f}% | cw_bull {100*cw_bull.notna().mean().mean():.0f}%"
+              f" | cm_bull {100*cm_bull.notna().mean().mean():.0f}% | doji(mo) {100*cm_doji.notna().mean().mean():.0f}%", flush=True)
+        print("  full set: hammer/inv-hammer/engulf/harami/marubozu/star/piercing/3-soldiers/dragonfly (+bear mirror) + doji", flush=True)
         _row("BASELINE (cheapest, no tilt)", dict())
         _row("tl_support (current flagship)", dict(entry="tl_support"))
-        for _e in ("candle_d", "cw_bull", "cm_bull", "cw_avoidbear", "cm_avoidbear"):
+        print("  -- DAILY / WEEKLY / MONTHLY bars, full pattern set --", flush=True)
+        for _e in ("cd_bull", "cw_bull", "cm_bull",           # prefer bullish full-set
+                   "cd_doji", "cw_doji", "cm_doji",           # prefer doji (indecision/reversal)
+                   "cd_avoidbear", "cw_avoidbear", "cm_avoidbear"):   # avoid bearish full-set
             _row(f"tilt={_e}", dict(entry=_e))
         sys.exit(0)
 
@@ -2309,6 +2404,56 @@ def build():
         print("\n  (3) EXCLUDE-2020 (trade 2021-01+ forward — is the edge just the COVID rebound?):", flush=True)
         _row("baseline 2021+", dict(), sd="2021-01-01")
         _row("tl_support 2021+", dict(entry="tl_support"), sd="2021-01-01")
+        sys.exit(0)
+
+    if os.environ.get("MORE_TESTS"):
+        # ── the untested/queued ideas (user 'continue with the other tests'), on the tl_support flagship base:
+        #   leverage stack (return-priority), COMBINED tl_support+no_downgrade gate, IMPROVING-ROE catalyst. ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _pre(pairs):
+            return float(_np.prod([1 + r for d, r in pairs if d < "2020"]) - 1) * 100
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            pr = r.get("monthly", [])
+            print(f"  {lab:30}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}  pre20{_pre(pr):>7.0f}%  2023{_yr(pr,'2023'):>6.0f}%", flush=True)
+            return r
+        print("\n=== MORE_TESTS (honest 2016-2026, div4x+drift base): leverage / combined-gate / improving-ROE ===", flush=True)
+        _row("BASELINE (cheapest, no entry)", dict())
+        _row("tl_support (flagship)", dict(entry="tl_support"))
+        print("  -- leverage on tl_support (return-priority; DD honest ~-60.8% real base) --", flush=True)
+        _row("tl_support + lev1.25x", dict(entry="tl_support", lev=1.25))
+        _row("tl_support + lev1.5x", dict(entry="tl_support", lev=1.5))
+        print("  -- combined gate + improving-ROE catalyst --", flush=True)
+        _row("tl_nodown (tl + avoid-downgrade)", dict(entry="tl_nodown"))
+        _row("improving (cheapest+ROE rising)", dict(entry="improving"))
+        _row("tl_improving (tl among improving)", dict(entry="tl_improving"))
+        _row("no_downgrade (ref)", dict(entry="no_downgrade"))
+        sys.exit(0)
+
+    if os.environ.get("EVENT2_LAB"):
+        # ── the last untested event signals (user 'do the untested'): 13D activist, earnings PEAD/proximity, net
+        # insider buy-sell, congress trades — each as the entry pick vs baseline (cheapest) and tl_support flagship. ──
+        import sys
+        import numpy as _np
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            pr = r.get("monthly", [])
+            print(f"  {lab:28}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}  2023{_yr(pr,'2023'):>6.0f}%", flush=True)
+            return r
+        print("\n=== EVENT2_LAB (honest 2016-2026, div4x+drift base): activist / earnings / insider-net / congress ===", flush=True)
+        _row("BASELINE (cheapest)", dict())
+        _row("tl_support (flagship ref)", dict(entry="tl_support"))
+        for _e in ("sec13d", "earn_beat", "earn_avoid", "insider_net", "avoid_insider_sell", "congress"):
+            _row(f"entry={_e}", dict(entry=_e))
         sys.exit(0)
 
     if os.environ.get("TL_TF"):
