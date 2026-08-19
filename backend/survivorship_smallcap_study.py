@@ -2591,10 +2591,13 @@ def build():
         def _row(lab, nm):
             tr = []
             r = run(True, True, **base, rebal=nm, trace=tr)
-            print(f"  {lab:22}{r['total']:>12.0f}%  ann {r['annual']:>6.1f}%  DD{r['dd']:>6.1f}%  "
+            print(f"  {lab:22}{r['total']:>12.0f}%  ann {r['annual']:>6.1f}%  periodDD*{r['dd']:>6.1f}%  "
                   f"Sh{r['sharpe']:>5.2f}  rebalances {r['months']:>4}", flush=True)
             return r
         print("\n=== REBAL_LAB (honest 2016-2026, full universe): rebalance cadence (hold longer, rotate less) ===", flush=True)
+        print("  *periodDD is sampled at the REBALANCE frequency (not monthly), so it is NOT comparable across "
+              "cadences — a coarser cadence hides intra-period drawdown (12mo ~0% is this artifact). Judge on "
+              "return + Sharpe; DD here is directional only.", flush=True)
         _row("1mo (current)", 1)
         _row("2mo", 2)
         _row("3mo (quarterly)", 3)
@@ -2805,9 +2808,11 @@ def build():
                 _e *= (1 + float(_sr)); _spycurve.append(round(_e * 100000))
         out = []
         for key, name, desc, kw in cfgs:
-            rF = run(True, True, country_ok=_is_usca, **kw)
-            rp = run(True, True, country_ok=_is_usca, end_date="2019-12-31", **kw)
-            rq = run(True, True, country_ok=_is_usca, start_date="2020-01-31", **kw)
+            # tl_support is part of the wired flagship recipe (all configs) — must match FLAGSHIP_TRACE (line ~3689)
+            # so the ladder totals equal the per-config pages / masthead (adaptive => 112,950%, not the old 29,472%).
+            rF = run(True, True, country_ok=_is_usca, entry="tl_support", **kw)
+            rp = run(True, True, country_ok=_is_usca, entry="tl_support", end_date="2019-12-31", **kw)
+            rq = run(True, True, country_ok=_is_usca, entry="tl_support", start_date="2020-01-31", **kw)
             n_yr = rF["months"] / 12.0
             cagr = ((1 + rF["total"] / 100) ** (1 / n_yr) - 1) * 100 if rF["total"] > -100 else None
             # equity curve + calendar from the monthly returns

@@ -236,7 +236,9 @@ def main():
     for p in payload["picks"]:
         pb = f"{p['pb_ratio']:>5}" if p.get("pb_ratio") is not None else "  n/a"
         acc = "  🔵 ACCUMULATING (4x)" if p.get("accumulating") else ""
-        print(f"  #{p['rank']:>2} {p['sector'][:22]:22} accel {p['acceleration']:>+6.1f}  ->  "
+        _sec = (p.get("sector") or "?")[:22]
+        _ac = f"{p['acceleration']:>+6.1f}" if p.get("acceleration") is not None else "   n/a"
+        print(f"  #{p['rank']:>2} {_sec:22} accel {_ac}  ->  "
               f"{p['pick']:8} driftP/B {pb}  ${p.get('last_close')}  alloc {p.get('pct_alloc')}%{acc}", flush=True)
 
 
