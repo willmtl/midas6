@@ -3662,9 +3662,11 @@ def build():
             _mc = p.get("mktcap_usd"); _mc = f"${_mc/1e6:.0f}M" if _mc else "?"
             print(f"  {str(p.get('sector'))[:24]:24} {p['ticker']:8} P/B {p.get('pb')}  {_mc}  conv={p.get('conviction')}", flush=True)
         print(f"\nRECONCILE last common month {_common}: live {'== backtest ✓' if _ok else 'DIFFERS ✗ ' + str((_lv[_common], _bt[_common]))}", flush=True)
+        _out = dict(live_month)                          # full trace month: date, top_sectors, all_sectors,
+        _out["reconciled"] = _ok                          # deactivated, picks — everything the live scanner needs
+        _out["reconcile_month"] = _common                 # to build the /rotation table from this single source
         Path("/app/.data/studies/live_flagship_picks.json").write_text(
-            json.dumps({"date": live_month["date"], "reconciled": _ok, "reconcile_month": _common,
-                        "picks": live_month["picks"]}, indent=2, default=str))
+            json.dumps(_out, indent=2, default=str))
         print("wrote /app/.data/studies/live_flagship_picks.json", flush=True)
         sys.exit(0)
 
