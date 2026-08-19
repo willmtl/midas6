@@ -338,6 +338,15 @@ def build():
     _spy_d = etf_daily[BENCH]["Close"]
     _spy200 = _spy_d.rolling(200).mean().resample("ME").last().reindex(midx)
     bull_200 = (spy_m >= _spy200)          # True = above 200d MA (bull); the classic trend filter
+    # SPY RSI(14) at month-end (PIT, Wilder EMA on daily closes) — gates the tl_support entry tilt: the dip-in-
+    # rising-trend pick only pays in HEALTHY/uptrend markets (SPY RSI high), so apply it only when RSI>=45, else
+    # take the plain cheapest. Best risk-adjusted + threshold-robust variant (SPY_RSI_LAB: Sh 1.95 vs 1.91).
+    def _spy_rsi_series(s, n=14):
+        dl = s.diff(); up = dl.clip(lower=0); dn = -dl.clip(upper=0)
+        ru = up.ewm(alpha=1.0 / n, adjust=False).mean(); rd = dn.ewm(alpha=1.0 / n, adjust=False).mean()
+        return 100 - 100 / (1 + ru / rd.replace(0, np.nan))
+    spy_rsi_m = _spy_rsi_series(_spy_d).resample("ME").last().reindex(midx)
+    TL_RSI_GATE = 45.0                      # SPY RSI floor for firing tl_support (user-chosen; robust across 45-55)
     _qqq_d = load_candles(["QQQ"]).get("QQQ")   # for the risk-off QQQ hedge (short growth when value holds up)
     qqq_close_m = (_qqq_d["Close"].resample("ME").last().reindex(midx) if _qqq_d is not None else spy_m)
 
@@ -588,7 +597,7 @@ def build():
             _slp[_t, :] = _b
         return (pd.DataFrame(_res, index=stock_m.index, columns=stock_m.columns),
                 pd.DataFrame(_slp, index=stock_m.index, columns=stock_m.columns))
-    _TL_LS = (4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 18) if os.environ.get("TL_GRID") else (6, 9, 12)
+    _TL_LS = (4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 18) if os.environ.get("TL_GRID") else (6, 8, 9, 12)
     _TL = {_L: _trendline(_L) for _L in _TL_LS}             # trendline fits at multiple lookbacks (finer under TL_GRID)
     tl_resid_m, tl_slope_m = _TL[9]                          # default trendline = 9-month fit
     # DAILY / WEEKLY trendline (user: "did you try day or weeks?"): fit the trendline on finer BARS instead of
@@ -958,19 +967,26 @@ def build():
         rsi_bull_m[t] = bull.resample("ME").last().reindex(midx).fillna(False).astype(bool)
         freshcross_m[t] = (cross.rolling(15).max() > 0).resample("ME").last().reindex(midx).fillna(False).astype(bool)
     print("two-stage secondary-signal panels built", flush=True)
-    dvol, adl_m = {}, {}
+    dvol, adl_m, dvol100 = {}, {}, {}
     for t in common:
         d = stock_daily.get(t)
         if d is None or "Volume" not in d or len(d) < 60:
             continue
         v = d["Volume"]
-        dvol[t] = (d["Close"] * v).rolling(20).mean().resample("ME").last().reindex(midx)
+        _ddv = d["Close"] * v
+        dvol[t] = _ddv.rolling(20).mean().resample("ME").last().reindex(midx)
+        dvol100[t] = _ddv.rolling(100).mean().resample("ME").last().reindex(midx)   # longer baseline for vol-trend
         if {"High", "Low", "Close"}.issubset(d.columns):
             rng = (d["High"] - d["Low"]).replace(0, np.nan)
             mfm = ((d["Close"] - d["Low"]) - (d["High"] - d["Close"])) / rng
             adl_m[t] = (mfm.fillna(0) * v).cumsum().resample("ME").last().reindex(midx)
     dvol = pd.DataFrame(dvol).reindex(index=midx, columns=common)
     dvol_usd = dvol * ret_factor                   # $5M liquidity floor must be in USD (KRW 5M is ~$3.6k, not $5M)
+    # VOLUME-TREND panel (PIT): 20d dollar-vol / 100d dollar-vol. >1 = volume BUILDING (accumulation/interest),
+    # <1 = volume DRYING UP (neglect). Tested as an entry tilt among the cheapest cohort (VOL_LAB). Currency
+    # cancels (ratio of two dollar-vols), so no FX needed. Both windows end at `date` -> no look-ahead.
+    dvol100_df = pd.DataFrame(dvol100).reindex(index=midx, columns=common)
+    vol_trend_m = (dvol / dvol100_df).replace([np.inf, -np.inf], np.nan)
     adl = pd.DataFrame(adl_m).reindex(index=midx, columns=common)
     ad_slope3 = adl - adl.shift(3); px_ret3 = px.pct_change(3)
     rsi_slope3 = rsi10_m - rsi10_m.shift(3)   # 3mo change in monthly RSI(10) -> RSI divergence (rsi up while price down)
@@ -1075,6 +1091,16 @@ def build():
                 if not q:
                     return _K[0]
                 return (max if hi else min)(q, key=lambda h: float(panel.loc[date, h]))
+            if entry == "vol_up":       return _pick_by(vol_trend_m, hi=True)   # BUILDING volume among the cheapest (20d/100d $vol highest)
+            if entry == "vol_down":     return _pick_by(vol_trend_m, hi=False)  # contrarian control: driest volume
+            if entry == "vol_dry_avoid":                                        # cheapest, but skip DRYING-volume names (<0.9)
+                q = [h for h in _K if h in vol_trend_m.columns and pd.notna(vol_trend_m.loc[date, h])
+                     and float(vol_trend_m.loc[date, h]) >= 0.9]
+                return q[0] if q else _K[0]
+            if entry == "vol_surge":                                            # cheapest among clear volume SURGES (>1.3)
+                q = [h for h in _K if h in vol_trend_m.columns and pd.notna(vol_trend_m.loc[date, h])
+                     and float(vol_trend_m.loc[date, h]) >= 1.3]
+                return q[0] if q else _K[0]
             if entry == "upgraded":     return _pick_by(net_upg_m, hi=True)     # most net analyst upgrades (90d)
             if entry == "no_downgrade": return _pick_by(net_upg_m, hi=True, gate=lambda v: v >= 0)  # avoid net-downgraded
             if entry == "insider":      return _pick_by(insider_m, hi=True)     # most insider open-market buying (90d)
@@ -1105,6 +1131,13 @@ def build():
                 q = [h for h in _K if h in _sm.columns and pd.notna(_sm.loc[date, h])
                      and float(_sm.loc[date, h]) > 0 and pd.notna(_rm.loc[date, h])]
                 return min(q, key=lambda h: float(_rm.loc[date, h])) if q else _K[0]
+            if entry == "tl_rsi":   # FLAGSHIP TILT: tl_support (L9) ONLY when SPY RSI>=gate (healthy/uptrend market),
+                _rv = spy_rsi_m.get(date)                       # else plain cheapest. Best Sharpe + threshold-robust.
+                if pd.isna(_rv) or float(_rv) < TL_RSI_GATE:
+                    return _K[0]
+                q = [h for h in _K if h in tl_slope_m.columns and pd.notna(tl_slope_m.loc[date, h])
+                     and float(tl_slope_m.loc[date, h]) > 0 and pd.notna(tl_resid_m.loc[date, h])]
+                return min(q, key=lambda h: float(tl_resid_m.loc[date, h])) if q else _K[0]
             def _tlpick(pool):   # tl_support applied to an arbitrary candidate subset
                 q = [h for h in pool if h in tl_slope_m.columns and pd.notna(tl_slope_m.loc[date, h])
                      and float(tl_slope_m.loc[date, h]) > 0 and pd.notna(tl_resid_m.loc[date, h])]
@@ -1163,6 +1196,22 @@ def build():
                 q = [h for h in _K if h in _sm.columns and pd.notna(_sm.loc[date, h])
                      and float(_sm.loc[date, h]) > 0 and pd.notna(_rm.loc[date, h])]
                 return min(q, key=lambda h: float(_rm.loc[date, h])) if q else _K[0]
+            if entry == "tl_mtf":   # MULTI-TF: monthly trendline UP (higher-TF direction) + deepest WEEKLY-39 dip (lower-TF entry)
+                _wr, _ws = _TLTF.get(("W", 39), (None, None))
+                q = [h for h in _K if h in tl_slope_m.columns and pd.notna(tl_slope_m.loc[date, h])
+                     and float(tl_slope_m.loc[date, h]) > 0]                     # monthly uptrend confirmed
+                if _wr is not None:
+                    qq = [h for h in q if h in _wr.columns and pd.notna(_wr.loc[date, h])]
+                    if qq:
+                        return min(qq, key=lambda h: float(_wr.loc[date, h]))    # most below its weekly trendline
+                return q[0] if q else _K[0]
+            if entry == "tl_mtf_agree":   # MULTI-TF: monthly AND weekly-39 slope>0 (both TFs agree), then monthly dip
+                _wr, _ws = _TLTF.get(("W", 39), (None, None))
+                q = [h for h in _K if h in tl_slope_m.columns and pd.notna(tl_slope_m.loc[date, h])
+                     and float(tl_slope_m.loc[date, h]) > 0 and pd.notna(tl_resid_m.loc[date, h])]
+                if _ws is not None:
+                    q = [h for h in q if h in _ws.columns and pd.notna(_ws.loc[date, h]) and float(_ws.loc[date, h]) > 0]
+                return min(q, key=lambda h: float(tl_resid_m.loc[date, h])) if q else _K[0]
             if entry == "candle_d":     return _pick_by(candle_bull_m, hi=True)   # daily bullish (old: hammer+engulf, 5d)
             _CANDLE = {"cd": (cd_bull, cd_bear, cd_doji), "cw": (cw_bull, cw_bear, cw_doji), "cm": (cm_bull, cm_bear, cm_doji)}
             if isinstance(entry, str) and ("_" in entry) and (entry[:2] in _CANDLE):
@@ -2563,6 +2612,176 @@ def build():
             _row(f"entry={_e}", dict(entry=_e))
         sys.exit(0)
 
+    if os.environ.get("SPY_RSI_LAB"):
+        # ── USER: "tl_support sounds useful only when SPY RSI is low." Gate the tl_support pick ON only in months
+        # where SPY's RSI(14) is below a threshold at the rebalance date (market oversold/stress), else plain
+        # cheapest. PIT: SPY RSI at `date` decides which pick to use for [date,ndate]. Post-hoc combine of the two
+        # runs' monthly series (valid — both pick at `date`). Also inverse (RSI high) + anchors. div4x+drift base. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _rsi(s, n=14):
+            dl = s.diff(); up = dl.clip(lower=0); dn = -dl.clip(upper=0)
+            ru = up.ewm(alpha=1.0 / n, adjust=False).mean(); rd = dn.ewm(alpha=1.0 / n, adjust=False).mean()
+            return 100 - 100 / (1 + ru / rd.replace(0, np.nan))
+        spy_rsi = _rsi(_spy_d).resample("ME").last().reindex(midx)
+        b = run(True, True, **base); s = run(True, True, **base, entry="tl_support")
+        bm = dict(b["monthly"]); sm = dict(s["monthly"])
+        dates = [d for d, _ in b["monthly"]]
+        def _metrics(rets):
+            r = np.asarray(rets, float); tot = (np.prod(1 + r) - 1) * 100
+            sh = r.mean() / r.std(ddof=1) * np.sqrt(12) if r.std(ddof=1) > 1e-9 else 0
+            eq = np.cumprod(1 + r); dd = ((eq / np.maximum.accumulate(eq)) - 1).min() * 100
+            return tot, sh, dd
+        def _gate(thr, low=True):
+            rets = []; nsel = 0
+            for d in dates:
+                rv = spy_rsi.get(pd.Timestamp(d))
+                use_tl = pd.notna(rv) and ((rv < thr) if low else (rv >= thr))
+                rets.append(sm[d] if use_tl else bm[d]); nsel += int(use_tl)
+            return _metrics(rets) + (nsel,)
+        # L8 anchor (the other OOS-surviving lookback) so RSI-gate is compared apples-to-apples vs L8 AND L9
+        s8 = run(True, True, **base, entry="tl_support_8"); s8m = dict(s8["monthly"])
+        OOS = [d for d in dates if d >= "2020-01-01"]
+        def _mo(series, ds): return _metrics([series[d] for d in ds])
+        def _gate2(pick_map, thr, low, ds):
+            r = []
+            for d in ds:
+                rv = spy_rsi.get(pd.Timestamp(d))
+                use = pd.notna(rv) and ((rv < thr) if low else (rv >= thr))
+                r.append(pick_map[d] if use else bm[d])
+            return _metrics(r)
+        def _line(lab, full, oos, n=None):
+            nt = f"  (tl {n}/120)" if n is not None else ""
+            print(f"  {lab:30}{full[0]:>11.0f}%  Sh{full[1]:>5.2f}   |  2020+ {oos[0]:>9.0f}%  Sh{oos[1]:>5.2f}{nt}", flush=True)
+        print("\n=== SPY_RSI_LAB (honest 2016-2026): RSI-gated tl_support vs L8/L9 always — FULL + OOS 2020+ ===", flush=True)
+        _line("ANCHOR baseline (no tl)", _mo(bm, dates), _mo(bm, OOS))
+        _line("ANCHOR tl_support L8 always", _mo(s8m, dates), _mo(s8m, OOS))
+        _line("ANCHOR tl_support L9 always", _mo(sm, dates), _mo(sm, OOS))
+        print("  -- RSI gate on L9 (tl if SPY RSI>=thr; threshold robustness) --", flush=True)
+        for thr in (45, 50, 55):
+            nsel = sum(1 for d in dates if pd.notna(spy_rsi.get(pd.Timestamp(d))) and spy_rsi.get(pd.Timestamp(d)) >= thr)
+            _line(f"L9, tl if RSI>={thr}", _gate2(sm, thr, False, dates), _gate2(sm, thr, False, OOS), nsel)
+        print("  -- low-RSI gate (user's original hypothesis, for the record) --", flush=True)
+        for thr in (45, 50):
+            nsel = sum(1 for d in dates if pd.notna(spy_rsi.get(pd.Timestamp(d))) and spy_rsi.get(pd.Timestamp(d)) < thr)
+            _line(f"L9, tl if RSI<{thr}", _gate2(sm, thr, True, dates), _gate2(sm, thr, True, OOS), nsel)
+        sys.exit(0)
+
+    if os.environ.get("REGIME_GATE_LAB"):
+        # ── REGIME-LEADERSHIP gate (menu #1): the data says tl_support wins when small-cap VALUE leads (2025) and
+        # loses in narrow mega-cap growth (2023). Gate tl_support ON only when the engine's OWN value/small-cap
+        # leadership signal (multi_fav) is favorable — and separately when SPY is above its 200d MA (bull). Post-hoc
+        # combine of baseline + tl_support monthly series (PIT: gate known at each rebalance date). FULL + OOS. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        b = run(True, True, **base); s = run(True, True, **base, entry="tl_support")
+        bm = dict(b["monthly"]); sm = dict(s["monthly"]); dates = [d for d, _ in b["monthly"]]
+        OOS = [d for d in dates if d >= "2020-01-01"]
+        def _metrics(rets):
+            r = np.asarray(rets, float); tot = (np.prod(1 + r) - 1) * 100
+            sh = r.mean() / r.std(ddof=1) * np.sqrt(12) if r.std(ddof=1) > 1e-9 else 0
+            return tot, sh
+        def _gate_sig(sig, invert=False):
+            def _combo(ds):
+                r = []
+                for d in ds:
+                    v = sig.get(pd.Timestamp(d)) if hasattr(sig, "get") else None
+                    on = bool(v) if not invert else (not bool(v))
+                    r.append(sm[d] if on else bm[d])
+                return _metrics(r)
+            n = sum(1 for d in dates if bool(sig.get(pd.Timestamp(d))) != invert)
+            return _combo(dates), _combo(OOS), n
+        def _line(lab, full, oos, n=None):
+            nt = f"  (tl {n}/120)" if n is not None else ""
+            print(f"  {lab:34}{full[0]:>11.0f}%  Sh{full[1]:>5.2f}   |  2020+ {oos[0]:>9.0f}%  Sh{oos[1]:>5.2f}{nt}", flush=True)
+        print("\n=== REGIME_GATE_LAB (honest 2016-2026): gate tl_support on VALUE-LEADERSHIP / SPY-bull — FULL + OOS ===", flush=True)
+        _line("ANCHOR baseline (no tl)", _metrics([bm[d] for d in dates]), _metrics([bm[d] for d in OOS]))
+        _line("ANCHOR tl_support always", _metrics([sm[d] for d in dates]), _metrics([sm[d] for d in OOS]))
+        f, o, n = _gate_sig(multi_fav);            _line("tl if VALUE/SMALL leads (multi_fav)", f, o, n)
+        f, o, n = _gate_sig(multi_fav, invert=True); _line("tl if GROWTH leads (inverse ctrl)", f, o, n)
+        f, o, n = _gate_sig(regime_fav);           _line("tl if value OR small leads (regime_fav)", f, o, n)
+        f, o, n = _gate_sig(bull_200);             _line("tl if SPY > 200d MA (bull)", f, o, n)
+        f, o, n = _gate_sig(bull_200, invert=True); _line("tl if SPY < 200d MA (bear ctrl)", f, o, n)
+        sys.exit(0)
+
+    if os.environ.get("MTF_LAB"):
+        # ── MULTI-TIMEFRAME (user): combine timeframes rather than pick one. tl_mtf = monthly trendline UP
+        # (higher-TF direction) + deepest WEEKLY-39 dip (lower-TF entry). tl_mtf_agree = both monthly & weekly-39
+        # slopes >0 (agreement) then monthly dip. Needs the weekly-39 trendline panel (built here). FULL + OOS. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        # build the weekly-39 trendline panel into _TLTF (same math as TL_TF's _tl_bars, W/39 only)
+        _pxd = pd.DataFrame({_tk: (_df["Close"] if _df is not None and "Close" in _df else None)
+                             for _tk, _df in stock_daily.items()}).dropna(how="all").sort_index()
+        _pw = _pxd.resample("W").last(); _lp = np.log(_pw.clip(lower=1e-9)).values
+        _L = 39; _x = np.arange(_L, dtype=float); _xm = _x.mean(); _Sxx = ((_x - _xm) ** 2).sum()
+        _res = np.full(_lp.shape, np.nan); _slp = np.full(_lp.shape, np.nan)
+        for _t in range(_L - 1, _lp.shape[0]):
+            _Y = _lp[_t - _L + 1:_t + 1, :]; _ym = _Y.mean(axis=0)
+            _b = ((_x[:, None] - _xm) * (_Y - _ym)).sum(axis=0) / _Sxx
+            _res[_t, :] = _Y[-1, :] - (_ym - _b * _xm + _b * (_L - 1)); _slp[_t, :] = _b
+        _R = pd.DataFrame(_res, index=_pw.index, columns=_pw.columns)
+        _S = pd.DataFrame(_slp, index=_pw.index, columns=_pw.columns)
+        _TLTF[("W", 39)] = (_R.reindex(_R.index.union(midx)).ffill().reindex(midx).reindex(columns=stock_m.columns),
+                            _S.reindex(_S.index.union(midx)).ffill().reindex(midx).reindex(columns=stock_m.columns))
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw); ro = run(True, True, **base, start_date="2020-01-01", **kw)
+            print(f"  {lab:30}{r['total']:>11.0f}%  Sh{r['sharpe']:>5.2f}   |  2020+ {ro['total']:>9.0f}%  Sh{ro['sharpe']:>5.2f}", flush=True)
+        print("\n=== MTF_LAB (honest 2016-2026): multi-timeframe trendline confluence — FULL + OOS ===", flush=True)
+        _row("BASELINE (cheapest)", dict())
+        _row("MONTHLY-9 (flagship tl)", dict(entry="tl_support"))
+        _row("WEEKLY-39 alone", dict(entry="tltf:W:39"))
+        _row("tl_mtf (mo dir + wk dip)", dict(entry="tl_mtf"))
+        _row("tl_mtf_agree (mo&wk up)", dict(entry="tl_mtf_agree"))
+        sys.exit(0)
+
+    if os.environ.get("VOL_LAB"):
+        # ── VOLUME-TREND entry tilt (user): among the 5 cheapest drift-P/B names, does preferring BUILDING volume
+        # (vol_up) / avoiding DRYING volume (vol_dry_avoid) / requiring a SURGE (vol_surge) beat the cheapest pick?
+        # Delisted-name diagnostic showed winners lean to building volume (median 1.20 vs losers 0.95) but weak/
+        # non-monotonic. This is the honest flagship-wide test. FULL + true OOS 2020+. div4x+drift base, K5. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _row(lab, kw):
+            r = run(True, True, **base, **kw)
+            ro = run(True, True, **base, start_date="2020-01-01", **kw)
+            print(f"  {lab:26}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}   |  2020+: "
+                  f"{ro['total']:>9.0f}%  Sh{ro['sharpe']:>5.2f}", flush=True)
+            return r
+        cov = float(vol_trend_m.notna().mean().mean())
+        print(f"\n=== VOL_LAB (honest 2016-2026, div4x+drift base): volume-trend entry tilt | coverage {100*cov:.0f}% ===", flush=True)
+        _row("BASELINE (cheapest, no tilt)", dict())
+        _row("vol_up (build vol)", dict(entry="vol_up"))
+        _row("vol_dry_avoid (skip <0.9)", dict(entry="vol_dry_avoid"))
+        _row("vol_surge (require >1.3)", dict(entry="vol_surge"))
+        _row("vol_down (control: driest)", dict(entry="vol_down"))
+        print("  -- cohort-size K sensitivity for vol_up --", flush=True)
+        _row("vol_up K3", dict(entry="vol_up", entry_k=3))
+        _row("vol_up K8", dict(entry="vol_up", entry_k=8))
+        sys.exit(0)
+
+    if os.environ.get("PRICE_LAB"):
+        # ── MIN ENTRY-PRICE floor sweep (user): the engine has NO price floor (MIN_PRICE=0) so it buys genuine
+        # penny names (MVST $0.76, PLUG $0.88, CGC ~$1.2). Sub-$1 names carry delisting risk (NYSE/Nasdaq bounce
+        # a stock under $1 for 30 days). Does excluding low-priced names cost return or improve it? On the honest
+        # base (drift+div4x, no tl_support tilt) + also with tl_support for reference. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        def _row(lab, mp, kw):
+            tr = []
+            r = run(True, True, **base, min_price=mp, trace=tr, **kw)
+            npk = sum(1 for m in tr for p in m.get("picks", []) if p.get("ticker"))
+            print(f"  {lab:26}{r['total']:>11.0f}%  DD{r['dd']:>6.1f}%  Sh{r['sharpe']:>5.2f}  picks {npk:>4}", flush=True)
+            return r
+        print("\n=== PRICE_LAB (honest 2016-2026): minimum ENTRY-price floor (drop delisting-risk penny names) ===", flush=True)
+        print("  -- drift+div4x base (the honest flagship going forward) --", flush=True)
+        for mp in (0.0, 1.0, 3.0, 5.0, 10.0):
+            _row(f"min_price ${mp:g}", mp, dict())
+        print("  -- with tl_support tilt (reference) --", flush=True)
+        for mp in (0.0, 1.0, 5.0):
+            _row(f"tl_support min ${mp:g}", mp, dict(entry="tl_support"))
+        sys.exit(0)
+
     if os.environ.get("LIQ_LAB"):
         # ── LIQUIDITY FLOOR sweep (user): raise the $/day dollar-volume floor for real-money executability. Higher
         # floor = bigger, more tradeable names but drops the illiquid nano-cap tail (where some winners live). ──
@@ -2811,11 +3030,11 @@ def build():
                 _e *= (1 + float(_sr)); _spycurve.append(round(_e * 100000))
         out = []
         for key, name, desc, kw in cfgs:
-            # tl_support is part of the wired flagship recipe (all configs) — must match FLAGSHIP_TRACE (line ~3689)
-            # so the ladder totals equal the per-config pages / masthead (adaptive => 112,950%, not the old 29,472%).
-            rF = run(True, True, country_ok=_is_usca, entry="tl_support", **kw)
-            rp = run(True, True, country_ok=_is_usca, entry="tl_support", end_date="2019-12-31", **kw)
-            rq = run(True, True, country_ok=_is_usca, entry="tl_support", start_date="2020-01-31", **kw)
+            # tl_rsi is the wired flagship tilt (all configs) — must match FLAGSHIP_TRACE so the ladder totals equal
+            # the per-config pages / masthead. tl_rsi = tl_support(L9) gated to SPY RSI>=45 (best Sharpe + robust).
+            rF = run(True, True, country_ok=_is_usca, entry="tl_rsi", **kw)
+            rp = run(True, True, country_ok=_is_usca, entry="tl_rsi", end_date="2019-12-31", **kw)
+            rq = run(True, True, country_ok=_is_usca, entry="tl_rsi", start_date="2020-01-31", **kw)
             n_yr = rF["months"] / 12.0
             cagr = ((1 + rF["total"] / 100) ** (1 / n_yr) - 1) * 100 if rF["total"] > -100 else None
             # equity curve + calendar from the monthly returns
@@ -3655,7 +3874,7 @@ def build():
         # a non-live run must produce identical picks on the last COMMON month (proves the live guards didn't
         # alter the normal path). Writes .data/studies/live_flagship_picks.json for the dashboard/scanner. ──
         import sys   # NOTE: use module-level json (a local `import json` here shadows it and breaks the delisted map)
-        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support")
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi")
         tr = []; run(True, True, live=True, trace=tr, **_base)               # includes the current (ndate=None) month
         tr2 = []; run(True, True, trace=tr2, **_base)                        # non-live backtest (stops one month short)
         live_month = tr[-1]
@@ -3694,7 +3913,7 @@ def build():
         }
         _ck = os.environ.get("CONFIG", "adaptive")
         _kw = _cfgkw.get(_ck, _cfgkw["adaptive"])
-        perf = run(True, True, country_ok=_is_usca, trace=tr, entry="tl_support", **_kw)  # tl_support VALIDATED (placebo/cost/sign pass; crash-rebound option, gating strictly worse)
+        perf = run(True, True, country_ok=_is_usca, trace=tr, entry="tl_rsi", **_kw)  # tl_rsi = tl_support(L9) gated to SPY RSI>=45 (best Sharpe/robust; SPY_RSI_LAB)
         out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": f"usca_small_{_ck}", "config": _ck,
                "perf": {k: perf.get(k) for k in ("total", "annual", "vs_spy", "sharpe", "dd", "t_stat", "months",
                                                  "delisted_picks")},
@@ -3732,7 +3951,7 @@ def build():
         # DD−24.9% (core-level DD, 2.4× the core return), +72% pre-2020. Detects regime from the rotation
         # system's own 12mo value/small leadership signal (slow = matches the multi-year regime, no whipsaw).
         "usca_small_adaptive": run(True, True, country_ok=_is_usca, regime_switch="either", regime_signal="multi",
-                                   entry="tl_support"),   # 2026-08-18: dip-in-9mo-uptrend, VALIDATED (placebo/cost/sign)
+                                   entry="tl_rsi"),   # FLAGSHIP: dip-in-9mo-uptrend gated to SPY RSI>=45 (best Sharpe/robust)
         # the demoted aggressive stack (kept for reference; overfit the 2020 recovery, DD−42%)
         "usca_small_upside_pb": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True,
                                     top_n=7, size_mode="upside", largecap_mode="skip"),
