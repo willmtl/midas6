@@ -168,7 +168,7 @@ def _fx_monthly(cur, midx, frm):
             s = s[s > 0].sort_index()
             if inv:
                 s = 1.0 / s
-            return s.resample("ME").last().reindex(midx).ffill().bfill()
+            return s.resample("ME").last().reindex(midx).ffill()   # ffill-only (audit 2026-08-19): bfill leaked a future rate backward into pre-history selection inputs
     v = FX_FALLBACK.get(cur)
     return pd.Series(v, index=midx) if v else pd.Series(np.nan, index=midx)
 
@@ -255,7 +255,7 @@ def _perf(r, spy, ppy=12.0):
     tot = float(np.prod(1 + r) - 1) * 100
     sp = float(np.prod(1 + np.asarray(spy)) - 1) * 100
     ann = (float(np.prod(1 + r)) ** (ppy / n) - 1) * 100 if n else 0.0
-    sh = float(r.mean() / r.std() * np.sqrt(ppy)) if r.std() > 1e-9 else 0.0
+    sh = float(r.mean() / r.std(ddof=1) * np.sqrt(ppy)) if r.std(ddof=1) > 1e-9 else 0.0   # ddof=1 (audit 2026-08-19): sample std, not population; raw (not excess) Sharpe
     eqc = np.cumprod(1 + r); dd = float(((eqc / np.maximum.accumulate(eqc)) - 1).min() * 100)
     t = _tstat_from_returns(list(r))
     return dict(total=round(tot, 1), annual=round(ann, 1), vs_spy=round(tot - sp, 1), sharpe=round(sh, 2),
@@ -319,6 +319,9 @@ def build():
             delisted_sector[tk] = e
     print(f"survivors {len(surv_sector)} | delisted GIC+fund mapped {n_gic} | dropped OTC/pink {n_otc} | "
           f"kept major-exchange {len(delisted_sector)}", flush=True)
+    if not delisted_sector:                    # guard (audit 2026-08-19): a missing GIC_FILE silently degrades
+        print("⚠️⚠️ delisted_sector is EMPTY — /app/.data/delisted_gic.json missing/unreadable; any "
+              "include_delisted=True run is effectively SURVIVORS-ONLY (headline would be MISLABELED).", flush=True)
 
     etf_tk = list(etfs.values()) + sorted(DEACT_TK)      # include deactivated so their accel is still computed
     etf_daily = load_candles(etf_tk + [BENCH])
