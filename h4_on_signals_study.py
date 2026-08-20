@@ -256,6 +256,137 @@ def _windows_B_plus(limit=None):
     return allowed, {"n_windows": nwin, "n_names": len(allowed), "dropped_fires": dropped}
 
 
+# ===== ITERATION 2 (2026-08-20): more setups, each aimed at a known weakness =====
+# A's weakness = market-correlated (added +5pp DD to C) -> hunt IDIOSYNCRATIC momentum (A_rs/A_vol/A_pead).
+# B's weakness = frequency/cash-drag (fires ~34/yr -> 90% in cash) -> a NEW orthogonal trigger (B_climax).
+
+def _windows_A_rs():
+    """A RELATIVE-STRENGTH gap-up: like A_plus but the gap must be IDIOSYNCRATIC — the name gaps up >=5%
+    AND beats SPY's same-day move by >=5pp — isolating stock-specific momentum (less market beta, aimed
+    straight at A's DD-correlation weakness). High-vol [50,300]% liquid ($5M) universe, 8-bar window."""
+    from seq_fundamental_study import load_candles
+    GAP, RS, VOL_LO, VOL_HI, DVOL_FLOOR, WIN = 0.05, 0.05, 0.50, 3.00, 5e6, 8
+    uni = _stock_universe()
+    daily = load_candles(uni + ["SPY"])
+    spy = daily.get("SPY")
+    spy_ret = spy["Close"].pct_change() if spy is not None else None
+    allowed, nwin = {}, 0
+    for tk, df in daily.items():
+        if tk == "SPY" or len(df) < 60:
+            continue
+        c = df["Close"]; idx = df.index
+        vol = c.pct_change().rolling(20).std() * (252 ** 0.5)
+        dvol = (c * df["Volume"]).rolling(20).mean()
+        gap = c / c.shift(1) - 1.0
+        sr = spy_ret.reindex(idx) if spy_ret is not None else pd.Series(0.0, index=idx)
+        rel = gap - sr
+        s = set()
+        for i in range(len(idx)):
+            if (gap.iloc[i] >= GAP and rel.iloc[i] >= RS and VOL_LO <= vol.iloc[i] <= VOL_HI
+                    and dvol.iloc[i] >= DVOL_FLOOR):
+                for j in range(i, min(i + WIN, len(idx))):
+                    s.add(idx[j].date())
+                nwin += 1
+        if s:
+            allowed[tk] = s
+    return allowed, {"n_windows": nwin, "n_names": len(allowed)}
+
+
+def _windows_A_vol():
+    """A VOLUME-CONFIRMED gap-up: A_plus gap-up PLUS a volume spike (>=2x its 20d avg volume) on the gap
+    bar — real conviction, not low-volume drift-up. High-vol [50,300]% liquid ($5M) universe, 8-bar window."""
+    from seq_fundamental_study import load_candles
+    GAP, VOLX, VOL_LO, VOL_HI, DVOL_FLOOR, WIN = 0.05, 2.0, 0.50, 3.00, 5e6, 8
+    uni = _stock_universe()
+    daily = load_candles(uni)
+    allowed, nwin = {}, 0
+    for tk, df in daily.items():
+        if len(df) < 60:
+            continue
+        c = df["Close"]; idx = df.index; v = df["Volume"]
+        vol = c.pct_change().rolling(20).std() * (252 ** 0.5)
+        dvol = (c * v).rolling(20).mean()
+        volavg = v.rolling(20).mean()
+        gap = c / c.shift(1) - 1.0
+        s = set()
+        for i in range(len(idx)):
+            if (gap.iloc[i] >= GAP and volavg.iloc[i] > 0 and v.iloc[i] >= VOLX * volavg.iloc[i]
+                    and VOL_LO <= vol.iloc[i] <= VOL_HI and dvol.iloc[i] >= DVOL_FLOOR):
+                for j in range(i, min(i + WIN, len(idx))):
+                    s.add(idx[j].date())
+                nwin += 1
+        if s:
+            allowed[tk] = s
+    return allowed, {"n_windows": nwin, "n_names": len(allowed)}
+
+
+def _windows_A_pead():
+    """A POST-EARNINGS-ANNOUNCEMENT-DRIFT: on the earnings-reaction bar (report_date bar or the next one),
+    if the name gaps up >=5% and is liquid ($5M), window = next 8 bars. Idiosyncratic by construction
+    (earnings are name-specific -> low market beta) and a documented drift anomaly. Surprise-sign agnostic
+    (pure price reaction) to stay technical; a positive-surprise gate can be layered later if this shows edge."""
+    import bisect
+    from seq_fundamental_study import load_candles
+    from core.models import EarningsEvent
+    GAP, DVOL_FLOOR, WIN = 0.05, 5e6, 8
+    uni = _stock_universe()
+    daily = load_candles(uni)
+    ev = {}
+    for tk, rd in EarningsEvent.objects.filter(ticker__in=uni).values_list("ticker", "report_date"):
+        ev.setdefault(tk, set()).add(rd)
+    allowed, nwin = {}, 0
+    for tk, df in daily.items():
+        rds = ev.get(tk)
+        if not rds or len(df) < 60:
+            continue
+        c = df["Close"]; idx = df.index
+        dvol = (c * df["Volume"]).rolling(20).mean()
+        gap = c / c.shift(1) - 1.0
+        bar_dates = [d.date() for d in idx.normalize()]
+        s = set()
+        for rd in sorted(rds):
+            k = bisect.bisect_left(bar_dates, rd)            # first trading bar on/after report_date
+            for i in (k, k + 1):                             # BMO reacts same bar, AMC the next -> check both
+                if 0 <= i < len(idx) and gap.iloc[i] >= GAP and dvol.iloc[i] >= DVOL_FLOOR:
+                    for j in range(i, min(i + WIN, len(idx))):
+                        s.add(idx[j].date())
+                    nwin += 1
+                    break
+        if s:
+            allowed[tk] = s
+    return allowed, {"n_windows": nwin, "n_names": len(allowed)}
+
+
+def _windows_B_climax(limit=None):
+    """B VOLUME-CLIMAX capitulation: a big DOWN day (<=-5%) on a volume spike (>=2.5x 20d avg) = selling
+    exhaustion; candidate for the next 10 trading days. A volume-based capitulation trigger ORTHOGONAL to
+    B's RSI/AD sequence — aimed at B's frequency (cash-drag) weakness. $5M liquidity floor."""
+    from seq_fundamental_study import load_candles
+    DOWN, VOLX, DVOL_FLOOR, WIN = -0.05, 2.5, 5e6, 10
+    uni = _stock_universe()
+    if limit:
+        uni = uni[:limit]
+    daily = load_candles(uni)
+    allowed, nwin = {}, 0
+    for tk, df in daily.items():
+        if len(df) < 60:
+            continue
+        c = df["Close"]; idx = df.index; v = df["Volume"]
+        dvol = (c * v).rolling(20).mean()
+        volavg = v.rolling(20).mean()
+        ret = c.pct_change()
+        s = set()
+        for i in range(len(idx)):
+            if (ret.iloc[i] <= DOWN and volavg.iloc[i] > 0 and v.iloc[i] >= VOLX * volavg.iloc[i]
+                    and dvol.iloc[i] >= DVOL_FLOOR):
+                for j in range(i, min(i + WIN, len(idx))):
+                    s.add(idx[j].date())
+                nwin += 1
+        if s:
+            allowed[tk] = s
+    return allowed, {"n_windows": nwin, "n_names": len(allowed)}
+
+
 def candidate_windows(selector, b_limit=None):
     """selector in {A,A_plus,B,B_plus,C,union} -> ({ticker: set[date]}, meta). b_limit caps B's universe."""
     if selector == "C":
@@ -268,6 +399,14 @@ def candidate_windows(selector, b_limit=None):
         return _windows_B(limit=b_limit)
     if selector == "B_plus":
         return _windows_B_plus(limit=b_limit)
+    if selector == "A_rs":
+        return _windows_A_rs()
+    if selector == "A_vol":
+        return _windows_A_vol()
+    if selector == "A_pead":
+        return _windows_A_pead()
+    if selector == "B_climax":
+        return _windows_B_climax(limit=b_limit)
     if selector == "union":
         merged, nwin = {}, 0
         for sel in ("A", "B", "C"):
