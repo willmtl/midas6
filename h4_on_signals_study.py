@@ -182,12 +182,15 @@ def _windows_B(limit=None):
 
 
 def _windows_A_plus():
-    """A_plus (short-horizon, redefined): MOMENTUM-CONTINUATION setup on a HIGH-VOLATILITY LIQUID universe —
-    the validated short-term edge (vol is the driver; burst/gap-up continue ~3 bars). Trigger = a >=8% 2-day
-    price BURST on a name whose 20d trailing vol is in [50%,300%] annualized and >=$5M/day dollar-volume; the
-    name is a candidate for the next 5 trading days. No value/quality frame (that HURTS the bounce — bake-off)."""
+    """★ FLAGSHIP A (short-horizon momentum finder). GAP-UP CONTINUATION on a HIGH-VOLATILITY LIQUID universe —
+    the validated short-term edge (vol is the driver; gap-ups continue). Trigger = a >=5% 1-day GAP-UP on a name
+    whose 20d trailing vol is in [50%,300%] annualized and >=$5M/day dollar-volume; candidate for the next 8
+    trading days. No value/quality frame (that HURTS the bounce — bake-off). Sweep winner: gap-up>=5% beat the
+    2-day burst. PORTFOLIO (a_beat.py, the return spec): run WIDE — K>=40 concurrent, <=2% each (concentration
+    = RUIN); ENTER on the gap-up, HOLD 8 bars — hold-8 beat hold-5 ~50x (+1959% vs +38% net-20bps over ~5y).
+    Do NOT magnitude-rank or uptrend-gate (both HURT). Survives fees, unlike the mean-reversion dip-buy."""
     from seq_fundamental_study import load_candles
-    BURST, VOL_LO, VOL_HI, DVOL_FLOOR, WIN = 0.08, 0.50, 3.00, 5e6, 5
+    GAP, VOL_LO, VOL_HI, DVOL_FLOOR, WIN = 0.05, 0.50, 3.00, 5e6, 8    # WIN=8 covers the 8-bar hold
     uni = _stock_universe()
     daily = load_candles(uni)
     allowed, nwin = {}, 0
@@ -197,10 +200,10 @@ def _windows_A_plus():
         c = df["Close"]; idx = df.index
         vol = c.pct_change().rolling(20).std() * (252 ** 0.5)        # annualized trailing vol
         dvol = (c * df["Volume"]).rolling(20).mean()                 # trailing $ volume (liquidity)
-        burst = c / c.shift(2) - 1.0                                 # 2-day price burst
+        gap = c / c.shift(1) - 1.0                                   # 1-day gap-up (sweep winner vs 2d burst)
         s = set()
         for i in range(len(idx)):
-            if (burst.iloc[i] >= BURST and VOL_LO <= vol.iloc[i] <= VOL_HI and dvol.iloc[i] >= DVOL_FLOOR):
+            if (gap.iloc[i] >= GAP and VOL_LO <= vol.iloc[i] <= VOL_HI and dvol.iloc[i] >= DVOL_FLOOR):
                 for j in range(i, min(i + WIN, len(idx))):
                     s.add(idx[j].date())
                 nwin += 1
@@ -209,11 +212,15 @@ def _windows_A_plus():
     return allowed, {"n_windows": nwin, "n_names": len(allowed)}
 
 
+B_PLUS_WIN = 15                 # flagship-B watch window (sweep: 15 bars best — capitulation gap-up needs time to appear)
+
+
 def _windows_B_plus(limit=None):
-    """B_plus (short-horizon): B's capitulation trigger (seq_rsi20_ad_rising_rsi) + the ONE proven keeper —
-    a $5M/day LIQUIDITY floor so the bounce is tradeable. NO fundamental/quality gate: the bake-off showed
-    value/profit filters HURT the mean-reversion bounce (they help only paired with a momentum signal).
-    Candidate for the next B_WINDOW_DAYS trading days after each fire."""
+    """★ FLAGSHIP B (short-horizon capitulation alert). B's capitulation trigger (seq_rsi20_ad_rising_rsi) +
+    the ONE proven keeper — a $5M/day LIQUIDITY floor so the bounce is tradeable. NO fundamental/quality gate
+    (value/profit HURT the mean-reversion bounce — bake-off). 15-trading-day WATCH WINDOW after each fire (sweep
+    winner) — then the H4 gap-up entry, exit ~3 bars = +1.96%/68%win/t5.31. RARE (~4/month) across liquid
+    large-caps (UAL/NFLX/MAR/ABBV…) so it's a high-quality ALERT/supplement, not a full standalone book."""
     from seq_fundamental_study import load_candles
     from studies import SIGNALS as STUDY_SIGNALS
     name, fn = STUDY_SIGNALS["seq_rsi20_ad_rising_rsi"]
@@ -235,7 +242,7 @@ def _windows_B_plus(limit=None):
                 continue
             if dvol.iloc[i] < DVOL_FLOOR:                            # liquidity floor (the proven keeper)
                 dropped += 1; continue
-            for j in range(i, min(i + B_WINDOW_DAYS, len(idx))):
+            for j in range(i, min(i + B_PLUS_WIN, len(idx))):
                 s.add(idx[j].date())
             nwin += 1
         if s:
