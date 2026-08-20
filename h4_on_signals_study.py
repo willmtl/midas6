@@ -181,14 +181,80 @@ def _windows_B(limit=None):
     return allowed, {"n_windows": nwin, "n_names": len(allowed)}
 
 
+def _windows_A_plus():
+    """A_plus (short-horizon, redefined): MOMENTUM-CONTINUATION setup on a HIGH-VOLATILITY LIQUID universe —
+    the validated short-term edge (vol is the driver; burst/gap-up continue ~3 bars). Trigger = a >=8% 2-day
+    price BURST on a name whose 20d trailing vol is in [50%,300%] annualized and >=$5M/day dollar-volume; the
+    name is a candidate for the next 5 trading days. No value/quality frame (that HURTS the bounce — bake-off)."""
+    from seq_fundamental_study import load_candles
+    BURST, VOL_LO, VOL_HI, DVOL_FLOOR, WIN = 0.08, 0.50, 3.00, 5e6, 5
+    uni = _stock_universe()
+    daily = load_candles(uni)
+    allowed, nwin = {}, 0
+    for tk, df in daily.items():
+        if len(df) < 60:
+            continue
+        c = df["Close"]; idx = df.index
+        vol = c.pct_change().rolling(20).std() * (252 ** 0.5)        # annualized trailing vol
+        dvol = (c * df["Volume"]).rolling(20).mean()                 # trailing $ volume (liquidity)
+        burst = c / c.shift(2) - 1.0                                 # 2-day price burst
+        s = set()
+        for i in range(len(idx)):
+            if (burst.iloc[i] >= BURST and VOL_LO <= vol.iloc[i] <= VOL_HI and dvol.iloc[i] >= DVOL_FLOOR):
+                for j in range(i, min(i + WIN, len(idx))):
+                    s.add(idx[j].date())
+                nwin += 1
+        if s:
+            allowed[tk] = s
+    return allowed, {"n_windows": nwin, "n_names": len(allowed)}
+
+
+def _windows_B_plus(limit=None):
+    """B_plus (short-horizon): B's capitulation trigger (seq_rsi20_ad_rising_rsi) + the ONE proven keeper —
+    a $5M/day LIQUIDITY floor so the bounce is tradeable. NO fundamental/quality gate: the bake-off showed
+    value/profit filters HURT the mean-reversion bounce (they help only paired with a momentum signal).
+    Candidate for the next B_WINDOW_DAYS trading days after each fire."""
+    from seq_fundamental_study import load_candles
+    from studies import SIGNALS as STUDY_SIGNALS
+    name, fn = STUDY_SIGNALS["seq_rsi20_ad_rising_rsi"]
+    uni = _stock_universe()
+    if limit:
+        uni = uni[:limit]
+    daily = load_candles(uni)
+    DVOL_FLOOR = 5e6
+    allowed, nwin, dropped = {}, 0, 0
+    for tk, df in daily.items():
+        if len(df) < 60:
+            continue
+        sig = fn(df).fillna(False)
+        idx = df.index
+        dvol = (df["Close"] * df["Volume"]).rolling(20).mean()       # trailing $ volume (liquidity)
+        s = set()
+        for i, v in enumerate(sig.values):
+            if not v:
+                continue
+            if dvol.iloc[i] < DVOL_FLOOR:                            # liquidity floor (the proven keeper)
+                dropped += 1; continue
+            for j in range(i, min(i + B_WINDOW_DAYS, len(idx))):
+                s.add(idx[j].date())
+            nwin += 1
+        if s:
+            allowed[tk] = s
+    return allowed, {"n_windows": nwin, "n_names": len(allowed), "dropped_fires": dropped}
+
+
 def candidate_windows(selector, b_limit=None):
-    """selector in {A,B,C,union} -> ({ticker: set[date]}, meta). b_limit caps B's universe (fast verify)."""
+    """selector in {A,A_plus,B,B_plus,C,union} -> ({ticker: set[date]}, meta). b_limit caps B's universe."""
     if selector == "C":
         return _windows_C()
     if selector == "A":
         return _windows_A()
+    if selector == "A_plus":
+        return _windows_A_plus()
     if selector == "B":
         return _windows_B(limit=b_limit)
+    if selector == "B_plus":
+        return _windows_B_plus(limit=b_limit)
     if selector == "union":
         merged, nwin = {}, 0
         for sel in ("A", "B", "C"):
@@ -268,12 +334,12 @@ def main():
     import django; django.setup()
     from pathlib import Path
     ap = argparse.ArgumentParser()
-    ap.add_argument("--selector", default="all", help="A|B|C|union|all")
+    ap.add_argument("--selector", default="all", help="A|A_plus|B|B_plus|C|union|all")
     ap.add_argument("--no-fetch", action="store_true", help="fast pass: cached 4h only")
     ap.add_argument("--b-limit", type=int, default=None, help="cap B universe (fast verify)")
     ap.add_argument("--years", type=float, default=5)
     args = ap.parse_args()
-    sels = ["C", "A", "B", "union"] if args.selector == "all" else [args.selector]
+    sels = ["C", "A", "A_plus", "B", "B_plus", "union"] if args.selector == "all" else [args.selector]
     print(f"selectors={sels} fetch={'off' if args.no_fetch else 'on'}", flush=True)
     payload = {"by_selector": {}}
     for sel in sels:
