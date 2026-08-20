@@ -215,6 +215,12 @@ def _windows_A_plus():
 B_PLUS_WIN = 15                 # flagship-B watch window (sweep: 15 bars best — capitulation gap-up needs time to appear)
 
 
+# B / B-2 / B-3 = three DISTINCT profitable entries inside the capitulation (seq w15) windows below
+# (b2_overlap.py, verified 0-2% overlap, all significant; run together = ~900 trades vs 172 for B alone):
+#   B   = gap-up     @3b  +1.54%/63%/t4.5  (strongest single). IV-skew fear-filter is a CONVICTION DIAL on B
+#         (a SUBSET, NOT a separate book) -> +2.18%/84% on fear-priced entries.
+#   B-2 = st_ad_div  @4b  +0.57%/57%/t2.5  (A/D-divergence continuation; orthogonal to B, 0% overlap).
+#   B-3 = mr_ndown   @6b  +0.65%/51%/t2.3  (n-down reversal; orthogonal, 2% overlap).
 def _windows_B_plus(limit=None):
     """★ FLAGSHIP B (short-horizon capitulation alert). B's capitulation trigger (seq_rsi20_ad_rising_rsi) +
     the ONE proven keeper — a $5M/day LIQUIDITY floor so the bounce is tradeable. NO fundamental/quality gate
