@@ -224,8 +224,44 @@ def build():
 
     meta = finviz_config.ticker_meta()
 
+    # ── PARITY panels (port the ETF flagship's 3 wired edges onto the Finviz industry universe): stale-book
+    # DRIFT P/B + A/D-divergence CONVICTION (div4x) + tl_rsi ENTRY (9mo-trendline dip, SPY-RSI>=45 gate). ──
+    pb_drift = pb; spy_rsi = None; tl_slope = tl_resid = ad_slope3 = px_ret3 = None
+    if os.environ.get("FINVIZ_PARITY"):
+        _filed = eq.ne(eq.shift()) & eq.notna()
+        _msf = pd.DataFrame(0, index=eq.index, columns=eq.columns)
+        for _c in eq.columns:
+            _gc = _filed[_c].cumsum(); _msf[_c] = _gc.groupby(_gc).cumcount().clip(upper=6)
+        _accr = (ttm_ni / 12.0).fillna(0.0) * _msf
+        _adjeq = eq + _accr
+        pb_drift = mktcap / _adjeq.where(_adjeq > 0)                    # drift-adjusted book (NaN if burned <=0)
+        _adl = {}
+        for t in common:
+            dfr = daily.get(t)
+            if dfr is None or not {"High", "Low", "Close", "Volume"}.issubset(dfr.columns):
+                continue
+            h, l, c, v = dfr["High"], dfr["Low"], dfr["Close"], dfr["Volume"]
+            rng = (h - l).replace(0, np.nan); mfm = ((c - l) - (h - c)) / rng
+            _adl[t] = (mfm.fillna(0) * v).cumsum().resample("ME").last().reindex(midx)
+        adl = pd.DataFrame(_adl).reindex(index=midx, columns=common)
+        ad_slope3 = adl - adl.shift(3); px_ret3 = px.pct_change(3)
+        _lp = np.log(px.clip(lower=1e-9)).values; _L = 9
+        _xx = np.arange(_L, dtype=float); _xm = _xx.mean(); _Sxx = ((_xx - _xm) ** 2).sum()
+        _res = np.full(_lp.shape, np.nan); _slp = np.full(_lp.shape, np.nan)
+        for _t in range(_L - 1, _lp.shape[0]):
+            _Y = _lp[_t - _L + 1:_t + 1, :]; _ym = _Y.mean(axis=0)
+            _b = ((_xx[:, None] - _xm) * (_Y - _ym)).sum(axis=0) / _Sxx
+            _res[_t, :] = _Y[-1, :] - (_ym - _b * _xm + _b * (_L - 1)); _slp[_t, :] = _b
+        tl_resid = pd.DataFrame(_res, index=midx, columns=common); tl_slope = pd.DataFrame(_slp, index=midx, columns=common)
+        def _rsi(s, n=14):
+            dl = s.diff(); up = dl.clip(lower=0); dn = -dl.clip(upper=0)
+            ru = up.ewm(alpha=1.0 / n, adjust=False).mean(); rd = dn.ewm(alpha=1.0 / n, adjust=False).mean()
+            return 100 - 100 / (1 + ru / rd.replace(0, np.nan))
+        spy_rsi = _rsi(daily[BENCH]["Close"]).resample("ME").last().reindex(midx)
+        print(f"PARITY panels built: drift-P/B, A/D conviction, 9mo trendline, SPY-RSI gate", flush=True)
+
     def run(top_k=10, start=None, end=None, min_mktcap=3e8, require_profit=False,
-            min_dvol=0.0, pb_floor=MIN_PB, value_key="pb", trace=False):   # DEFAULT floor $300M; value_key "pb"/"blend"
+            min_dvol=0.0, pb_floor=MIN_PB, value_key="pb", parity=False, trace=False):   # parity = drift+div4x+tl_rsi
         rets = []
         picks_log = []
         tmonths = []          # detailed per-month record (only when trace=True)
@@ -243,6 +279,7 @@ def build():
             top = list(row.sort_values(ascending=False).head(top_k).index)
             held = set()
             month_rets = []
+            month_wts = []
             month_names = []
             t_top, t_picks, t_skips = [], [], []
             for name in top:
@@ -271,13 +308,29 @@ def build():
                         p_dv = dvol.loc[d, t] if t in dvol.columns else np.nan
                         if not (pd.notna(p_dv) and p_dv >= min_dvol):
                             continue
+                    if parity:   # rank by DRIFT P/B; drop names with burned-through (NaN/<=0) nowcast book
+                        _dpb = pb_drift.loc[d, t] if t in pb_drift.columns else np.nan
+                        if pd.isna(_dpb) or _dpb <= 0:
+                            continue
+                        _rankpb = float(_dpb)
+                    else:
+                        _rankpb = float(p_pb)
                     p_up = upside.loc[d, t] if (not upside.empty and t in upside.columns) else np.nan
-                    cands.append((t, float(p_pb), (float(p_up) if pd.notna(p_up) else None)))
+                    cands.append((t, _rankpb, (float(p_up) if pd.notna(p_up) else None)))
                 if not cands:
                     if trace:
                         t_skips.append({"industry": name, "reason": "no qualifying small-cap value name (P/B, $300M size, price)"})
                     continue                                                   # SKIP (same as flagship)
-                if value_key == "blend":     # 60% analyst-upside + 40% cheap-P/B rank blend; fallback cheapest-P/B
+                if parity:                   # FLAGSHIP parity: tl_rsi entry among the 5 cheapest DRIFT-P/B
+                    _K = sorted(cands, key=lambda x: x[1])[:5]
+                    _rv = spy_rsi.get(d) if spy_rsi is not None else None
+                    if _rv is not None and pd.notna(_rv) and float(_rv) >= 45:
+                        _q = [c for c in _K if pd.notna(tl_slope.loc[d, c[0]]) and float(tl_slope.loc[d, c[0]]) > 0
+                              and pd.notna(tl_resid.loc[d, c[0]])]
+                        t = min(_q, key=lambda c: float(tl_resid.loc[d, c[0]]))[0] if _q else _K[0][0]
+                    else:
+                        t = _K[0][0]
+                elif value_key == "blend":     # 60% analyst-upside + 40% cheap-P/B rank blend; fallback cheapest-P/B
                     q = [(ct, cpb, cup) for ct, cpb, cup in cands if cup is not None]
                     if len(q) >= 3:
                         pr = pd.Series({ct: cpb for ct, cpb, cup in q}).rank(pct=True)                 # low P/B good
@@ -292,7 +345,11 @@ def build():
                 p1 = as_traded.iloc[i + 1][t] if t in as_traded.columns else np.nan
                 if pd.notna(p0) and pd.notna(p1) and p0 > 0:
                     _r = p1 / p0 - 1.0
-                    month_rets.append(_r)
+                    _w = 1.0
+                    if parity and ad_slope3 is not None and t in ad_slope3.columns:   # div4x A/D-divergence conviction
+                        if pd.notna(ad_slope3.loc[d, t]) and ad_slope3.loc[d, t] > 0 and pd.notna(px_ret3.loc[d, t]) and px_ret3.loc[d, t] < 0:
+                            _w = 4.0
+                    month_rets.append(_r); month_wts.append(_w)
                     month_names.append(t)
                     if trace:
                         _mc = mktcap.loc[d, t] if t in mktcap.columns else np.nan
@@ -305,7 +362,7 @@ def build():
                                         "upside": round(float(_up), 3) if pd.notna(_up) else None,
                                         "ret": round(_r, 4)})
             if month_rets:
-                br = float(np.mean(month_rets))
+                br = float(np.average(month_rets, weights=month_wts))   # div4x-weighted (all 1.0 when not parity)
                 rets.append(br)
                 _spy = float(spy_ret.loc[ndate]) if pd.notna(spy_ret.loc[ndate]) else None
                 picks_log.append({"date": str(d.date()), "n": len(month_names),
@@ -322,6 +379,36 @@ def build():
         return {"total": round(total, 1), "spy_total": round(spy_total, 1),
                 "sharpe": round(_annualized_sharpe(rets), 2), "dd": round(_max_drawdown(rets), 1),
                 "months": len(rets), "picks_log": picks_log, "tmonths": tmonths}
+
+    if os.environ.get("FINVIZ_PARITY"):
+        import sys, json as _json
+        print("\n=== FINVIZ PARITY: port ETF flagship edges (drift-P/B + div4x + tl_rsi) onto the 149-industry universe ===", flush=True)
+        _pa_full = None
+        for lab, sd, ed in [("FULL 2016-26", None, None), ("OOS 2020+", "2020-01-01", None)]:
+            v2 = run(top_k=10, start=sd, end=ed, value_key="blend")
+            pa = run(top_k=10, start=sd, end=ed, parity=True, min_dvol=5e6, trace=(lab == "FULL 2016-26"))
+            print(f"  {lab:14}  v2(blend) {v2['total']:>9.0f}% Sh{v2['sharpe']:.2f} DD{v2['dd']:.0f}%  |  "
+                  f"PARITY {pa['total']:>9.0f}% Sh{pa['sharpe']:.2f} DD{pa['dd']:.0f}%  ({pa['months']}mo)", flush=True)
+            if lab == "FULL 2016-26":
+                _pa_full = pa
+        try:
+            etf = _json.load(open("/app/.data/studies/flagship_history.json"))
+            etfm = {m["date"]: m.get("basket_ret") for m in etf["months"] if m.get("basket_ret") is not None}
+            fvm = {m["date"]: m["basket_ret"] for m in _pa_full["tmonths"]}
+            cd = sorted(set(etfm) & set(fvm))
+            def _bm(w):
+                r = np.array([(1 - w) * etfm[d] + w * fvm[d] for d in cd])
+                tot = (np.prod(1 + r) - 1) * 100; sh = r.mean() / r.std(ddof=1) * np.sqrt(12) if r.std(ddof=1) > 1e-9 else 0
+                eq = np.cumprod(1 + r); dd = ((eq / np.maximum.accumulate(eq)) - 1).min() * 100; return tot, sh, dd
+            e = np.array([etfm[d] for d in cd]); et = (np.prod(1 + e) - 1) * 100; esh = e.mean() / e.std(ddof=1) * np.sqrt(12)
+            fv = np.array([fvm[d] for d in cd]); corr = float(np.corrcoef(e, fv)[0, 1])
+            print(f"\n  BLEND with ETF flagship (common {len(cd)}mo {cd[0]}..{cd[-1]}; monthly-return corr {corr:+.2f}):", flush=True)
+            print(f"    ETF flagship alone            {et:>10.0f}%  Sh{esh:.2f}", flush=True)
+            for w in (0.2, 0.3, 0.5):
+                t, s, dd = _bm(w); print(f"    {int((1-w)*100)}ETF/{int(w*100)}finviz-parity     {t:>10.0f}%  Sh{s:.2f}  DD{dd:.0f}%", flush=True)
+        except Exception as _e:
+            print("blend step failed:", _e, flush=True)
+        sys.exit(0)
 
     wins = [("FULL", None, None), ("ex-2020", "2021-01-31", None),
             ("H1 19-22", None, "2022-12-31"), ("H2 23-26", "2023-01-31", None)]
