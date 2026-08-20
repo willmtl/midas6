@@ -2195,6 +2195,50 @@ def build():
         pb = pb_drift   # restore the new default (drift)
         sys.exit(0)
 
+    if os.environ.get("VERIFY_DD"):
+        # ── VERIFY (user: 'you likely did it wrong or did not have all the data' + 'when is the 60% drawdown').
+        # Run the DEPLOYED flagship configs on the CURRENT candle depth and dump: window span, total/CAGR/Sharpe,
+        # and the MONTH-END-marked max drawdown with its PEAK->TROUGH dates + the worst months around the trough,
+        # plus per-year returns. If the trough lands on a known crash (2020-03 COVID / 2022 bear) the -60% is real
+        # market P&L, not a bug. Compares FULL (2016-2026, trades through 2020) vs POST-2020-only (starts at the
+        # bottom) to show the -23% vs -60% gap is the WINDOW, not the code. ──
+        import sys
+        def _curve(pr):
+            ds = [d for d, _ in pr]; xs = [x for _, x in pr]
+            eq = np.cumprod([1.0 + x for x in xs]); pk = np.maximum.accumulate(eq)
+            dd = eq / pk - 1.0
+            itr = int(np.argmin(dd)); ipk = int(np.argmax(eq[:itr + 1])) if itr > 0 else 0
+            return ds, xs, eq, dd, ipk, itr
+        def _peryear(pr):
+            yr = {}
+            for d, x in pr:
+                yr[d[:4]] = yr.get(d[:4], 1.0) * (1.0 + x)
+            return {y: (v - 1.0) * 100 for y, v in sorted(yr.items())}
+        base = dict(country_ok=_is_usca)
+        configs = [
+            ("drift + div4x + regime (DEPLOY default)", dict(regime_switch="either", regime_signal="multi", conv=4.0)),
+            ("drift + div4x (no regime)",               dict(conv=4.0)),
+            ("drift + div4x + tl_rsi entry",            dict(regime_switch="either", regime_signal="multi", conv=4.0, entry="tl_rsi")),
+        ]
+        for lab, kw in configs:
+            r = run(True, True, **base, **kw)
+            pr = r["monthly"]
+            ds, xs, eq, dd, ipk, itr = _curve(pr)
+            yrs = (pd.Timestamp(ds[-1]) - pd.Timestamp(ds[0])).days / 365.25
+            cagr = (eq[-1] ** (1 / yrs) - 1) * 100 if yrs > 0 else float("nan")
+            print(f"\n===== {lab} =====", flush=True)
+            print(f"  window {ds[0]} .. {ds[-1]}  ({len(ds)} months, {yrs:.1f} yrs)", flush=True)
+            print(f"  TOTAL {r['total']:+,.0f}%   CAGR {cagr:+.1f}%/yr   Sharpe {r['sharpe']:.2f}   "
+                  f"run().dd(month-end) {r['dd']:.1f}%", flush=True)
+            print(f"  >>> MAX MONTH-END DRAWDOWN {dd[itr]*100:+.1f}%   PEAK {ds[ipk]} -> TROUGH {ds[itr]}", flush=True)
+            print("  worst 8 single months:", flush=True)
+            order = sorted(range(len(xs)), key=lambda k: xs[k])[:8]
+            for k in sorted(order):
+                print(f"     {ds[k]}  {xs[k]*100:+7.1f}%   (running DD {dd[k]*100:+6.1f}%)", flush=True)
+            print("  per-year returns:", flush=True)
+            print("     " + "  ".join(f"{y}:{v:+.0f}%" for y, v in _peryear(pr).items()), flush=True)
+        sys.exit(0)
+
     if os.environ.get("ENTRY_DIV_LAB"):
         # ── (A) ENTRY-TIMING (#110): time the value pick on the stock's OWN RSI(10) — oversold gate/pref, dip-in-
         # uptrend, and a BUY-STRENGTH anti-control (memory entry-signal-value-pick says confirmation SUBTRACTS).

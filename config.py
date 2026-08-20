@@ -50,7 +50,9 @@ SECTOR_ETFS = {
     "E-Commerce": "IBUY",
     "Social Media": "SOCL",
     "Electric Vehicles": "DRIV",
-    "3D Printing": "PRNT",
+    # REMOVED "3D Printing": "PRNT" (2026-08-20, user): not a real sector + documented chronic loser
+    # (net -5.9% contribution, 30% win over 10 picks; SSYS/DDD). DROP_ETFS=PRNT test: tl_rsi arm
+    # +98,498% -> +112,538% (Sharpe 1.91->1.93, DD flat -23%). A true loser-prune, not a broad-sleeve prune.
     "Gaming & Esports": "HERO",
     # REMOVED "Ark Innovation": "ARKK" (2026-08-17, user): ARKK is an actively-managed MULTI-THEME FUND, not a
     # sector — it doesn't belong in a sector-rotation universe. (It was also the worst sleeve: −75.6 contrib,
