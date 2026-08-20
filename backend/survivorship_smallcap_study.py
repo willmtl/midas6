@@ -297,6 +297,18 @@ def build():
         for t in sector_holdings.get_holdings(n):
             if t not in (e, BENCH) and t not in CRYPTO:
                 surv_sector.setdefault(t, e); all_holds.add(t)
+    # ── ADR CANDIDATES (opt-in, ADD_ADRS=1): merge screened foreign small-cap-value ADRs (ingest_adrs.py) into
+    # their GICS sector pools, treated like any live holding. A/B: default (unset) reproduces the flagship exactly. ──
+    if os.environ.get("ADD_ADRS"):
+        try:
+            _adr = json.load(open("/app/.data/adr_candidates.json"))
+        except Exception:
+            _adr = {}
+        _added = 0
+        for t, e in _adr.items():
+            if e in etf_name and t not in surv_sector:
+                surv_sector[t] = e; all_holds.add(t); _added += 1
+        print(f"ADD_ADRS: merged {_added} foreign ADRs into sector pools", flush=True)
 
     # delisted GICS map
     try:
@@ -2688,6 +2700,30 @@ def build():
         _line("FLAGSHIP tl_rsi (1/sector)", [mf])
         _line("flagship + 2nd-cheapest", [mf, m2])
         _line("flagship + 2nd + 3rd", [mf, m2, m3])
+        sys.exit(0)
+
+    if os.environ.get("ADR_AB"):
+        # ── A/B: does adding the 79 screened foreign small-cap-value ADRs to the sector pools lift the flagship?
+        # Run this WITHOUT ADD_ADRS (baseline, must = 104,939%) and WITH ADD_ADRS=1 (ADRs merged). Reports total/
+        # Sharpe/DD + how many picks were ADRs and their contribution. ──
+        import sys
+        _adr = set(json.load(open("/app/.data/adr_candidates.json")))
+        tr = []
+        r = run(True, True, country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi", trace=tr)
+        ctr = 0.0; adr_mo = 0; adr_names = set()
+        for m in tr:
+            ps = [p for p in m.get("picks", []) if p.get("ret") is not None and p.get("weight")]
+            W = sum(p["weight"] for p in ps) or 1
+            for p in ps:
+                if p.get("ticker") in _adr:
+                    ctr += p["weight"] / W * p["ret"]; adr_mo += 1; adr_names.add(p["ticker"])
+        on = bool(os.environ.get("ADD_ADRS"))
+        ro = run(True, True, country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi", start_date="2020-01-01")
+        print(f"\n=== ADR_AB [{'WITH ADRs' if on else 'BASELINE (no ADRs)'}]: {r['total']:.0f}% Sh{r['sharpe']} DD{r['dd']}%  "
+              f"|  OOS-2020+ {ro['total']:.0f}% Sh{ro['sharpe']} ===", flush=True)
+        if on:
+            print(f"  ADRs picked: {len(adr_names)} unique names, {adr_mo} pick-months, contribution {ctr*100:+.1f}pp", flush=True)
+            print(f"  names: {sorted(adr_names)}", flush=True)
         sys.exit(0)
 
     if os.environ.get("MACRO_SCALE_LAB"):
