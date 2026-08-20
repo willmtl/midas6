@@ -318,19 +318,26 @@ def build():
     delisted_sector = {}
     from core.models import FinancialReport, Candle, DelistedCompany
     dl_have = set(FinancialReport.objects.values_list("ticker", flat=True).distinct())
-    # exchange gate: keep delisted names only if they were on a MAJOR exchange (no OTC/pink). Penny prices OK.
-    dl_exch = {d.ticker: (d.exchange or "").strip()
-               for d in DelistedCompany.objects.filter(ticker__in=list(gic_raw))}
-    n_gic, n_otc = 0, 0
+    # exchange gate + NAME (for the SPAC ban). Keep delisted names only if MAJOR exchange (no OTC/pink), penny OK.
+    _dc = {d.ticker: ((d.exchange or "").strip(), (d.name or ""))
+           for d in DelistedCompany.objects.filter(ticker__in=list(gic_raw))}
+    dl_exch = {t: v[0] for t, v in _dc.items()}
+    dl_name = {t: v[1] for t, v in _dc.items()}
+    def _is_spac(nm):                          # SPAC/blank-check shells (EODHD tags them "Financials"); NOT real value.
+        nm = (nm or "").lower()                # ~588 in the delisted pool; kept in the DB, banned from the pool.
+        return ("acquisition" in nm) or ("blank check" in nm) or (" spac" in nm)
+    n_gic, n_otc, n_spac = 0, 0, 0
     for tk, gic in gic_raw.items():
         e = GIC_TO_ETF.get((gic or "").strip())
         if e and tk in dl_have:
             n_gic += 1
             if dl_exch.get(tk) not in MAJOR_EXCH:
                 n_otc += 1; continue          # drop OTC / pink-sheet delisted names
+            if _is_spac(dl_name.get(tk)):
+                n_spac += 1; continue         # BAN SPACs from the candidate pool (hygiene; inert — 0 were ever picked)
             delisted_sector[tk] = e
     print(f"survivors {len(surv_sector)} | delisted GIC+fund mapped {n_gic} | dropped OTC/pink {n_otc} | "
-          f"kept major-exchange {len(delisted_sector)}", flush=True)
+          f"banned SPACs {n_spac} | kept major-exchange {len(delisted_sector)}", flush=True)
     if not delisted_sector:                    # guard (audit 2026-08-19): a missing GIC_FILE silently degrades
         print("⚠️⚠️ delisted_sector is EMPTY — /app/.data/delisted_gic.json missing/unreadable; any "
               "include_delisted=True run is effectively SURVIVORS-ONLY (headline would be MISLABELED).", flush=True)
