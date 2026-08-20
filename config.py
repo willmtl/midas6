@@ -156,13 +156,16 @@ SECTOR_ETFS = {
     "Greece": "GREK",
     "Qatar": "QAT",
     "UAE": "UAE",
-    "Pakistan": "PAK",
+    # REMOVED "Pakistan": "PAK" (2026-08-20): Global X MSCI Pakistan ETF was LIQUIDATED; candles stop
+    # 2024-03-05 (confirmed dead via fetch_delisted.py delisted_date). Dead sleeve, never rankable. No
+    # backtest impact (a stale ETF has no acceleration → never enters top-10).
     "ACWI (All-Country World)": "ACWI",
     "World ex-US": "VEU",
     "Asia ex-Japan": "AAXJ",
     "Pacific ex-Japan": "EPP",
     "EM ex-China": "EMXC",
-    "Frontier Markets": "FM",
+    # REMOVED "Frontier Markets": "FM" (2026-08-20): ZERO candles ever fetched (never had data), so it
+    # sat in the universe as a phantom sleeve that could never be ranked. No backtest impact.
 
     # ── Factor / Style ──
     "Dividend": "SCHD",

@@ -105,7 +105,9 @@ def _short_interest_panel(midx, cols, stale_days=45):
     return pd.DataFrame(out).reindex(index=midx, columns=cols)
 
 
-def _analyst_upside_panel(midx, px_panel, stale_days=180, consensus=True):
+def _analyst_upside_panel(midx, px_panel, stale_days=None, consensus=True):
+    if stale_days is None:
+        stale_days = int(os.environ.get("ANALYST_STALE_DAYS", "180"))   # coverage/staleness dial (ANALYST_LAB)
     """PIT monthly analyst implied-upside panel = (CONSENSUS price target within `stale_days` as of month-end) /
     (month-end close) − 1, per ticker. Source: .data/analyst_ratings.jsonl (Benzinga, 2011+). 2026-08-18 COVERAGE
     FIX (was 19% cells): (1) stale_days 90→180 (a 6-month-old target is still a data point), (2) CONSENSUS = MEDIAN
@@ -2193,6 +2195,22 @@ def build():
         pb = pb_raw;    _row("BASELINE div4x (raw P/B)", dict(conv=4.0))
         pb = pb_drift;  _row("drift-adjusted + div4x", dict(conv=4.0))
         pb = pb_drift   # restore the new default (drift)
+        sys.exit(0)
+
+    if os.environ.get("ANALYST_LAB"):
+        # Coverage/staleness dial for the analyst implied-upside signal. Coverage is source-capped ~70%
+        # (Benzinga tracks only ~70% of our small-cap picks; EODHD adds ~nothing). Widening the freshness
+        # window is the only PIT-safe lever: 180d→365d lifts pick-month fill 53%→60% (measured). This tests
+        # whether wider = better return or just stale noise. Run at ANALYST_STALE_DAYS=180/365/730.
+        import sys
+        sd = os.environ.get("ANALYST_STALE_DAYS", "180")
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", conv=4.0, entry="tl_rsi")
+        print(f"\n===== ANALYST_LAB  stale_days={sd} =====", flush=True)
+        for lab, kw in [("drift (deploy default)", dict()),
+                        ("upside_pb_60 (analyst blend)", dict(value_key="upside_pb_60")),
+                        ("no_downgrade (rating-action)", dict(entry="no_downgrade"))]:
+            r = run(True, True, **{**base, **kw})   # kw overrides base (e.g. entry=no_downgrade)
+            print(f"  {lab:30} TOTAL {r['total']:+,.0f}%  Sharpe {r['sharpe']:.2f}  DD {r['dd']:.1f}%", flush=True)
         sys.exit(0)
 
     if os.environ.get("VERIFY_DD"):

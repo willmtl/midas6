@@ -29,7 +29,7 @@ def analyst_universe():
     """Stocks that have fundamentals, minus ETFs/benchmarks, UNION the Finviz US/CA universe (so the Finviz
     industry engine's analyst-upside blend has coverage too). Avoids build_universe()'s DISTINCT over the
     Candle hypertable (which hangs on the worker without max_parallel_workers_per_gather=0)."""
-    from core.models import Fundamental, Sector
+    from core.models import Fundamental, Sector, DelistedCompany
     etfs = set(Sector.objects.values_list("etf", flat=True)) | {"SPY", "QQQ"}
     have_fund = set(Fundamental.objects.values_list("ticker", flat=True))
     fv = set()
@@ -39,7 +39,12 @@ def analyst_universe():
         fv = {t for t, m in _d["by_ticker"].items() if m.get("country") in ("USA", "Canada")}
     except Exception:
         pass
-    return sorted((have_fund | fv) - etfs)
+    # DELISTED names that we hold candles for (delisted_date populated by fetch_delisted.py --date-only).
+    # These have NO current Fundamental row so they were silently excluded — yet Polygon-Benzinga carries
+    # their full dated history (ANSS→2012, BCEI, EXPR verified). Including them is a PIT-safe coverage win
+    # for the ~30% of small-cap picks (acquired/renamed names) that were previously dark.
+    dead = set(DelistedCompany.objects.exclude(delisted_date=None).values_list("ticker", flat=True))
+    return sorted((have_fund | fv | dead) - etfs)
 
 OUT = Path("/app/.data/analyst_ratings.jsonl")
 KEEP = ("date", "time", "firm", "analyst", "rating", "previous_rating", "rating_action",
