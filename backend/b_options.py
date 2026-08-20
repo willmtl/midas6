@@ -34,17 +34,17 @@ def bs_call(Sp, K, T, iv):
     return Sp * nd1 - K * nd2
 
 
-def lc_ret(S0, S1, iv0, iv1, K, hc):
-    c0 = bs_call(S0, K, T_ENTRY, iv0); c1 = bs_call(S1, K, T_EXIT, iv1)
+def lc_ret(S0, S1, iv0, iv1, K, hc, Tent, Text):
+    c0 = bs_call(S0, K, Tent, iv0); c1 = bs_call(S1, K, Text, iv1)
     cost = c0 * (1 + hc)
     if cost <= 0:
         return None
     return (c1 * (1 - hc) - cost) / cost
 
 
-def bs_ret(S0, S1, iv0, iv1, Klong, Kshort, hc):
-    l0 = bs_call(S0, Klong, T_ENTRY, iv0); s0 = bs_call(S0, Kshort, T_ENTRY, iv0)
-    l1 = bs_call(S1, Klong, T_EXIT, iv1);  s1 = bs_call(S1, Kshort, T_EXIT, iv1)
+def bs_ret(S0, S1, iv0, iv1, Klong, Kshort, hc, Tent, Text):
+    l0 = bs_call(S0, Klong, Tent, iv0); s0 = bs_call(S0, Kshort, Tent, iv0)
+    l1 = bs_call(S1, Klong, Text, iv1);  s1 = bs_call(S1, Kshort, Text, iv1)
     debit = l0 * (1 + hc) - s0 * (1 - hc)              # buy long@ask, sell short@bid
     if debit <= 0:
         return None
@@ -108,18 +108,21 @@ def summ(rets):
 
 
 stock = [(S1 - S0) / S0 for (S0, S1, _iv) in trades]
-print(f"  STOCK                {summ(stock)}", flush=True)
+print(f"  STOCK (2-day hold)   {summ(stock)}", flush=True)
+
+# ===== DTE SWEEP: buy 1-2mo out, HOLD ~2 days, sell — vs the 7-DTE weekly (worst-case theta) =====
+DTE_GRID = [7, 30, 45, 60]     # calendar days to expiry AT ENTRY; hold = HOLD_DAYS then sell
+HC = 0.03                       # central spread haircut (monthlies are TIGHTER than weeklies in reality)
 for scen, mult in IV_SCEN.items():
-    print(f"\n===== exit-IV scenario: {scen} (exit iv = {mult}×entry) =====", flush=True)
-    for hc in HAIRCUTS:
-        print(f"  -- haircut {hc*100:.0f}% per leg --", flush=True)
-        lc_atm = [lc_ret(S0, S1, iv, iv * mult, S0, hc) for (S0, S1, iv) in trades]
-        lc_itm = [lc_ret(S0, S1, iv, iv * mult, 0.98 * S0, hc) for (S0, S1, iv) in trades]
+    print(f"\n===== exit-IV: {scen} (exit iv={mult}×), spread haircut {HC*100:.0f}%/leg =====", flush=True)
+    for dte in DTE_GRID:
+        Tent = dte / 365.0; Text = (dte - HOLD_DAYS * 365) / 365.0
+        lc_atm = [lc_ret(S0, S1, iv, iv * mult, S0, HC, Tent, Text) for (S0, S1, iv) in trades]
+        lc_itm = [lc_ret(S0, S1, iv, iv * mult, 0.95 * S0, HC, Tent, Text) for (S0, S1, iv) in trades]
+        print(f"  --- {dte:>2}-DTE ---", flush=True)
         print(f"    LONG CALL atm      {summ(lc_atm)}", flush=True)
-        print(f"    LONG CALL 2%-ITM   {summ(lc_itm)}", flush=True)
-        for m in M_GRID:
-            rets = []
-            for (S0, S1, iv) in trades:
-                Kshort = S0 * (1 + m * iv * math.sqrt(HOLD_DAYS))
-                rets.append(bs_ret(S0, S1, iv, iv * mult, S0, Kshort, hc))
+        print(f"    LONG CALL 5%-ITM   {summ(lc_itm)}", flush=True)
+        for m in (1.0, 2.0):
+            rets = [bs_ret(S0, S1, iv, iv * mult, S0, S0 * (1 + m * iv * math.sqrt(HOLD_DAYS)), HC, Tent, Text)
+                    for (S0, S1, iv) in trades]
             print(f"    BULL SPREAD m={m:>3}σ    {summ(rets)}", flush=True)
