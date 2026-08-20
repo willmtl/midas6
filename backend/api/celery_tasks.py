@@ -617,6 +617,24 @@ def refresh_expanded_universe():
 
 
 @shared_task
+def ensure_universe_data():
+    """Weekly (right AFTER refresh_expanded_universe): backfill full-history candles + PIT financials for any
+    CURRENT ETF constituent that lacks them, so newly-added names actually become tradeable by the live scanner
+    (expand_holdings.py only refreshes membership; build_universe() only sees names that already have data, so a
+    brand-new constituent is otherwise gated out forever). Idempotent / fetch-only-missing → fast after week 1."""
+    import subprocess, os
+    if not os.path.exists("/app/ensure_universe_data.py"):
+        return {"error": "not mounted"}
+    proc = subprocess.run(["python", "-u", "/app/ensure_universe_data.py"], cwd="/app", env={**os.environ},
+                          capture_output=True, text=True, timeout=5400)
+    if proc.returncode != 0:
+        logger.error("ensure_universe_data failed (rc=%s): %s", proc.returncode, (proc.stderr or "")[-1500:])
+    else:
+        logger.info("ensure_universe_data: %s", (proc.stdout or "")[-500:])
+    return proc.returncode
+
+
+@shared_task
 def refresh_finviz_universe():
     """Weekly: re-scrape the Finviz taxonomy (11 sectors → 149 industries → all US/CA names) so the
     Finviz-version engine's membership stays current. urllib GET (Cloudflare-ok from the worker) →

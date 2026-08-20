@@ -324,6 +324,13 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.refresh_expanded_universe",
         "schedule": crontab(hour=20, minute=5, day_of_week=0),
     },
+    # Backfill candles + PIT financials for any NEW constituent from the refresh above, so newly-added ETF
+    # members become tradeable by the live scanner (else build_universe() never sees them). Sun 20:10, right
+    # after the membership refresh (20:05) and before the recomputes. Idempotent / fetch-only-missing.
+    "ensure-universe-data-weekly": {
+        "task": "api.celery_tasks.ensure_universe_data",
+        "schedule": crontab(hour=20, minute=10, day_of_week=0),
+    },
 
     # ── FINVIZ VERSION pipeline (separate industry-rotation engine) + flagship tearsheet, self-maintaining ──
     # Weekly data refresh (Sun, before the nightly recomputes use it). Universe → fundamentals → candles,
