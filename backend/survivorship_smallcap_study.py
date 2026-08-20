@@ -1084,6 +1084,8 @@ def build():
             if entry == "strength":                              # ANTI-signal control: prefer HIGH RSI (buy strength)
                 q = [h for h in _K if not np.isnan(_r(h))]
                 return max(q, key=_r) if q else _K[0]
+            if entry == "second":  return _K[1] if len(_K) > 1 else _K[0]   # 2nd-cheapest (for the top-2 breadth blend)
+            if entry == "third":   return _K[2] if len(_K) > 2 else _K[-1]  # 3rd-cheapest (top-3 breadth)
             def _pick_by(panel, hi=True, gate=None):
                 q = [h for h in _K if h in panel.columns and pd.notna(panel.loc[date, h])]
                 if gate is not None:
@@ -1294,6 +1296,8 @@ def build():
                 _tn = conc_regime[0] if _ron else conc_regime[1]
             if _sr == "accel" or _sr is None:          # top-N by acceleration (CURRENT)
                 top = a.dropna().sort_values(ascending=False).head(_tn).index
+            elif _sr == "weak":                        # BOTTOM-N by acceleration (WEAKEST sectors) — short-leg selector
+                top = a.dropna().sort_values(ascending=True).head(_tn).index
             elif _sr == "mom6":                        # top-10 by 6mo momentum LEVEL (trend-following)
                 top = m6.dropna().sort_values(ascending=False).head(TOP_N).index
             elif _sr == "up_and_accel":                # up AND accelerating (mom>0 & accel>0), by accel
@@ -1615,6 +1619,8 @@ def build():
                     else:                                      # CALM regime -> cheapest P/B among profitable
                         q = [x for x in g if pd.notna(roe_ttm.loc[date, x]) and roe_ttm.loc[date, x] > 0]
                         p = min(q, key=lambda h: pb.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
+                elif value_key == "expensive":   # SHORT-LEG selector: MOST expensive (highest P/B) name in the sector
+                    p = max(g, key=lambda h: pb.loc[date, h])
                 else:
                     p = _entry_pick(g)          # FLAGSHIP DEFAULT: cheapest (drift-)P/B, optional entry-timing overlay
                 held.add(p)
@@ -2610,6 +2616,119 @@ def build():
         _row("tl_support (flagship ref)", dict(entry="tl_support"))
         for _e in ("sec13d", "earn_beat", "earn_avoid", "insider_net", "avoid_insider_sell", "congress"):
             _row(f"entry={_e}", dict(entry=_e))
+        sys.exit(0)
+
+    if os.environ.get("INTL_LAB"):
+        # ── INTERNATIONAL small-cap universe (user, ALPHA): the flagship gates to US+CA (_is_usca). The universe
+        # already carries foreign-listed names (16 FX currencies) — dropping the gate adds global small-cap value.
+        # Test on the tl_rsi flagship: US+CA (current) vs ALL-countries vs EX-US/CA (foreign only). FULL + OOS. ──
+        import sys
+        _base = dict(regime_switch="either", regime_signal="multi", entry="tl_rsi")
+        def _row(lab, cok):
+            r = run(True, True, country_ok=cok, **_base); ro = run(True, True, country_ok=cok, start_date="2020-01-01", **_base)
+            print(f"  {lab:28}{r['total']:>12.0f}%  Sh{r['sharpe']:>5.2f}  DD{r['dd']:>6.1f}%   |  2020+ {ro['total']:>9.0f}%  Sh{ro['sharpe']:>5.2f}", flush=True)
+        print("\n=== INTL_LAB (honest 2016-2026): international small-cap universe on tl_rsi flagship ===", flush=True)
+        _row("US+CA (current flagship)", _is_usca)
+        _row("ALL countries (global)", None)
+        _row("EX-US/CA (foreign only)", lambda t: not _is_usca(t))
+        sys.exit(0)
+
+    if os.environ.get("LONGSHORT_LAB"):
+        # ── LONG-SHORT (user): keep the long value book (tl_rsi flagship) + SHORT the most EXPENSIVE (highest P/B)
+        # names in the WEAKEST-accel sectors. Short leg = run(sector_rule="weak", value_key="expensive"); shorting
+        # it earns -(its return) - borrow (~3%/yr). Nets down beta -> should cut DD; adds alpha IFF expensive-weak
+        # names underperform. Caveat: shorting small-caps is costly/hard-to-borrow — this is an upper-bound estimate. ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        lng = run(True, True, **base, entry="tl_rsi")
+        sht = run(True, True, **base, sector_rule="weak", value_key="expensive")
+        lm, _smd = dict(lng["monthly"]), dict(sht["monthly"]); dates = [d for d, _ in lng["monthly"]]
+        sm = {d: _smd.get(d, 0.0) for d in dates}   # months the short leg didn't trade (no expensive name) -> 0 short
+        borrow = 0.03 / 12.0
+        def _metrics(rets):
+            r = np.asarray(rets, float); tot = (np.prod(1 + r) - 1) * 100
+            sh = r.mean() / r.std(ddof=1) * np.sqrt(12) if r.std(ddof=1) > 1e-9 else 0.0
+            eq = np.cumprod(1 + r); dd = ((eq / np.maximum.accumulate(eq)) - 1).min() * 100
+            return tot, sh, dd
+        sc = np.mean([sm[d] for d in dates]) * 100; lc = np.mean([lm[d] for d in dates]) * 100
+        print("\n=== LONGSHORT_LAB (honest 2016-2026): long tl_rsi value + short expensive-weak-sector names ===", flush=True)
+        print(f"  short-CANDIDATE (expensive names, weak sectors) mean {sc:+.2f}%/mo vs long {lc:+.2f}%/mo "
+              f"(spread {lc-sc:+.2f}pp — shorting profits iff short-cand << long)", flush=True)
+        def _line(lab, rets):
+            t, s, dd = _metrics(rets); print(f"  {lab:30}{t:>12.0f}%  Sh{s:>5.2f}  DD(mo){dd:>6.1f}%", flush=True)
+        _line("LONG ONLY (flagship)", [lm[d] for d in dates])
+        for sw in (0.3, 0.5, 1.0):
+            _line(f"long - {sw:g}x short (net {1-sw:g}x)", [lm[d] - sw * (sm[d] + borrow) for d in dates])
+        sys.exit(0)
+
+    if os.environ.get("BREADTH_LAB"):
+        # ── TOP-2/3-PER-SECTOR breadth (user, DD goal): the -13/-17% single-day gaps come from ~5-10 concentrated
+        # names. Holding MORE names/sector cuts idiosyncratic gap risk. Approximated by an equal post-hoc blend of
+        # the cheapest / 2nd / 3rd picks per sector (a faithful proxy for 2 or 3 equal-weight names per sector).
+        # Tested on the cheapest base AND on the tl_rsi flagship. Monthly-marked DD (relative). ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi")
+        r1 = run(True, True, **base); r2 = run(True, True, **base, entry="second")
+        r3 = run(True, True, **base, entry="third"); rf = run(True, True, **base, entry="tl_rsi")
+        m1, m2, m3, mf = dict(r1["monthly"]), dict(r2["monthly"]), dict(r3["monthly"]), dict(rf["monthly"])
+        dates = [d for d, _ in r1["monthly"]]
+        def _metrics(rets):
+            r = np.asarray(rets, float); tot = (np.prod(1 + r) - 1) * 100
+            sh = r.mean() / r.std(ddof=1) * np.sqrt(12) if r.std(ddof=1) > 1e-9 else 0.0
+            eq = np.cumprod(1 + r); dd = ((eq / np.maximum.accumulate(eq)) - 1).min() * 100
+            return tot, sh, dd
+        def _line(lab, maps):
+            rets = [np.mean([m[d] for m in maps]) for d in dates]
+            t, s, dd = _metrics(rets)
+            print(f"  {lab:34}{t:>12.0f}%  Sh{s:>5.2f}  DD(mo){dd:>6.1f}%", flush=True)
+        print("\n=== BREADTH_LAB (honest 2016-2026): top-2/3 names per sector (idiosyncratic-risk reduction) ===", flush=True)
+        _line("cheapest only (1/sector)", [m1])
+        _line("top-2 cheapest (1+2/sector)", [m1, m2])
+        _line("top-3 cheapest (1+2+3/sector)", [m1, m2, m3])
+        _line("FLAGSHIP tl_rsi (1/sector)", [mf])
+        _line("flagship + 2nd-cheapest", [mf, m2])
+        _line("flagship + 2nd + 3rd", [mf, m2, m3])
+        sys.exit(0)
+
+    if os.environ.get("MACRO_SCALE_LAB"):
+        # ── EXPOSURE MANAGEMENT (user, DD/Sharpe goal) on the tl_rsi flagship, post-hoc on monthly returns:
+        # (a) macro-liquidity scaling — de-risk (halve/quarter/cash) when Fed net-liquidity is FALLING (PIT); and
+        # (b) a fixed GOLD diversifier sleeve. Cash/de-risked portion earns 0 (conservative). DD is monthly-marked
+        # (relative comparison only; the real daily DD is ~1.5x deeper per flagship_daily_dd.py). ──
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi")
+        f = run(True, True, **base); fm = dict(f["monthly"]); dates = [d for d, _ in f["monthly"]]
+        gld = etf_m["GLD"].pct_change() if "GLD" in etf_m.columns else None
+        def _metrics(rets):
+            r = np.asarray(rets, float); tot = (np.prod(1 + r) - 1) * 100
+            sh = r.mean() / r.std(ddof=1) * np.sqrt(12) if r.std(ddof=1) > 1e-9 else 0.0
+            eq = np.cumprod(1 + r); dd = ((eq / np.maximum.accumulate(eq)) - 1).min() * 100
+            return tot, sh, dd
+        def _line(lab, rets, n=None):
+            t, s, dd = _metrics(rets); nt = f"  ({n})" if n else ""
+            print(f"  {lab:34}{t:>12.0f}%  Sh{s:>5.2f}  DD(mo){dd:>6.1f}%{nt}", flush=True)
+        print("\n=== MACRO_SCALE_LAB (tl_rsi flagship): net-liquidity exposure scaling + gold sleeve ===", flush=True)
+        _line("BASELINE (full exposure)", [fm[d] for d in dates])
+        print("  -- macro-liquidity scaling (de-risk when net-liquidity FALLING, PIT) --", flush=True)
+        for lab, sig, expo in [("halve on netliq falling", macro_netliq_ok, 0.5),
+                               ("quarter on netliq falling", macro_netliq_ok, 0.25),
+                               ("cash on netliq falling", macro_netliq_ok, 0.0),
+                               ("halve on macro_fav off", macro_fav, 0.5)]:
+            n = 0; rets = []
+            for d in dates:
+                ok = bool(sig.get(pd.Timestamp(d))); rets.append(fm[d] if ok else fm[d] * expo); n += (0 if ok else 1)
+            _line(lab, rets, f"{n}/{len(dates)} derisked")
+        if gld is not None:
+            print("  -- gold diversifier sleeve (fixed % GLD, monthly rebalanced) --", flush=True)
+            for w in (0.10, 0.20):
+                rets = [(1 - w) * fm[d] + w * (float(gld.get(pd.Timestamp(d))) if pd.notna(gld.get(pd.Timestamp(d))) else 0.0) for d in dates]
+                _line(f"{int(w*100)}% gold / {int((1-w)*100)}% flagship", rets)
+            rets = []
+            for d in dates:
+                gv = gld.get(pd.Timestamp(d)); gv = float(gv) if pd.notna(gv) else 0.0
+                ok = bool(macro_netliq_ok.get(pd.Timestamp(d)))
+                rets.append(fm[d] if ok else 0.5 * fm[d] + 0.5 * gv)
+            _line("half-to-gold when netliq falling", rets)
         sys.exit(0)
 
     if os.environ.get("SPY_RSI_LAB"):
