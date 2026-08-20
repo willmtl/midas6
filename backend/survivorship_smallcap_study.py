@@ -1700,6 +1700,7 @@ def build():
                                         "de": _f(de.loc[date, p]), "gpa": _f(gpa.loc[date, p]),
                                         "rev_g": _f(rev_g.loc[date, p]), "ni": _f(ttm_ni.loc[date, p]),
                                         "revenue": _f(revp.loc[date, p]), "mktcap_usd": _f(mktcap_usd.loc[date, p]),
+                                        "dvol_usd": _f(dvol_usd.loc[date, p]),   # trailing-20d $ vol for cost/capacity modeling
                                         "weight": float(w), "ret": (float(r) if ndate is not None else None), "delisted": p in delisted_sector,
                                         "mae": (_pick_mae(p, date, ndate) if ndate is not None else None),
                                         "conviction": bool(accumulating(p, date))})
@@ -2707,6 +2708,80 @@ def build():
         _line("FLAGSHIP tl_rsi (1/sector)", [mf])
         _line("flagship + 2nd-cheapest", [mf, m2])
         _line("flagship + 2nd + 3rd", [mf, m2, m3])
+        sys.exit(0)
+
+    if os.environ.get("COST_LAB"):
+        # ── TRANSACTION-COST + CAPACITY model on the exact tl_rsi flagship. Every headline number is GROSS,
+        # no-cost, infinite-capacity, month-end fills. This book trades illiquid small-caps monthly, so the
+        # realistic net return and the AUM ceiling are the numbers a real deployment hinges on. ──
+        # Model (per traded name, per rebalance): notional traded = |Δweight_frac| * AUM (names held at the same
+        # weight trade nothing -> persistence is free). Cost = effective half-spread (dvol-tiered) + square-root
+        # market impact (sigma_daily * sqrt(order / (dvol * exec_days))). Buys and sells fall out of the month-to-
+        # month weight deltas, so a full round-trip is only charged when a name actually enters and later exits.
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi")
+        tr = []
+        f = run(True, True, trace=tr, **base)
+        dates = [d for d, _ in f["monthly"]]; gm = dict(f["monthly"])
+        # per-month held book: ticker -> (weight_fraction, dvol_usd)
+        books = []
+        for m in tr:
+            ps = [p for p in m.get("picks", []) if p.get("weight") and p.get("ret") is not None and p.get("dvol_usd")]
+            W = sum(p["weight"] for p in ps) or 1.0
+            books.append({p["ticker"]: (p["weight"] / W, float(p["dvol_usd"])) for p in ps})
+
+        SIG_D = float(os.environ.get("COST_SIG", "0.03"))     # small-cap daily vol assumption (impact scale)
+        EXEC_D = float(os.environ.get("COST_EXEC", "1.0"))    # trading days to work each order (1 = aggressive)
+
+        def hspread_bps(dvol):                                # effective half-spread: wider for thinner names
+            return min(90.0, max(8.0, 8.0 * (2.0e7 / max(dvol, 1e5)) ** 0.5))
+
+        def net_series(aum):
+            """Apply per-name spread+impact to each rebalance; return (net monthly rets, avg 1-way turnover,
+            median participation, worst single-name participation)."""
+            rets = []; turns = []; parts = []; worst_p = 0.0; prev = {}
+            for k, d in enumerate(dates):
+                cur = books[k] if k < len(books) else {}
+                cost_usd = 0.0; traded_usd = 0.0
+                for t in set(cur) | set(prev):
+                    fw_c = cur.get(t, (0.0, 0.0))[0]; fw_p = prev.get(t, (0.0, 0.0))[0]
+                    dv = cur.get(t, prev.get(t, (0.0, 1e6)))[1]
+                    dfw = abs(fw_c - fw_p)
+                    if dfw <= 1e-9:
+                        continue
+                    order = dfw * aum; traded_usd += order
+                    part = order / (max(dv, 1e5) * EXEC_D)
+                    worst_p = max(worst_p, part)
+                    if t in cur and fw_c > fw_p:
+                        parts.append(part)
+                    cost_bps = hspread_bps(dv) + SIG_D * 1e4 * (part ** 0.5)   # spread + sqrt-impact
+                    cost_usd += order * cost_bps / 1e4
+                drag = cost_usd / aum
+                rets.append(gm[d] - drag)
+                turns.append(traded_usd / (2.0 * aum))        # one-way turnover fraction
+                prev = cur
+            return np.asarray(rets, float), float(np.mean(turns)), (float(np.median(parts)) if parts else 0.0), worst_p
+
+        def _stats(r):
+            tot = (np.prod(1 + r) - 1) * 100
+            sh = r.mean() / r.std(ddof=1) * np.sqrt(12) if r.std(ddof=1) > 1e-9 else 0.0
+            eq = np.cumprod(1 + r); dd = ((eq / np.maximum.accumulate(eq)) - 1).min() * 100
+            n = len(r); cagr = ((1 + tot / 100) ** (12.0 / n) - 1) * 100 if n else 0.0
+            return tot, cagr, sh, dd
+
+        gr = np.asarray([gm[d] for d in dates], float)
+        gt, gc, gs, gd = _stats(gr)
+        print(f"\n=== COST_LAB (tl_rsi flagship): transaction-cost + capacity  [sigma_d={SIG_D:.0%}, exec={EXEC_D:g}d] ===", flush=True)
+        print(f"  months={len(dates)}  median pick $vol=${np.median([dv for bk in books for _, dv in bk.values()])/1e6:.0f}M", flush=True)
+        print(f"  {'AUM':>8}{'net total%':>14}{'net CAGR%':>11}{'Sharpe':>8}{'DD%':>8}{'turn/mo':>9}{'med part':>10}{'worst part':>12}", flush=True)
+        print(f"  {'GROSS':>8}{gt:>14.0f}{gc:>11.1f}{gs:>8.2f}{gd:>8.1f}{'—':>9}{'—':>10}{'—':>12}", flush=True)
+        for aum in (1e5, 1e6, 5e6, 1e7, 5e7, 1e8, 2.5e8, 5e8):
+            r, turn, medp, wp = net_series(aum)
+            t, c, s, dd = _stats(r)
+            tag = f"${aum/1e6:.2g}M" if aum < 1e9 else f"${aum/1e9:.2g}B"
+            print(f"  {tag:>8}{t:>14.0f}{c:>11.1f}{s:>8.2f}{dd:>8.1f}{turn:>8.0%}{medp:>10.1%}{wp:>11.0%}", flush=True)
+        print("  NOTE: gross halves / edge degrades where median participation exceeds ~10-15% of a day's volume;", flush=True)
+        print("        worst-participation column flags names you cannot fill at that AUM without moving the tape.", flush=True)
         sys.exit(0)
 
     if os.environ.get("ADR_AB"):
