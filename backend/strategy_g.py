@@ -147,3 +147,26 @@ def perf(ret, spy_ret, posw=None):
                 maxdd=float((eq / np.maximum.accumulate(eq) - 1).min() * 100),
                 hit=float((pr.values > 0).mean() * 100), beat_spy=float(np.nanmean(pr.values > sr) * 100),
                 n_mo=int(len(pr)), pos_win=None if posw is None else float(posw * 100))
+
+
+_WINDOWS = [("2016-2018", "2016-01-01", "2018-12-31"), ("2019-2021", "2019-01-01", "2021-12-31"),
+            ("2022-2023", "2022-01-01", "2023-12-31"), ("2024-2026", "2024-01-01", "2026-12-31"),
+            ("covid-2020H1", "2020-01-01", "2020-06-30")]
+
+
+def walk_forward(P, cost_bps=25.0):
+    """Non-overlapping subperiods + a COVID-crash window. verdict='robust' if G-core beats SPY CAGR in >=3 of
+    the 4 multi-year windows, else 'fragile'. Returns dict(subperiods=[...], verdict)."""
+    r = sim(P, cost_bps=cost_bps)["ret"]; spy = P["spy_ret"]
+    subs = []
+    for label, a, b in _WINDOWS:
+        seg = r[(r.index >= a) & (r.index <= b)].dropna()
+        sseg = spy.reindex(seg.index)
+        if len(seg) < 3:
+            continue
+        m = perf(seg, sseg); sm = perf(sseg, sseg)
+        subs.append(dict(label=label, start=a, end=b, cagr=m["cagr"], maxdd=m["maxdd"],
+                         hit=m["hit"], beat_spy=m["beat_spy"], spy_cagr=sm["cagr"]))
+    multi = [s for s in subs if not s["label"].startswith("covid")]
+    beats = sum(1 for s in multi if s["cagr"] > s["spy_cagr"])
+    return dict(subperiods=subs, verdict="robust" if beats >= 3 else "fragile")

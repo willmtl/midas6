@@ -49,7 +49,19 @@ def test_gcore_reproduces_prototype():
     assert m["cagr"] > spy["cagr"] + 8, f"G-core does not clear SPY: {m['cagr']} vs {spy['cagr']}"
 
 
-TESTS = [test_panels_pit_and_shapes, test_gcore_reproduces_prototype]
+def test_walk_forward_gate():
+    uni, tgts, P = _panels()
+    wf = G.walk_forward(P, cost_bps=25.0)
+    assert len(wf["subperiods"]) >= 5, f"too few subperiods: {len(wf['subperiods'])}"
+    multi = [s for s in wf["subperiods"] if not s["label"].startswith("covid")]
+    beats = sum(1 for s in multi if s["cagr"] > s["spy_cagr"])
+    for s in wf["subperiods"]:
+        print(f"    {s['label']:14} G CAGR {s['cagr']:+7.1f}%  SPY {s['spy_cagr']:+7.1f}%  DD {s['maxdd']:6.1f}%  hit {s['hit']:.0f}%", flush=True)
+    assert beats >= 3, f"not robust: beats SPY in only {beats}/{len(multi)} windows"
+    assert wf["verdict"] == "robust"
+
+
+TESTS = [test_panels_pit_and_shapes, test_gcore_reproduces_prototype, test_walk_forward_gate]
 
 
 def _run(fns):
