@@ -1834,6 +1834,35 @@ class DelistedSurvivorshipView(_StudyResultView):
     json_path = "/app/.data/studies/delisted_survivorship.json"
 
 
+class StrategyGView(_StudyResultView):
+    """Strategy G — analyst-gap diversified value book (top-5% below-target + TTM-profit gate, EW monthly,
+    $5M/day floor). High-capacity flagship complement. GET adds current-month live picks; POST re-runs with
+    DB persistence and refreshes the live picks."""
+    kind = "strategy_g"
+    script = "strategy_g.py"
+    json_path = "/app/.data/strategy_g.json"
+
+    def get(self, request):
+        import os as _os, json as _json
+        resp = super().get(request)
+        picks_p = "/app/.data/strategy_g_picks.json"
+        if isinstance(resp.data, dict) and _os.path.exists(picks_p):
+            with open(picks_p) as f:
+                resp.data["live_picks"] = _json.load(f)
+        return resp
+
+    def post(self, request):
+        import threading, subprocess
+        def _run():
+            try:
+                subprocess.run(["python", "-u", "strategy_g.py", "--db"], cwd="/app", timeout=3600)
+                subprocess.run(["python", "-u", "strategy_g_scan.py"], cwd="/app", timeout=1800)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+        return Response({"status": "strategy_g recompute started"})
+
+
 class DarkPoolBacktestView(_StudyResultView):
     """Historical dark-pool backtest: monthly PIT high-share / accumulation strategies vs SPY."""
     kind = "darkpool_backtest"

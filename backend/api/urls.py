@@ -54,6 +54,8 @@ urlpatterns = [
     # Alt-data validation studies (analysis only, not wired to risk-rating)
     path("congress-study", views.CongressStudyView.as_view(), name="congress-study"),
     path("delisted-survivorship", views.DelistedSurvivorshipView.as_view(), name="delisted-survivorship"),
+    # Strategy G — analyst-gap diversified value book (high-capacity flagship complement)
+    path("strategy-g", views.StrategyGView.as_view(), name="strategy-g"),
     # Dark pool: daily Polygon off-% + official weekly FINRA ATS off-% (overlay) + amplifier result
     path("dark-pool", views.DarkPoolView.as_view(), name="dark-pool"),
     # Dark-pool + alt-data equity-curve backtests (DB-first via BacktestResult)
