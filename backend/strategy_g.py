@@ -170,3 +170,77 @@ def walk_forward(P, cost_bps=25.0):
     multi = [s for s in subs if not s["label"].startswith("covid")]
     beats = sum(1 for s in multi if s["cagr"] > s["spy_cagr"])
     return dict(subperiods=subs, verdict="robust" if beats >= 3 else "fragile")
+
+
+COST_GRID = [0, 10, 25, 50, 100]
+OUT = Path("/app/.data/strategy_g.json")
+
+
+def build_payload(P):
+    """Full persisted payload: cost grid for both variants, turnover, walk-forward, latest holdings, curve, caveat."""
+    def grid(weight):
+        out = []
+        for cb in COST_GRID:
+            r = sim(P, weight=weight, cost_bps=cb); m = perf(r["ret"], P["spy_ret"], r["pos_win"])
+            out.append(dict(cost_bps=cb, weight=weight, avg_n=r["avg_n"], turnover=r["turnover"], **m))
+        return out
+    core_grid, smooth_grid = grid("equal"), grid("invvol")
+    r25 = sim(P, cost_bps=25.0)
+    last_d = sorted(r25["holdings"])[-1]
+    spy = perf(P["spy_ret"], P["spy_ret"])
+    return dict(
+        computed_at=pd.Timestamp.utcnow().isoformat(),
+        config=dict(top_frac=TOP_FRAC, profit_gate=True, weight="equal", dvol_floor=DVOL_FLOOR,
+                    price_floor=PRICE_FLOOR, stale_days=STALE_DAYS, rebalance="monthly"),
+        cost_grid=core_grid + smooth_grid, spy=spy,
+        turnover_oneway_monthly=r25["turnover"],
+        walk_forward=walk_forward(P, cost_bps=25.0),
+        latest_holdings=dict(date=last_d, tickers=r25["holdings"][last_d]),
+        curve={d.date().isoformat(): float(v) for d, v in r25["ret"].dropna().items()},
+        caveat="Long-only EW monthly. PIT (targets<=month-end 180d; TTM ni ffill by avail_date). Survivorship-aware "
+               "(delisted-with-candles incl.). US-listed only. In-sample 2016-2026; see walk_forward for subperiods. "
+               "Costs modeled as flat bps on turnover (no market-impact curve).")
+
+
+def _print_sweep(P):
+    def row(label, **kw):
+        r = sim(P, **kw); m = perf(r["ret"], P["spy_ret"], r["pos_win"])
+        print(f"  {label:36} CAGR {m['cagr']:+6.1f}%  DD {m['maxdd']:6.1f}%  Sh {m['sharpe']:4.2f}  "
+              f"hit {m['hit']:4.1f}%  posW {m['pos_win']:.1f}%  turn {r['turnover']*100:.0f}%", flush=True)
+    print("=== G lever sweep (record) ===", flush=True)
+    row("G-core (top-5% profit EW)")
+    row("G-smooth (inverse-vol)", weight="invvol")
+    for frac, tag in [(0.10, "decile"), (0.20, "quintile")]:
+        row(f"{tag} profit EW", top_frac=frac)
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", action="store_true"); ap.add_argument("--variant", default="core", choices=["core", "smooth"])
+    ap.add_argument("--cost-bps", type=float, default=25.0); ap.add_argument("--sweep", action="store_true")
+    a = ap.parse_args()
+    uni, tgts = build_universe(); print(f"covered universe: {len(uni)}", flush=True)
+    P = build_panels(uni, tgts)
+    w = "invvol" if a.variant == "smooth" else "equal"
+    r = sim(P, weight=w, cost_bps=a.cost_bps); m = perf(r["ret"], P["spy_ret"], r["pos_win"])
+    print(f"G-{a.variant} @ {a.cost_bps:.0f}bps: CAGR {m['cagr']:+.1f}%  DD {m['maxdd']:.1f}%  "
+          f"Sharpe {m['sharpe']:.2f}  hit {m['hit']:.1f}%  >SPY {m['beat_spy']:.1f}%  turn {r['turnover']*100:.0f}%", flush=True)
+    if a.sweep:
+        _print_sweep(P)
+    p = build_payload(P)
+    OUT.parent.mkdir(parents=True, exist_ok=True); OUT.write_text(json.dumps(p, indent=2, default=str))
+    print(f"verdict: {p['walk_forward']['verdict']}", flush=True)
+    if a.db:
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(
+                kind="strategy_g", defaults={"payload": json.loads(json.dumps(p, default=str)), "computed_at": timezone.now()})
+            print("Saved BacktestResult[strategy_g]", flush=True)
+        except Exception as e:
+            print("DB save failed:", e, flush=True)
+
+
+if __name__ == "__main__":
+    main()

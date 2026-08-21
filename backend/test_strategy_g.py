@@ -61,7 +61,17 @@ def test_walk_forward_gate():
     assert wf["verdict"] == "robust"
 
 
-TESTS = [test_panels_pit_and_shapes, test_gcore_reproduces_prototype, test_walk_forward_gate]
+def test_payload_and_persistence():
+    uni, tgts, P = _panels()
+    p = G.build_payload(P)
+    assert p["config"]["top_frac"] == 0.05 and p["config"]["profit_gate"] is True
+    assert "cost_grid" in p and any(abs(c["cost_bps"] - 25) < 1e-9 for c in p["cost_grid"])
+    assert p["walk_forward"]["verdict"] in ("robust", "fragile")
+    assert p["latest_holdings"] and isinstance(p["latest_holdings"]["tickers"], list) and p["latest_holdings"]["tickers"]
+    assert "computed_at" in p and p["curve"]
+
+
+TESTS = [test_panels_pit_and_shapes, test_gcore_reproduces_prototype, test_walk_forward_gate, test_payload_and_persistence]
 
 
 def _run(fns):
