@@ -2241,6 +2241,7 @@ def build():
         base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", conv=4.0, entry="tl_rsi")
         print(f"\n===== ANALYST_LAB  stale_days={sd} =====", flush=True)
         for lab, kw in [("drift (deploy default)", dict()),
+                        ("upside PURE (target/price gap)", dict(value_key="upside")),
                         ("upside_pb_60 (analyst blend)", dict(value_key="upside_pb_60")),
                         ("no_downgrade (rating-action)", dict(entry="no_downgrade"))]:
             r = run(True, True, **{**base, **kw})   # kw overrides base (e.g. entry=no_downgrade)
