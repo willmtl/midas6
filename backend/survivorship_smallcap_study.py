@@ -1087,6 +1087,22 @@ def build():
             if not cands:
                 return None
             _K = sorted(cands, key=lambda h: pb.loc[date, h])
+            # ── ADDITIVE analyst overlays (ANALYST_OVERLAY_LAB): layered ON TOP of the deployed pick, they
+            # only reshape the candidate pool, never replace the drift-P/B + entry logic. PIT-safe. ──
+            _ov = os.environ.get("ANALYST_OVERLAY")
+            if _ov:
+                if "veto" in _ov:          # drop names that were NET-DOWNGRADED in the trailing 90d
+                    _f = [h for h in _K if not (h in net_upg_m.columns and pd.notna(net_upg_m.loc[date, h])
+                                                and float(net_upg_m.loc[date, h]) < 0)]
+                    if _f:
+                        _K = _f
+                if "tiebreak" in _ov and _K:   # among ~tied-cheapest P/B (within 10% of the min), prefer higher upside
+                    _pbmin = pb.loc[date, _K[0]]
+                    if pd.notna(_pbmin) and _pbmin > 0:
+                        _tied = [h for h in _K if pd.notna(pb.loc[date, h]) and pb.loc[date, h] <= _pbmin * 1.10]
+                        _tied.sort(key=lambda h: (float(upside_m.loc[date, h]) if h in upside_m.columns
+                                                  and pd.notna(upside_m.loc[date, h]) else -9.0), reverse=True)
+                        _K = _tied + [h for h in _K if h not in _tied]
             if entry is None:
                 return _K[0]
             _K = _K[:entry_k]                                    # time the entry among the K cheapest
@@ -2195,6 +2211,24 @@ def build():
         pb = pb_raw;    _row("BASELINE div4x (raw P/B)", dict(conv=4.0))
         pb = pb_drift;  _row("drift-adjusted + div4x", dict(conv=4.0))
         pb = pb_drift   # restore the new default (drift)
+        sys.exit(0)
+
+    if os.environ.get("ANALYST_OVERLAY_LAB"):
+        # Does analyst data add value as an ADDITIVE OVERLAY on the REAL deployed flagship (drift + tl_rsi +
+        # div4x + regime), rather than as a substitute value-key/entry (which loses, see ANALYST_LAB)? Tests
+        # no_downgrade as a VETO and analyst-upside as a cheapest-P/B TIE-BREAK, at the current 95% coverage.
+        import sys
+        base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", conv=4.0, entry="tl_rsi")
+        print("\n===== ANALYST_OVERLAY_LAB (additive on deployed flagship) =====", flush=True)
+        for lab, ov in [("deployed (no overlay)", ""), ("+ no_downgrade VETO", "veto"),
+                        ("+ upside TIE-BREAK", "tiebreak"), ("+ veto + tiebreak", "veto_tiebreak")]:
+            if ov:
+                os.environ["ANALYST_OVERLAY"] = ov
+            else:
+                os.environ.pop("ANALYST_OVERLAY", None)
+            r = run(True, True, **base)
+            print(f"  {lab:24} TOTAL {r['total']:+,.0f}%  Sharpe {r['sharpe']:.2f}  DD {r['dd']:.1f}%", flush=True)
+        os.environ.pop("ANALYST_OVERLAY", None)
         sys.exit(0)
 
     if os.environ.get("ANALYST_LAB"):
