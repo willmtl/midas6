@@ -1091,7 +1091,12 @@ def build():
             # only reshape the candidate pool, never replace the drift-P/B + entry logic. PIT-safe. ──
             _ov = os.environ.get("ANALYST_OVERLAY")
             if _ov:
-                if "veto" in _ov:          # drop names that were NET-DOWNGRADED in the trailing 90d
+                if "vetoabove" in _ov:     # drop names trading AT/ABOVE analyst target (upside<=0) — the robust
+                    _f = [h for h in _K if not (h in upside_m.columns and pd.notna(upside_m.loc[date, h])  # short-side
+                                                and float(upside_m.loc[date, h]) <= 0.0)]                  # signal
+                    if _f:
+                        _K = _f
+                elif "veto" in _ov:        # drop names that were NET-DOWNGRADED in the trailing 90d
                     _f = [h for h in _K if not (h in net_upg_m.columns and pd.notna(net_upg_m.loc[date, h])
                                                 and float(net_upg_m.loc[date, h]) < 0)]
                     if _f:
@@ -2220,8 +2225,9 @@ def build():
         import sys
         base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", conv=4.0, entry="tl_rsi")
         print("\n===== ANALYST_OVERLAY_LAB (additive on deployed flagship) =====", flush=True)
-        for lab, ov in [("deployed (no overlay)", ""), ("+ no_downgrade VETO", "veto"),
-                        ("+ upside TIE-BREAK", "tiebreak"), ("+ veto + tiebreak", "veto_tiebreak")]:
+        for lab, ov in [("deployed (no overlay)", ""), ("+ VETO at/above-target", "vetoabove"),
+                        ("+ no_downgrade VETO", "veto"), ("+ upside TIE-BREAK", "tiebreak"),
+                        ("+ veto + tiebreak", "veto_tiebreak")]:
             if ov:
                 os.environ["ANALYST_OVERLAY"] = ov
             else:
