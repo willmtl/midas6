@@ -94,3 +94,56 @@ def build_panels(uni, tgts):
     fwd = mclose.shift(-1) / mclose - 1.0
     spy_ret = mclose["SPY"].shift(-1) / mclose["SPY"] - 1.0
     return dict(mclose=mclose, mdvol=mdvol, ups=ups, ttm_ni=ttm_ni, mvol=mvol, fwd=fwd, spy_ret=spy_ret, midx=midx)
+
+
+def profit_ok(P, d, t):
+    """TTM net income present and > 0 at month d (the quality guard)."""
+    v = P["ttm_ni"].get(t)
+    return v is not None and pd.notna(P["ttm_ni"].loc[d, t]) and P["ttm_ni"].loc[d, t] > 0
+
+
+def sim(P, top_frac=TOP_FRAC, profit_gate=True, weight="equal", cost_bps=0.0):
+    """Monthly long-only book. weight: 'equal' | 'invvol'. cost_bps: one-way per-trade cost charged on both
+    sides of turnover. Returns dict(ret, avg_n, pos_win, turnover, holdings)."""
+    mclose, mdvol, ups, mvol, fwd = P["mclose"], P["mdvol"], P["ups"], P["mvol"], P["fwd"]
+    midx = P["midx"]
+    pr, held_n, pos_win, pos_tot = [], [], 0, 0
+    prev_w, turns, holdings = {}, [], {}
+    for d in midx[:-1]:
+        u = ups.loc[d].dropna(); f = fwd.loc[d]; dv = mdvol.loc[d]; cl = mclose.loc[d]; vol = mvol.loc[d]
+        cand = [t for t in u.index if t != "SPY" and pd.notna(f.get(t)) and np.isfinite(f[t])
+                and pd.notna(dv.get(t)) and dv[t] >= DVOL_FLOOR and pd.notna(cl.get(t)) and cl[t] > PRICE_FLOOR]
+        if profit_gate:
+            cand = [t for t in cand if profit_ok(P, d, t)]
+        if len(cand) < 10:
+            pr.append(np.nan); held_n.append(0); continue
+        ranked = u[cand].sort_values(ascending=False)                 # furthest-below-target first
+        k = max(1, int(len(ranked) * top_frac))
+        hold = list(ranked.index[:k]); rr = f[hold]
+        if weight == "invvol":
+            wv = np.array([1.0 / vol[t] if pd.notna(vol.get(t)) and vol[t] > 0 else np.nan for t in hold])
+            wv = np.where(np.isfinite(wv), wv, np.nanmedian(wv)) if np.isfinite(wv).sum() >= 2 else np.ones(len(hold))
+            wv = wv / wv.sum(); m = float(np.dot(rr.values, wv))
+        else:
+            wv = np.full(len(hold), 1.0 / len(hold)); m = float(rr.mean())
+        pos_win += int((rr > 0).sum()); pos_tot += len(rr)
+        cur_w = {t: wv[i] for i, t in enumerate(hold)}
+        keys = set(cur_w) | set(prev_w)
+        turn = 0.5 * sum(abs(cur_w.get(t, 0.0) - prev_w.get(t, 0.0)) for t in keys)   # one-way turnover
+        turns.append(turn); m -= turn * 2.0 * (cost_bps / 1e4); prev_w = cur_w        # charge both sides
+        holdings[d.date().isoformat()] = hold
+        pr.append(m); held_n.append(k)
+    return dict(ret=pd.Series(pr, index=midx[:-1]), avg_n=float(np.mean([h for h in held_n if h])),
+                pos_win=pos_win / pos_tot if pos_tot else float("nan"),
+                turnover=float(np.mean(turns)) if turns else float("nan"), holdings=holdings)
+
+
+def perf(ret, spy_ret, posw=None):
+    """Summary stats. Percentages as numbers (e.g. 31.1). Returns dict(total,cagr,sharpe,maxdd,hit,beat_spy,n_mo,pos_win)."""
+    pr = ret.dropna(); eq = np.cumprod(1 + pr.values)
+    yrs = len(pr) / 12.0; sr = spy_ret.reindex(pr.index).values
+    return dict(total=(eq[-1] - 1) * 100, cagr=(eq[-1] ** (1 / yrs) - 1) * 100,
+                sharpe=float(pr.mean() / pr.std() * np.sqrt(12)),
+                maxdd=float((eq / np.maximum.accumulate(eq) - 1).min() * 100),
+                hit=float((pr.values > 0).mean() * 100), beat_spy=float(np.nanmean(pr.values > sr) * 100),
+                n_mo=int(len(pr)), pos_win=None if posw is None else float(posw * 100))

@@ -36,7 +36,20 @@ def test_panels_pit_and_shapes():
     assert (pd.isna(expected) and pd.isna(got)) or abs(got - expected) < 1e-6, f"PIT breach: {got} vs {expected}"
 
 
-TESTS = [test_panels_pit_and_shapes]
+def test_gcore_reproduces_prototype():
+    uni, tgts, P = _panels()
+    r = G.sim(P, cost_bps=25.0)                          # prototype G-core @ 25bps: CAGR 29.5, DD -24.8, hit 69.5
+    m = G.perf(r["ret"], P["spy_ret"], r["pos_win"])
+    assert 27.0 <= m["cagr"] <= 32.0, f"CAGR off: {m['cagr']}"
+    assert -27.0 <= m["maxdd"] <= -22.0, f"DD off: {m['maxdd']}"
+    assert m["hit"] >= 66.0, f"hit rate off: {m['hit']}"
+    assert 0.15 <= r["turnover"] <= 0.30, f"turnover off: {r['turnover']}"
+    assert 55 <= r["avg_n"] <= 70, f"name count off: {r['avg_n']}"
+    spy = G.perf(P["spy_ret"], P["spy_ret"])
+    assert m["cagr"] > spy["cagr"] + 8, f"G-core does not clear SPY: {m['cagr']} vs {spy['cagr']}"
+
+
+TESTS = [test_panels_pit_and_shapes, test_gcore_reproduces_prototype]
 
 
 def _run(fns):
