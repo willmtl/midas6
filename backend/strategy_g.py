@@ -54,6 +54,12 @@ def build_panels(uni, tgts):
     midx = mclose.index
 
     # implied-upside panel: median target within trailing STALE_DAYS, / month-end close - 1
+    # SPLIT-ADJUST TARGETS (correctness — same bug fixed in the flagship): analyst price targets are quoted in the
+    # raw as-of-date share basis, but Candle.close is split-ADJUSTED. Dividing a pre-split target by a post-split
+    # adjusted price inflates upside by the split ratio (e.g. PIPR +424% -> +31% after its 4:1). Put each target on
+    # the present-adjusted basis: T_adj = T / (product of split ratios STRICTLY AFTER the target's date).
+    import price_basis
+    _splits = price_basis.load_splits()
     midx_i = np.array([t.value for t in midx], dtype="int64")
     stale = STALE_DAYS * 86400 * 10**9
     ups = pd.DataFrame(np.nan, index=midx, columns=mclose.columns)
@@ -61,7 +67,18 @@ def build_panels(uni, tgts):
         pts = tgts.get(tk)
         if not pts:
             continue
-        arr = np.array(sorted(pts)); di, tv = arr[:, 0], arr[:, 1]
+        arr = np.array(sorted(pts)); di, tv = arr[:, 0], arr[:, 1].astype(float)
+        sm = _splits.get(tk)
+        if sm:                                             # divide each target by splits occurring after its date
+            sd = sorted((pd.Timestamp(ds).value, float(r)) for ds, r in sm.items())
+            fac = np.ones(len(di))
+            for k in range(len(di)):
+                f = 1.0
+                for sts, r in sd:
+                    if sts > di[k]:
+                        f *= r
+                fac[k] = f
+            tv = tv / fac
         col = np.full(len(midx), np.nan)
         for j, d in enumerate(midx_i):
             a = np.searchsorted(di, d - stale, side="right"); b = np.searchsorted(di, d, side="right")

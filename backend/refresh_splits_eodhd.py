@@ -25,8 +25,25 @@ for hf in ["flagship_history", "flagship_history_core", "flagship_history_middle
         for m in J.get("months", []):
             for pk in m.get("picks", []):
                 picks.add(pk["ticker"])
-tickers = sorted(set(old.keys()) | picks)
-print(f"universe to refresh: {len(tickers)} ({len(old)} cached + {len(picks)} pick-names)  key set: {bool(KEY)}", flush=True)
+# Strategy G universe: every analyst-covered US non-ETF name (same filter as strategy_g.build_universe)
+gnames = set()
+rp = "/app/.data/analyst_ratings.jsonl"
+if os.path.exists(rp):
+    from pathlib import Path as _P
+    for line in _P(rp).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        tk = r.get("ticker")
+        if tk and r.get("price_target") and "." not in tk:
+            gnames.add(tk)
+universe = set(old.keys()) | picks | gnames
+todo = sorted(t for t in universe if t not in old)          # only fetch names not already in the (refreshed) cache
+print(f"universe {len(universe)} ({len(old)} cached + {len(picks)} picks + {len(gnames)} analyst) -> fetching {len(todo)} new  key={bool(KEY)}", flush=True)
+tickers = todo
 
 
 def eodhd_sym(tk):

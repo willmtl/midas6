@@ -1,7 +1,13 @@
 # Strategy G — Analyst-Gap Diversified Value Book — Design
 
 **Date:** 2026-08-21
-**Status:** Approved (design), pending implementation plan
+**Status:** ⛔ REFUTED (2026-08-21) — implemented, then killed. The entire backtested edge was a
+split-adjustment data bug: `upside = analyst_target / adjusted_close` divided UNADJUSTED analyst targets
+by SPLIT-ADJUSTED prices. Once targets are split-adjusted (each divided by the product of split ratios
+after its date, using the EODHD-refreshed `splits_cache`), G-core is **CAGR +7.8% / maxDD −57.4% /
+Sharpe 0.40**, losing to SPY (15.1% / −24% / 1.01) in every walk-forward window (verdict: fragile). All
+the headline numbers below (+1,648% / CAGR 31% / DD −24%) are BOGUS artifacts of the bug. Build left in
+place but inert. Do not deploy. Lesson: any analyst-target signal MUST split-adjust targets first.
 **Author:** William + Claude
 
 ## Problem
