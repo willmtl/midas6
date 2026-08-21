@@ -138,6 +138,22 @@ def sim(P, top_frac=TOP_FRAC, profit_gate=True, weight="equal", cost_bps=0.0):
                 turnover=float(np.mean(turns)) if turns else float("nan"), holdings=holdings)
 
 
+def latest_picks(P, top_frac=TOP_FRAC, profit_gate=True):
+    """Actionable holdings for the MOST RECENT month-end (no forward return needed — for the live scanner).
+    Same candidate/gate/rank logic as sim(). Returns (date_iso, [{ticker, upside, close}, ...])."""
+    mclose, mdvol, ups = P["mclose"], P["mdvol"], P["ups"]
+    d = P["midx"][-1]
+    u = ups.loc[d].dropna(); dv = mdvol.loc[d]; cl = mclose.loc[d]
+    cand = [t for t in u.index if t != "SPY" and pd.notna(dv.get(t)) and dv[t] >= DVOL_FLOOR
+            and pd.notna(cl.get(t)) and cl[t] > PRICE_FLOOR]
+    if profit_gate:
+        cand = [t for t in cand if profit_ok(P, d, t)]
+    ranked = u[cand].sort_values(ascending=False)
+    k = max(1, int(len(ranked) * top_frac))
+    hold = list(ranked.index[:k])
+    return d.date().isoformat(), [dict(ticker=t, upside=float(u[t]), close=float(cl[t])) for t in hold]
+
+
 def perf(ret, spy_ret, posw=None):
     """Summary stats. Percentages as numbers (e.g. 31.1). Returns dict(total,cagr,sharpe,maxdd,hit,beat_spy,n_mo,pos_win)."""
     pr = ret.dropna(); eq = np.cumprod(1 + pr.values)
