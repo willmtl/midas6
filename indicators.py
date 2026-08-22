@@ -4,14 +4,15 @@ Stock Market Trend Bot - Indicators
 Rolling Sortino ratio and RSI with SMA crossover detection.
 """
 
+import os
 import numpy as np
 import pandas as pd
 import ta
 
 import config
 
-RSI_PERIOD = 10
-RSI_SMA_PERIOD = 10
+RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "10"))    # env-overridable for RSI-period experiments (default 10)
+RSI_SMA_PERIOD = int(os.environ.get("RSI_SMA_PERIOD", "10"))
 
 # MACD parameters (standard 12/26/9 on daily closes)
 MACD_FAST = 12
