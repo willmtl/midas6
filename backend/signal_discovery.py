@@ -31,22 +31,20 @@ EXIT_SET = ["1d", "3d", "1w", "2w", "4w", "8w", "12w", "6m",     # fixed horizon
 
 
 def _universe():
-    """Survivorship-aware: analyst-covered US names ∪ delisted-with-candles, minus ETFs. Avoids the
-    Candle-hypertable DISTINCT trap (built from the ratings file + DelistedCompany)."""
+    """Comprehensive US common-stock universe: ALL distinct candle tickers that look US-listed (no '.' exchange
+    suffix) minus ETFs, ∪ delisted-with-candles (survivorship). Liquidity/quality handled at TEST time
+    ($5M/day + >$5). Distinct pulled via parallel-safe GROUP BY (avoids the Candle-hypertable DISTINCT DiskFull
+    trap). Returns (sorted universe, delisted set)."""
     from core.models import Sector, DelistedCompany
+    from django.db import connection
     etfs = set(Sector.objects.values_list("etf", flat=True)) | {"SPY", "QQQ"}
-    covered = set()
-    for line in Path("/app/.data/analyst_ratings.jsonl").read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            tk = json.loads(line).get("ticker")
-        except Exception:
-            tk = None
-        if tk and "." not in tk:
-            covered.add(tk)
+    with connection.cursor() as c:
+        c.execute("SET max_parallel_workers_per_gather=0")
+        c.execute("SELECT ticker FROM core_candle GROUP BY ticker")
+        allt = set(r[0] for r in c.fetchall())
+    us = {t for t in allt if "." not in t}                    # drop foreign (.TO/.L/... carry an exchange suffix)
     delisted = set(DelistedCompany.objects.exclude(delisted_date=None).values_list("ticker", flat=True))
-    return sorted((covered | delisted) - etfs), delisted
+    return sorted((us | (delisted & allt)) - etfs), delisted
 
 
 def _wins(x):
@@ -98,13 +96,19 @@ def _worker(payload):
     for tk, sdf in candles.items():
         if len(sdf) < MIN_BARS:
             continue
-        _prepare_indicators(sdf); _prepare_alt(sdf, insider.get(tk), filings.get(tk))
         close = sdf["Close"].values; vol = sdf["Volume"].values; n = len(close)
         dvol20 = pd.Series(close * vol).rolling(20, min_periods=10).mean().values
+        # LIQUIDITY PRECHECK: skip names that NEVER clear the floor — they yield zero events but would cost the
+        # full 366-signal computation. Correctness-neutral (those events are floored out anyway); big speedup.
+        if not np.any((dvol20 >= DVOL_FLOOR) & (close > PRICE_FLOOR)):
+            continue
+        _prepare_indicators(sdf); _prepare_alt(sdf, insider.get(tk), filings.get(tk))
         dates = sdf.index
         bench_al = ew_level.reindex(dates).values                 # EW-universe index aligned to this ticker's dates
         bull_al = (spy_c.reindex(dates) > spy_ma.reindex(dates)).values
-        for sk in signal_keys:
+        exit_cache = {}                                           # (ek, idx) -> exit_idx; the exit depends only on
+        _MISS = object()                                          # (df, idx), so reuse across the many signals that
+        for sk in signal_keys:                                    # fire on the same bar (~10x fewer exit computations)
             try:
                 sig = SIGNALS[sk][1](sdf).fillna(False)
             except Exception:
@@ -125,12 +129,16 @@ def _worker(payload):
                 reg = "bull" if bool(bull_al[idx]) else "bear"
                 ym = f"{dates[idx].year}-{dates[idx].month:02d}"
                 for ek, fn in exit_fns.items():
-                    try:
-                        xi = fn(sdf, idx)
-                    except Exception:
-                        xi = None
-                    if xi is None or xi >= n:
-                        xi = n - 1                                # SURVIVORSHIP: exit at last bar (delisting outcome)
+                    ck = (ek, idx)
+                    xi = exit_cache.get(ck, _MISS)
+                    if xi is _MISS:
+                        try:
+                            xi = fn(sdf, idx)
+                        except Exception:
+                            xi = None
+                        if xi is None or xi >= n:
+                            xi = n - 1                            # SURVIVORSHIP: exit at last bar (delisting outcome)
+                        exit_cache[ck] = xi
                     if xi <= idx:
                         continue
                     b1 = bench_al[xi]
@@ -191,7 +199,7 @@ def run(jobs, limit=None, signal_keys=None, save_db=True):
     if jobs <= 1:
         _mrg(_worker((sig_keys, EXIT_SET, universe, ew_level, spy_c)))
     else:
-        chunks = _chunk(universe, jobs * 3)
+        chunks = _chunk(universe, jobs * 8)                   # smaller chunks -> lower per-worker memory (OOM guard)
         ctx = mp.get_context("spawn")
         with cf.ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as ex:
             futs = [ex.submit(_worker, (sig_keys, EXIT_SET, ch, ew_level, spy_c)) for ch in chunks]
