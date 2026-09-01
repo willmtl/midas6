@@ -48,10 +48,14 @@ def build_universe():
 
 
 def load_candles(tickers, interval="1d"):
+    import os
     import pandas as pd
     from core.models import Candle
     qs = (Candle.objects.filter(ticker__in=list(tickers), interval=interval)
           .values_list("ticker", "date", "open", "high", "low", "close", "volume"))
+    _as_of = os.environ.get("AS_OF")   # PIT re-run: pin the latest bar to this date (YYYY-MM-DD). Unset = live.
+    if _as_of:
+        qs = qs.filter(date__lte=_as_of)
     big = pd.DataFrame.from_records(
         list(qs), columns=["ticker", "date", "Open", "High", "Low", "Close", "Volume"])
     if big.empty:

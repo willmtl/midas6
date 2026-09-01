@@ -1285,6 +1285,227 @@ def _eodhd_get(path, **params):
         return None
 
 
+def _eodhd_eod(sym, frm, tries=5):
+    """EODHD daily-EOD fetch with 429-aware backoff. Unlike `_eodhd_get` (which swallows every error
+    into None, so a rate-limit is indistinguishable from no-data and never retried), this RAISES nothing
+    but genuinely retries on HTTP 429 with linear backoff. Returns a list of bar dicts, or None on any
+    non-recoverable error / exhausted retries."""
+    import os, json, time, urllib.request, urllib.parse, urllib.error
+    key = os.environ.get("EODHD_API_KEY")
+    if not key:
+        return None
+    url = "https://eodhd.com/api/eod/" + sym + "?" + urllib.parse.urlencode(
+        {"from": frm, "period": "d", "api_token": key, "fmt": "json"})
+    req = urllib.request.Request(url, headers={"User-Agent": "rotation/1.0"})
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=40) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and i < tries - 1:
+                time.sleep(2 * (i + 1)); continue          # rate-limited: back off and retry
+            return None
+        except Exception:
+            return None
+    return None
+
+
+def _eodhd_rows(tk, frm):
+    """Fetch EODHD adjusted daily bars for a ticker -> [Candle(...)] (empty list if unavailable).
+    Storage matches the auto_adjust convention: close = adjusted_close; open/high/low = raw*(adj/close);
+    volume = raw. interval='1d'. Mirrors fetch_candles_eodhd.py so the hourly path and the repair tool
+    agree bar-for-bar."""
+    sym = _eodhd_sym(tk)
+    if sym is None:
+        return []
+    resp = _eodhd_eod(sym, frm)
+    if not isinstance(resp, list) or not resp:
+        return []
+    out = []
+    for r in resp:
+        d = r.get("date"); cl = r.get("close"); adj = r.get("adjusted_close", cl)
+        if not d or cl in (None, "") or adj in (None, ""):
+            continue
+        try:
+            cl = float(cl); adj = float(adj); fac = adj / cl if cl else 1.0
+            o = float(r.get("open") or cl) * fac
+            h = float(r.get("high") or cl) * fac
+            lo = float(r.get("low") or cl) * fac
+            vol = int(float(r.get("volume") or 0))
+        except (TypeError, ValueError):
+            continue
+        if adj <= 0:
+            continue
+        out.append(Candle(ticker=tk, date=d, interval="1d", open=o, high=h, low=lo, close=adj, volume=vol))
+    return out
+
+
+def _eodhd_bulk_day(date_str, tries=5):
+    """EODHD BULK end-of-day for ALL US tickers on `date_str` in ONE call. Returns {code: row} or {}.
+    This is the daily-increment workhorse: one request covers the whole US market, so it sidesteps the
+    per-ticker rate limit (the 429 storms) AND the individual /eod endpoint's occasional bad adjustment
+    factor (the bulk feed's adjusted_close matched raw for every flagship name in the audit). 429-aware."""
+    import json, time, urllib.request, urllib.parse, urllib.error
+    key = os.environ.get("EODHD_API_KEY")
+    if not key:
+        return {}
+    url = "https://eodhd.com/api/eod-bulk-last-day/US?" + urllib.parse.urlencode(
+        {"date": date_str, "api_token": key, "fmt": "json"})
+    req = urllib.request.Request(url, headers={"User-Agent": "rotation/1.0"})
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            return {x["code"]: x for x in data if isinstance(x, dict) and x.get("code")} if isinstance(data, list) else {}
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and i < tries - 1:
+                time.sleep(2 * (i + 1)); continue
+            return {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _bulk_candle(tk, r, date_str):
+    """Build one adjusted Candle from a bulk-EOD record (same storage convention as _eodhd_rows)."""
+    cl = r.get("close"); adj = r.get("adjusted_close", cl)
+    if cl in (None, "") or adj in (None, ""):
+        return None
+    try:
+        cl = float(cl); adj = float(adj); fac = adj / cl if cl else 1.0
+        o = float(r.get("open") or cl) * fac
+        h = float(r.get("high") or cl) * fac
+        lo = float(r.get("low") or cl) * fac
+        vol = int(float(r.get("volume") or 0))
+    except (TypeError, ValueError):
+        return None
+    if adj <= 0:
+        return None
+    return Candle(ticker=tk, date=r.get("date") or date_str, interval="1d",
+                  open=o, high=h, low=lo, close=adj, volume=vol)
+
+
+def import_candles_eodhd_task(jobs=3):
+    """HOURLY candle refresh via EODHD (paid, egress works from this container) — the replacement for the
+    yfinance `import_candles_task`, which cannot reach the internet here and therefore left prices silently
+    frozen (the reason month-end data had to be hand-backfilled). Covers the SAME universe the strategy
+    reads (sector ETFs + SPY + commodity anchors/proxies + every ticker with candles + the fundamentals
+    universe).
+
+    TWO fetch paths:
+      • BULK (the common case): up-to-date US tickers are refreshed via `eod-bulk-last-day` — ONE call per
+        recent trading day covers the entire US market, so no per-ticker 429 storm and no individual-endpoint
+        adjustment quirk.
+      • INDIVIDUAL: full 11y rebuilds (missing/truncated series, last bar >1y old), non-US listings, and any
+        US name behind by more than the bulk window fall back to the per-ticker /eod endpoint (429 backoff).
+    Both replace the trailing window before insert so a FINAL bar overwrites an intraday partial, and both are
+    NON-DESTRUCTIVE: rows are deleted only AFTER a non-empty fetch, so a failed/429 fetch never wipes history
+    and self-heals next run. DB writes are serial."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from django.db.models import Max
+    if config is None:
+        logger.error("config module not found"); return
+    YEARS = int(os.environ.get("CANDLE_YEARS", "11"))     # keep 11y so backtests trade THROUGH 2020 (see fetch_candles_eodhd.py)
+
+    tickers = list(config.SECTOR_ETFS.values()) + [config.BENCHMARK]
+    comm = set()
+    for anchor, ps in COMMODITY_THEMES.values():
+        if anchor != "BASKET":
+            comm.add(anchor)
+        comm.update(ps)
+    existing = list(Candle.objects.filter(interval="1d").values_list("ticker", flat=True).distinct())
+    try:
+        from seq_fundamental_study import build_universe
+        universe = list(build_universe())
+    except Exception as e:
+        logger.warning("build_universe failed in eodhd candle import: %s", e); universe = []
+    # skip futures/indices (=F, ^VIX) — EODHD EOD mapping differs and _eodhd_sym returns None for =F anyway
+    tickers = [t for t in dict.fromkeys(tickers + sorted(comm) + existing + universe)
+               if "=F" not in t and not t.startswith("^")]
+    today = date.today()
+    trunc_cut = today - timedelta(days=365)               # last bar older than ~1y => treat as truncated/corrupt
+
+    last_by_ticker = {r["ticker"]: r["last"] for r in
+                      Candle.objects.filter(ticker__in=tickers, interval="1d")
+                      .values("ticker").annotate(last=Max("date"))}
+
+    BULK_WINDOW = 20                                       # days back the bulk path will refresh (covers short gaps)
+    us_bulk = [t for t in tickers if "." not in t
+               and last_by_ticker.get(t) is not None
+               and last_by_ticker[t] >= today - timedelta(days=BULK_WINDOW)]
+    us_bulk_set = set(us_bulk)
+    indiv = [t for t in tickers if t not in us_bulk_set]   # full/truncated, non-US, far-behind US -> per-ticker
+
+    # ── BULK path: up-to-date US tickers, one call per recent trading day for the whole market ──
+    bulk_bars = 0
+    if us_bulk:
+        start = max(min(last_by_ticker[t] for t in us_bulk), today - timedelta(days=BULK_WINDOW))
+        by_date, n_calls, d = {}, 0, start
+        while d <= today:
+            day = _eodhd_bulk_day(d.isoformat()); n_calls += 1
+            if day:
+                by_date[d] = day
+            d += timedelta(days=1)
+        Candle.objects.filter(ticker__in=us_bulk, interval="1d", date__gte=start).delete()  # drop partials in window
+        objs = []
+        for d, day in by_date.items():
+            for tk in us_bulk:
+                r = day.get(tk)
+                if r:
+                    c = _bulk_candle(tk, r, d.isoformat())
+                    if c:
+                        objs.append(c)
+        if objs:
+            Candle.objects.bulk_create(objs, ignore_conflicts=True, batch_size=5000); bulk_bars = len(objs)
+        logger.info("EODHD bulk-day: %d US tickers, %s..%s (%d calls) -> %d bars",
+                    len(us_bulk), start, today, n_calls, bulk_bars)
+
+    # ── INDIVIDUAL path: full rebuilds + non-US + far-behind US ──
+    def _plan(tk):
+        last = last_by_ticker.get(tk)
+        if last is None or last < trunc_cut:
+            return tk, "full", (today - timedelta(days=int(YEARS * 365.25))).isoformat(), None
+        start = last - timedelta(days=3)                   # small trailing window; final replaces partials
+        return tk, "inc", start.isoformat(), start
+
+    plans = [_plan(t) for t in indiv]
+    n_full = sum(1 for p in plans if p[1] == "full")
+    logger.info("EODHD individual: %d tickers (%d full/truncated, %d incremental), jobs=%d",
+                len(indiv), n_full, len(indiv) - n_full, jobs)
+
+    # Fetch in parallel; WRITE per-ticker in the main thread as each completes, so progress persists even
+    # if the run is interrupted (and Django DB connections aren't shared across threads).
+    restored = incremental = skipped = 0
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        futs = {ex.submit(_eodhd_rows, tk, frm): (tk, mode, since) for tk, mode, frm, since in plans}
+        for f in as_completed(futs):
+            tk, mode, since = futs[f]
+            try:
+                objs = f.result()
+            except Exception:
+                objs = []
+            if not objs:                                   # empty/failed/429 -> leave existing rows untouched
+                skipped += 1; continue
+            if mode == "full":
+                Candle.objects.filter(ticker=tk, interval="1d").delete()
+                Candle.objects.bulk_create(objs, ignore_conflicts=True, batch_size=5000); restored += 1
+            else:
+                Candle.objects.filter(ticker=tk, interval="1d", date__gte=since).delete()   # drop partials in window
+                Candle.objects.bulk_create(objs, ignore_conflicts=True, batch_size=5000); incremental += 1
+
+    fresh_cut = today - timedelta(days=5)
+    stale = sorted(r["ticker"] for r in
+                   Candle.objects.filter(ticker__in=tickers, interval="1d")
+                   .values("ticker").annotate(last=Max("date")) if r["last"] and r["last"] < fresh_cut)
+    if stale:
+        logger.warning("CANDLE FRESHNESS (eodhd): %d/%d still stale (>5d) after import: %s%s",
+                       len(stale), len(tickers), stale[:25], " …" if len(stale) > 25 else "")
+    else:
+        logger.info("CANDLE FRESHNESS (eodhd): all %d tickers current (<=5d).", len(tickers))
+    return {"tickers": len(tickers), "bulk_bars": bulk_bars, "full": restored, "incremental": incremental,
+            "indiv_skipped": skipped, "stale_after": len(stale)}
+
+
 def import_eodhd_news(tickers=None, days=400, per=1000, max_pages=1000, sleep=0.02):
     """Pull EODHD news + sentiment → NewsItem, PAGINATED (EODHD returns newest-first, capped at
     `limit` per call, so we page with `offset` to reach deep history). `days` sets how far back

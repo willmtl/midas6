@@ -213,9 +213,111 @@ def build():
     return payload
 
 
+def _freshness_gate(min_cov=0.90):
+    """GUARD (2026-09): refuse to publish a basket when the candle feed is behind the market or grossly
+    incomplete — the exact failure that produced a bogus September basket (feed frozen at 08-28 while the
+    market was at 08-31, so the engine ranked candidates on stale prices). Raises SystemExit (non-zero)
+    rather than clobber the last good BacktestResult[rotation_picks]. Set ROTATION_SKIP_GATE=1 to override."""
+    import os as _os, datetime as _dt
+    if _os.environ.get("ROTATION_SKIP_GATE"):
+        print("freshness gate: SKIPPED (ROTATION_SKIP_GATE set)", flush=True); return
+    from core.models import Candle
+    from django.db.models import Max
+    frontier = Candle.objects.filter(interval="1d").aggregate(m=Max("date"))["m"]
+    if frontier is None:
+        raise SystemExit("FRESHNESS GATE: no candles at all — refusing to publish.")
+    # The bar the pool must have reached = EODHD's true last COMPLETED trading day (SPY, external truth).
+    # (Not our own max date — a handful of intraday-partial bars can push that a day ahead of the market.)
+    target = None
+    try:
+        from api.tasks import _eodhd_eod
+        spy = _eodhd_eod("SPY.US", (_dt.date.today() - _dt.timedelta(days=12)).isoformat())
+        target = _dt.date.fromisoformat(spy[-1]["date"]) if spy else None
+    except Exception as e:
+        print("freshness gate: could not fetch true LTD; falling back to DB frontier:", e, flush=True)
+    if target is None:
+        target = frontier
+    # US/CA candidate coverage at/after the target trading day (chronically-dead names tolerated by the ratio)
+    try:
+        from seq_fundamental_study import build_universe
+        cand = [t for t in build_universe() if ("." not in t) or t.rsplit(".", 1)[-1] in ("TO", "V")]
+        agg = Candle.objects.filter(interval="1d", ticker__in=cand).values("ticker").annotate(mx=Max("date"))
+        cur = sum(1 for r in agg if r["mx"] and r["mx"] >= target)
+        cov = cur / max(len(cand), 1)
+        print(f"freshness gate: target(true LTD)={target}, db_frontier={frontier}, "
+              f"US/CA coverage {cur}/{len(cand)} = {cov:.1%}", flush=True)
+        if cov < min_cov:
+            raise SystemExit(f"FRESHNESS GATE FAILED: only {cov:.1%} of US/CA candidates reached the market's "
+                             f"last trading day {target} (<{min_cov:.0%}) — feed stale/half-updated. Run the EODHD "
+                             f"updater before publishing; NOT overwriting the last good basket.")
+    except SystemExit:
+        raise
+    except Exception as e:
+        print("freshness gate: completeness check skipped (infra):", e, flush=True)
+    print("freshness gate: PASS", flush=True)
+
+
+def _pin_gate():
+    """PIN (2026-09): the flagship REBALANCES MONTHLY at month-end. The live basket must be the pick from the
+    last COMPLETED month-end and stay LOCKED for the rest of the month — otherwise the nightly scan overwrites
+    it with an in-progress (partial-month) ranking that keeps churning as new daily bars land (the exact thing
+    that made the September basket look unstable). Two guarantees:
+      1. Pin the engine to the last completed month-end via AS_OF -> the pick is DETERMINISTIC all month
+         (ranks on the finalized month, never on the partial current month).
+      2. Publish a rebalance ONCE per period: if the already-published basket is for this same month, don't
+         re-run at all (LOCK it, immune to any mid-month data drift); only recompute when a NEW month-end has
+         both passed AND landed in the feed.
+    Returns the pinned month-end (also exported as AS_OF), or raises SystemExit(0) to keep the last-good basket.
+    Override with ROTATION_SKIP_PIN=1 to publish the live partial-month preview instead."""
+    import os as _os, datetime as _dt
+    today = _dt.date.today()
+    this_me = (_dt.date(today.year, 12, 31) if today.month == 12
+               else _dt.date(today.year, today.month + 1, 1) - _dt.timedelta(days=1))
+    last_me = this_me if today >= this_me else (today.replace(day=1) - _dt.timedelta(days=1))
+    if _os.environ.get("ROTATION_SKIP_PIN"):
+        print(f"pin gate: SKIPPED (ROTATION_SKIP_PIN) — publishing live partial-month preview, "
+              f"NOT pinned to {last_me}", flush=True)
+        return None
+    # Already locked for this rebalance period? -> do not re-run, do not overwrite.
+    try:
+        from core.models import BacktestResult
+        cur = BacktestResult.objects.filter(kind="rotation_picks").values_list("payload", flat=True).first()
+        aom = (cur or {}).get("as_of_month")
+        if aom:
+            d = _dt.date.fromisoformat(str(aom)[:10])
+            if (d.year, d.month) == (last_me.year, last_me.month):
+                print(f"pin gate: basket for {last_me:%Y-%m} already LOCKED (as_of {d}) — not re-running "
+                      f"mid-month; last-good basket preserved.", flush=True)
+                raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print("pin gate: could not read existing basket (will proceed):", e, flush=True)
+    # New rebalance period — but only publish once the month-end bar has actually landed in the feed, so we
+    # rebalance on the FINAL month-end close, not a half-posted one.
+    try:
+        from api.tasks import _eodhd_eod
+        spy = _eodhd_eod("SPY.US", (today - _dt.timedelta(days=12)).isoformat())
+        ltd = _dt.date.fromisoformat(spy[-1]["date"]) if spy else None
+        if ltd and ltd < last_me:
+            print(f"pin gate: rebalance to {last_me} PENDING — month-end bar not in feed yet "
+                  f"(market LTD={ltd}); keeping last-good basket until it posts.", flush=True)
+            raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print("pin gate: LTD check skipped (infra):", e, flush=True)
+    _os.environ["AS_OF"] = last_me.isoformat()
+    print(f"pin gate: NEW rebalance -> pinning engine to month-end {last_me} (AS_OF={last_me.isoformat()})",
+          flush=True)
+    return last_me
+
+
 def main():
     global OUT
     OUT = HERE / ".data" / "studies" / "rotation_picks.json"
+    _pin_gate()          # lock the basket to the last completed month-end (monthly rebalance); may exit 0
+    _freshness_gate()
     payload = build()
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(payload, indent=2, default=str))

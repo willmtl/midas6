@@ -13,11 +13,15 @@ def update_candles():
     """
     Hourly task: fetch missing candle data up to current day.
     Current day is always re-fetched (market may still be open).
+
+    Uses the EODHD path (paid API, egress works from this container). The legacy yfinance
+    `import_candles_task` cannot reach the internet here — it left prices silently frozen and forced
+    manual month-end backfills — so it is kept only as a reference/fallback and no longer scheduled.
     """
-    from api.tasks import import_candles_task
-    logger.info("Starting hourly candle update")
-    import_candles_task()
-    logger.info("Hourly candle update complete")
+    from api.tasks import import_candles_eodhd_task
+    logger.info("Starting hourly candle update (EODHD)")
+    result = import_candles_eodhd_task()
+    logger.info("Hourly candle update complete: %s", result)
 
 
 @shared_task
