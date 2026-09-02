@@ -173,28 +173,44 @@ def _available_at(series, date):
     return bool(pd.notna(s) and s > 0)
 
 
-def _ret_delist(series, date, end):
+def _ret_delist(series, date, end, daily=None):
     """Hold-period return date->end. If the name has no valid price at `end` (delisted/halted mid-
     hold), realize at the LAST traded price on or before `end` — a delisting is a real exit, not a
     reason to drop the trade. Requiring a price AT `end` (old `_ret`) was survivorship LOOKAHEAD: it
-    filtered selection on which names survived the holding period."""
+    filtered selection on which names survived the holding period.
+
+    `daily` (optional): the name's DAILY close series (local ccy). When a delisting has no valid `end`
+    price, the terminal exit is realized on the daily series (its own last-trade ratio) rather than the
+    stale monthly close — this captures a final-month collapse to pennies that a month-end print sampled
+    *before* the crater misses, so genuine bankruptcies are penalized properly. It is still last-traded-
+    price (an orderly acquisition exits near its last daily/deal price too), never a blanket -100%. FX is
+    ~flat over the partial delisting month and =1 for the US/CA book, so the local daily ratio is used
+    directly (consistent with the USD entry to within a slow-FX drift on a single terminal month)."""
     if not _available_at(series, date):
         return None
     s = series.loc[date]
     e = series.loc[end] if end in series.index else None
     if pd.notna(e) and e and e > 0:
-        return e / s - 1
+        return e / s - 1                        # normal: a valid month-end exit price exists (no delisting)
+    # ── DELISTING: realize at the last traded price. Prefer DAILY granularity (see docstring). ──
+    if daily is not None:
+        try:
+            d0 = daily[daily.index <= pd.Timestamp(date)].dropna(); d0 = d0[d0 > 0]
+            de = daily[(daily.index > pd.Timestamp(date)) & (daily.index <= pd.Timestamp(end))].dropna(); de = de[de > 0]
+            if len(d0) and len(de):
+                return float(de.iloc[-1]) / float(d0.iloc[-1]) - 1
+        except Exception:
+            pass
     win = series.loc[date:end].dropna()
     win = win[win > 0]
     if len(win) == 0:            # no valid price at all in the window (entry non-positive) -> can't realize
         return None
-    # Delisting = exit at the LAST TRADED price (deal price for an M&A/going-private, last print for a fade).
-    # The old blanket -100% here was a BUG: it treated EVERY acquisition/rename/data-gap as a total loss
-    # (e.g. STMP/Stamps.com acquired @ $330 was booked at -100%), biasing delist-aware backtests badly
-    # pessimistic. When only the entry price survives (data ends at entry, len==1), this returns 0% = a flat
-    # exit at last-known price. LIMITATION: genuine gap-to-zero bankruptcies with no intermediate monthly
-    # print are now under-penalized (booked flat, not -100%); without a delisting-reason/daily feed this is
-    # the least-biased default. See memory delisted-survivorship / verify_survivorship.py.
+    # Monthly fallback (no daily provided). NOTE the old blanket -100% here was a BUG: it treated EVERY
+    # acquisition/rename/data-gap as a total loss (e.g. STMP/Stamps.com acquired @ $330 booked at -100%),
+    # biasing delist-aware backtests pessimistic. When only the entry price survives (len==1) this returns
+    # 0% (flat exit). Without a delisting-reason feed, last-traded-price is the least-biased default; the
+    # `daily` path above narrows the residual under-penalization of fast bankruptcies. See memory
+    # delisted-survivorship / verify_survivorship.py.
     return win.iloc[-1] / s - 1
 
 

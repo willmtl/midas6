@@ -105,6 +105,42 @@ def _short_interest_panel(midx, cols, stale_days=45):
     return pd.DataFrame(out).reindex(index=midx, columns=cols)
 
 
+def _si_pct_panel(midx, cols, shares_out, stale_days=75, pub_lag_bd=10):
+    """PIT short-interest as a FRACTION of shares outstanding, from .data/short_interest.jsonl (Polygon/FINRA
+    bi-monthly). short_interest (shares) is dated by settlement_date but only DISSEMINATED ~10 business days later,
+    so a reading is made available at settlement_date + `pub_lag_bd` bdays (no look-ahead), ffill'd to each
+    month-end (drop if older than `stale_days`), then / shares_out (=mktcap/price, so quote-currency cancels)."""
+    import json
+    from collections import defaultdict
+    p = Path("/app/.data/short_interest.jsonl")
+    if not p.exists():
+        return pd.DataFrame(index=midx, columns=cols)
+    colset = set(cols)
+    byt = defaultdict(list)
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("short_interest") is not None and r.get("settlement_date") and r.get("ticker") in colset:
+            avail = pd.Timestamp(r["settlement_date"]) + pd.tseries.offsets.BusinessDay(pub_lag_bd)
+            byt[r["ticker"]].append((avail, float(r["short_interest"])))
+    out = {}
+    midx_ser = pd.Series(midx, index=midx)
+    for tk, pts in byt.items():
+        s = pd.Series({d: v for d, v in pts}).sort_index()
+        s = s[~s.index.duplicated(keep="last")]
+        val = s.reindex(s.index.union(midx)).sort_index().ffill().reindex(midx)
+        li = s.index
+        last_date = pd.Series([li[li <= d][-1] if len(li[li <= d]) else pd.NaT for d in midx], index=midx)
+        age = (midx_ser - last_date).dt.days
+        out[tk] = val.where(age <= stale_days)
+    short_sh = pd.DataFrame(out).reindex(index=midx, columns=cols)
+    return short_sh / shares_out.where(shares_out > 0)
+
+
 def _analyst_upside_panel(midx, px_panel, stale_days=None, consensus=True):
     if stale_days is None:
         stale_days = int(os.environ.get("ANALYST_STALE_DAYS", "180"))   # coverage/staleness dial (ANALYST_LAB)
@@ -144,6 +180,28 @@ def _analyst_upside_panel(midx, px_panel, stale_days=None, consensus=True):
         out[tk] = col
     tgt_panel = pd.DataFrame(out, index=midx).reindex(columns=px_panel.columns)
     return (tgt_panel / px_panel.where(px_panel > 0)) - 1
+
+
+def _adj_shares_panel(reports_map, splits, midx):
+    """Split-CONSISTENT shares_outstanding (month x ticker), forward-filled by avail_date like _pit_monthly_panel
+    BUT each filing's AS-FILED share count is first converted to TODAY'S split basis (× the split factor STRICTLY
+    AFTER the filing date). This fixes shares going stale across a split: the as-filed count is otherwise ffilled
+    unchanged, so after e.g. NVDA's 2024 10:1 the pre-split 2.46B is carried ~8mo until the next filing and
+    mktcap (= price × shares) reads ~1/10th of true -> the name looks 10x too cheap on P/B. Adjusting at the
+    FILING (where the future-split factor is known) and ffilling the split-INVARIANT today-basis count is correct.
+    Market cap is then adjusted-close × these adjusted shares (both in today's units) = true, split-invariant cap.
+    Tickers absent from the splits cache are unchanged (factor 1.0), so non-splitters match the old path exactly."""
+    out = {}
+    for tk, r in reports_map.items():
+        if "shares_outstanding" not in r.columns:
+            continue
+        s = pd.Series(r["shares_outstanding"].values, index=pd.to_datetime(r["avail_date"])).dropna()
+        if s.empty:
+            continue
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        s = s * price_basis._future_split_factor(splits.get(tk, {}), s.index).values   # -> today's split basis
+        out[tk] = s.reindex(s.index.union(midx)).ffill().reindex(midx)
+    return pd.DataFrame(out)
 
 # exchange-suffix -> reporting/quote currency. Market cap is computed in the QUOTE currency (price*shares) then
 # converted to USD so the <$2B small-cap bucket is apples-to-apples. .L (London) quotes in PENCE -> ×0.01.
@@ -785,19 +843,28 @@ def build():
             entry = float(base)
         return float(end / entry - 1.0) if entry > 0 else None
     reps = load_financial_reports(universe)
-    sh, eq, ni, dt = (_pit_monthly_panel(reps, f, midx) for f in
-                      ("shares_outstanding", "total_equity", "net_income", "total_debt"))
-    common = stock_m.columns.intersection(sh.columns).intersection(eq.columns)
+    _splits = price_basis.load_splits()
+    sh_adj = _adj_shares_panel(reps, _splits, midx)   # split-consistent shares (today's basis) — see fn docstring
+    eq, ni, dt = (_pit_monthly_panel(reps, f, midx) for f in ("total_equity", "net_income", "total_debt"))
+    common = stock_m.columns.intersection(sh_adj.columns).intersection(eq.columns)
     R = lambda p: p.reindex(index=midx, columns=common)
-    px = stock_m[common]; sh, eq, ni, dt = R(sh), R(eq), R(ni), R(dt)
-    as_traded = price_basis.as_traded_close(px)
-    mktcap = as_traded * sh                       # QUOTE-currency market cap -> used for P/B (ratio, currency cancels)
+    px = stock_m[common]; sh, eq, ni, dt = R(sh_adj), R(eq), R(ni), R(dt)
+    as_traded = price_basis.as_traded_close(px, splits=_splits)
+    # market cap = ADJUSTED close × ADJUSTED (today-basis) shares -> both in today's split units, so the product
+    # is the true split-INVARIANT market cap. Identical to the old as_traded×nominal-shares for non-splitters and
+    # for names with no split between their last filing and the month; only fixes the stale-shares split window.
+    mktcap = px * sh                              # QUOTE-currency market cap -> used for P/B (ratio, currency cancels)
     pb = mktcap / eq.where(eq != 0)
     de = dt / eq.where(eq != 0)                    # debt-to-equity (PIT) — for the flagship-history trace
     # POINT-IN-TIME FX: we trade in USD, so returns must include FX gain/loss. Convert the price series to USD at
     # each date's historical rate; returns are then computed on the USD series (local_return × fx_return).
     usd_factor_m, ccy_ser = _usd_factor_matrix(list(common), midx)
-    ret_factor = usd_factor_m.fillna(1.0)         # unknown-ccy names: keep (no conv) rather than drop; logged below
+    # unknown-currency names (whole column NaN): keep unconverted (factor 1.0) rather than drop. But do NOT fill a
+    # MAPPED currency's LEADING gap (months before its FX history starts) with 1.0 — that stamps e.g. KRW as USD
+    # then jumps to the real ~0.00072 rate, injecting a fake ~-100% return the transition month. Leave those NaN
+    # so the name is simply excluded (via the notna gates) until its FX is available.
+    ret_factor = usd_factor_m.copy()
+    ret_factor[usd_factor_m.columns[usd_factor_m.isna().all()]] = 1.0
     px_usd = px * ret_factor                       # <- USD-translated price series (returns include FX P&L)
     as_traded_usd = as_traded * ret_factor
     mktcap_usd = mktcap * usd_factor_m             # size bucket: unknown ccy stays NaN (not classifiable as 'small')
@@ -807,7 +874,7 @@ def build():
     for cur, s in sorted(ccy_ser.items()):
         print(f"  FX {cur}->USD  first={s.iloc[0]:.4g} last={s.iloc[-1]:.4g} min={s.min():.4g} max={s.max():.4g}", flush=True)
     trap = (ni < 0) & (~(eq >= eq.shift(12))) & (~(ni > ni.shift(4)))
-    low = (dt / eq.where(eq != 0)) < 1.0
+    low = (eq > 0) & ((dt / eq.where(eq > 0)) < 1.0)   # D/E<1 among POSITIVE-equity names (neg equity is NOT "low debt")
     # ROE for the PREMIUM-NORMALIZED value test: justified P/B rises with ROE, so raw-cheapest-P/B avoids
     # quality (mega-caps like GOOG never qualify). P/B÷ROE = cheapness PER UNIT of quality (lower = cheaper).
     roe = ni / eq.where(eq != 0)
@@ -853,7 +920,7 @@ def build():
     fcfy_ttm = -(ttm_fcf / _ev.where(_ev > 0))             # highest FCF/EV -> negate so min = best
     # ANALYST implied-upside panel (PIT): (latest target within 90d) / month-close − 1. For mixing the Benzinga
     # signal into the flagship pick (tie-breaker / gate). Higher = more analyst upside.
-    upside_m = _analyst_upside_panel(midx, px).reindex(index=midx, columns=common)
+    upside_m = _analyst_upside_panel(midx, as_traded).reindex(index=midx, columns=common)  # as_traded (nominal): target/price is split-consistent (px is split-back-adjusted -> future-split look-ahead)
     _up_cov = float(upside_m.notna().mean().mean())
     print(f"analyst implied-upside panel: {upside_m.notna().any().sum()} names ever covered, "
           f"{100*_up_cov:.0f}% cell coverage", flush=True)
@@ -874,6 +941,7 @@ def build():
             _svol[tk] = dd["Close"].pct_change().rolling(126).std().resample("ME").last().reindex(midx)
     stock_vol = pd.DataFrame(_svol).reindex(index=midx, columns=common)
     si_days = _short_interest_panel(midx, common)                      # PIT short interest (days-to-cover)
+    si_pct_m = _si_pct_panel(midx, common, sh)                         # PIT SI as fraction of shares-out (SI_EXCLUDE_LAB)
     print(f"short-interest panel: {si_days.notna().any().sum()} names covered, "
           f"{100*float(si_days.notna().mean().mean()):.0f}% cell coverage", flush=True)
     QFACTORS = {
@@ -1074,13 +1142,15 @@ def build():
             defensive_riskoff=None, largecap_keep=None, sector_playbook=False, regime_switch=None,
             regime_lookback=6, regime_signal="vs", regime_hyst=0, no_cash=False, book="value",
             conv=None, conc_regime=None, entry=None, entry_k=5, flow_gate=False, live=False, conv_signal="ad",
-            wait_entry=None, small_max=None, lev_regime=None, small_min=0.0, min_dvol=None, rebal=1):
+            wait_entry=None, small_max=None, lev_regime=None, small_min=0.0, min_dvol=None, rebal=1,
+            exclude_si_pct=None, sel_regime=None):
         rets, spies, dl_picks, mrets = [], [], 0, []
         _step = int(rebal) if rebal else 1                 # rebalance cadence in months (1=monthly, 3=quarterly)
         _min_dvol = float(min_dvol) if min_dvol is not None else MIN_DVOL   # $/day liquidity floor (executability)
         _conv = float(conv) if conv is not None else CONV   # A/D-divergence conviction weight (default div_2x)
         _small_max = float(small_max) if small_max is not None else SMALL   # small-cap size ceiling
         _small_min = float(small_min)                                       # size FLOOR (drop the tiniest names)
+        _si_cols = set(si_pct_m.columns) if exclude_si_pct is not None else set()   # SI-EXCLUSION overlay universe
         def _entry_pick(cands):
             """Flagship default pick = cheapest (drift-)P/B, with optional ENTRY-TIMING on the stock's own RSI(10).
             entry=None reproduces the flagship exactly. Modes gate/reorder the `entry_k` cheapest names."""
@@ -1268,6 +1338,8 @@ def build():
             return _K[0]
         prev_held = set()          # last month's basket, for turnover-based transaction costs
         _base_lcm = largecap_mode  # base large-cap policy; regime_switch overrides it per-month
+        _base_vk = value_key       # base value metric; sel_regime may swap it per-month (regime-conditional SELECTION)
+        _base_conv = _conv         # base A/D conviction weight; sel_regime may crank it per-month
         # resolve the regime signal ONCE (which detector + hysteresis) for this run
         if regime_switch:
             _fw = regime_lookback if regime_lookback in regime_fav_by_w else 6
@@ -1340,38 +1412,38 @@ def build():
                 top = a.dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "weak":                        # BOTTOM-N by acceleration (WEAKEST sectors) — short-leg selector
                 top = a.dropna().sort_values(ascending=True).head(_tn).index
-            elif _sr == "mom6":                        # top-10 by 6mo momentum LEVEL (trend-following)
-                top = m6.dropna().sort_values(ascending=False).head(TOP_N).index
+            elif _sr == "mom6":                        # top-N by 6mo momentum LEVEL (trend-following)
+                top = m6.dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "up_and_accel":                # up AND accelerating (mom>0 & accel>0), by accel
-                top = a[(m6 > 0) & (a > 0)].dropna().sort_values(ascending=False).head(TOP_N).index
+                top = a[(m6 > 0) & (a > 0)].dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "up_decel":                    # UP but DECELERATING (mom>0 & accel<0), by momentum
-                top = m6[(m6 > 0) & (a < 0)].dropna().sort_values(ascending=False).head(TOP_N).index
+                top = m6[(m6 > 0) & (a < 0)].dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "up_any":                      # anything still UP (mom>0), by momentum (ignore accel)
-                top = m6[m6 > 0].dropna().sort_values(ascending=False).head(TOP_N).index
+                top = m6[m6 > 0].dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "down_turning":                # DOWN but turning up (mom<0 & accel>0), by accel — early reversal
-                top = a[(m6 < 0) & (a > 0)].dropna().sort_values(ascending=False).head(TOP_N).index
-            elif _sr == "accel_pos":                   # accel>0 filter then by accel (drops decel Q even if top-10)
-                top = a[a > 0].dropna().sort_values(ascending=False).head(TOP_N).index
+                top = a[(m6 < 0) & (a > 0)].dropna().sort_values(ascending=False).head(_tn).index
+            elif _sr == "accel_pos":                   # accel>0 filter then by accel (drops decel Q even if top-N)
+                top = a[a > 0].dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "mom_x_accel":                 # rank blend: momentum-rank + accel-rank
                 mr = m6.rank(pct=True); ar = a.rank(pct=True)
-                top = (mr + ar).dropna().sort_values(ascending=False).head(TOP_N).index
+                top = (mr + ar).dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "accel_inflect":               # CAPTURE SOONER: rank by CHANGE in accel (accel rising =
                 da = (accel.loc[date] - accel.iloc[i - 1]) if i >= 1 else a   # sector just STARTING to accelerate)
-                top = da.reindex(a.dropna().index).dropna().sort_values(ascending=False).head(TOP_N).index
+                top = da.reindex(a.dropna().index).dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "early":                       # CAPTURE SOONER: accelerating (accel>0) but price hasn't run
                 _c = a[(a > 0)].dropna()               # yet (mom6 below median) — catch the turn, not the top
                 if len(_c):
                     _med = m6.reindex(_c.index).median()
                     _e = _c[m6.reindex(_c.index) <= _med]
-                    top = (_e if len(_e) >= TOP_N else _c).sort_values(ascending=False).head(TOP_N).index
+                    top = (_e if len(_e) >= _tn else _c).sort_values(ascending=False).head(_tn).index
                 else:
-                    top = a.dropna().sort_values(ascending=False).head(TOP_N).index
+                    top = a.dropna().sort_values(ascending=False).head(_tn).index
             elif _sr == "accel_cap":                   # CAPTURE SOONER: accel>0 but DROP the extreme blow-offs
                 _c = a[a > 0].dropna().sort_values(ascending=False)          # (top over-extended already ran)
-                _c = _c.iloc[2:] if len(_c) > TOP_N + 2 else _c              # skip the 2 most-extended sleeves
-                top = _c.head(TOP_N).index
+                _c = _c.iloc[2:] if len(_c) > _tn + 2 else _c              # skip the 2 most-extended sleeves
+                top = _c.head(_tn).index
             else:
-                top = a.dropna().sort_values(ascending=False).head(TOP_N).index
+                top = a.dropna().sort_values(ascending=False).head(_tn).index
             if flow_gate and not sector_flow_m.empty:      # ETF FUND-FLOW confirm: from the accel ranking, keep only
                 _pos = [e for e in a.dropna().sort_values(ascending=False).index   # sectors with money flowing IN
                         if e in sector_flow_m.columns and pd.notna(sector_flow_m.loc[date, e])
@@ -1385,6 +1457,22 @@ def build():
             largecap_mode = _base_lcm
             if regime_switch:
                 largecap_mode = "skip" if bool(_rsig.get(date, True)) else None
+
+            # REGIME-CONDITIONAL SELECTION (user alpha #3): switch the SELECTION rule itself — not just exposure —
+            # on the same PIT leadership signal. When OUR factor leads (_ron), press the edge (deep value / higher
+            # A/D conviction); when mega-cap growth leads (hostile), tilt to QUALITY (cheapest PROFITABLE P/B) to
+            # dodge value traps. _rsig is prior-price + 1mo-lagged-FRED (no look-ahead). Off (None) = flagship exact.
+            value_key = _base_vk; _conv = _base_conv
+            if sel_regime is not None and regime_switch:
+                _ron = bool(_rsig.get(date, True))
+                if sel_regime == "quality_off":            # hostile regime -> cheapest PROFITABLE P/B
+                    value_key = _base_vk if _ron else "pb_prof"
+                elif sel_regime == "quality_on":           # inverse A/B: quality when WE lead
+                    value_key = "pb_prof" if _ron else _base_vk
+                elif sel_regime == "conv_on":              # lead -> crank div-conviction 4->6
+                    _conv = (_base_conv * 1.5) if _ron else _base_conv
+                elif sel_regime == "conv_off":             # inverse A/B
+                    _conv = (_base_conv * 1.5) if not _ron else _base_conv
 
             # DEFENSIVE ROTATION in risk-off (user): when SPY < 200d MA, don't de-risk to cash — ROTATE into
             # defensive sleeves (Gold miners / Consumer Staples / Utilities / Healthcare) and buy the cheap value
@@ -1441,6 +1529,8 @@ def build():
                 cands = [h for h in sector_cands(etf, include_delisted) if h not in held
                          and (not ban_first_loss or h not in banned)
                          and (exclude_tickers is None or h not in exclude_tickers)
+                         and (exclude_si_pct is None or h not in _si_cols or pd.isna(si_pct_m.at[date, h])
+                              or si_pct_m.at[date, h] <= exclude_si_pct)
                          and (_mom_book or pbceil_ok(h))
                          and (country_ok is None or country_ok(h))
                          and _available_at(px_usd[h], date)
@@ -1668,9 +1758,20 @@ def build():
                 held.add(p)
                 if pd.notna(mktcap_usd.loc[date, p]) and mktcap_usd.loc[date, p] > 5e10:
                     mega_picks += 1
-                r = (0.0 if ndate is None else                                          # LIVE: no fwd return
-                     (_wait_entry_ret(p, date, ndate, wait_entry) if wait_entry          # ENTRY-TIMING overlay
-                      else _ret_delist(px_usd[p], date, ndate)))
+                _dly = (stock_daily[p]["Close"] if (p in stock_daily and "Close" in stock_daily[p]) else None)
+                if ndate is None:
+                    r = 0.0                                                             # LIVE: no forward return yet
+                elif wait_entry:                                                        # ENTRY-TIMING overlay (lab only)
+                    _lr = _wait_entry_ret(p, date, ndate, wait_entry)                   # local (FX-less) entry-timed return
+                    if _lr is None:                                                     # can't time entry -> DON'T drop the
+                        r = _ret_delist(px_usd[p], date, ndate, daily=_dly)            # pick (drop shrinks rr/wsum =
+                    else:                                                               # survivorship inflation); fall back
+                        _fe = ret_factor.loc[date, p] if p in ret_factor.columns else np.nan   # to the plain USD hold return.
+                        _fx = (ret_factor.loc[ndate, p] / _fe) if (pd.notna(_fe) and _fe != 0   # translate the local entry-
+                               and ndate in ret_factor.index and pd.notna(ret_factor.loc[ndate, p])) else 1.0   # timed return
+                        r = (1.0 + _lr) * float(_fx) - 1.0                              # to USD (monthly FX over the hold)
+                else:
+                    r = _ret_delist(px_usd[p], date, ndate, daily=_dly)                # FLAGSHIP: USD hold; delisting realized on daily
                 if r is None or not np.isfinite(r):
                     if tr is not None:
                         tr["picks"].append({"sector": etf_name.get(etf, etf), "etf": etf, "ticker": p,
@@ -1741,7 +1842,8 @@ def build():
                             _lc.append(h)
                 if _lc:                                   # take the cheapest-P/B name regardless of size
                     p = min(_lc, key=lambda h: pb.loc[date, h])
-                    r = _ret_delist(px_usd[p], date, ndate)
+                    r = _ret_delist(px_usd[p], date, ndate,
+                                    daily=(stock_daily[p]["Close"] if (p in stock_daily and "Close" in stock_daily[p]) else None))
                     if r is not None and np.isfinite(r):
                         wsum = 1.0; rr = float(r)
                         if tr is not None:
@@ -4205,6 +4307,168 @@ def build():
             b = base[name]
             print(f"  {name:20} {r['total']:8.1f}%  (baseline {b:7.1f}%  {r['total']-b:+7.1f}pp)  "
                   f"Sharpe {r['sharpe']:.2f}  DD {r['dd']:.1f}%  t {r['t_stat']}", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("ANALYST_ACTION_LAB"):
+        import sys
+        # ── ANALYST ACTION/REVISION signals on the FULL-COVERAGE flagship (post-backfill: 5,099 tk, net_upg_m now
+        # dense). LEVEL-based upside failed; test whether the CHANGE signals help — esp. `veto` = drop cheapest-P/B
+        # names NET-DOWNGRADED in trailing 90d = the value-trap filter the loss-attribution + conviction-knife
+        # studies wanted (can analyst downgrades separate cheap-and-sinking from cheap-and-reversing?). ──
+        _fk = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi")
+        _cov_up = float(upside_m.notna().values.mean()); _cov_ng = float(net_upg_m.notna().values.mean())
+        base = run(True, True, **_fk)
+        print(f"\n=== ANALYST_ACTION_LAB (upside cov {_cov_up*100:.0f}%, net-upg cov {_cov_ng*100:.0f}%; baseline {base['total']:.1f}%) ===", flush=True)
+        print(f"{'overlay':>22s} {'total':>10s} {'vs base':>9s} {'Sharpe':>7s} {'DD':>8s}", flush=True)
+        rows = {"baseline": {k: base[k] for k in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months')}}
+        for ov in ["veto", "vetoabove", "tiebreak", "veto,tiebreak", "vetoabove,tiebreak"]:
+            os.environ["ANALYST_OVERLAY"] = ov
+            r = run(True, True, **_fk)
+            os.environ.pop("ANALYST_OVERLAY", None)
+            print(f"  {ov:>20s} {r['total']:>9.1f}% {r['total']-base['total']:>+8.1f} {r['sharpe']:>7.2f} {r['dd']:>7.1f}%", flush=True)
+            rows[ov] = {k: r[k] for k in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months')}
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="analyst_action_overlays",
+                defaults={"payload": {"computed_at": pd.Timestamp.utcnow().isoformat(), "baseline_total": base["total"],
+                                      "upside_cov": _cov_up, "netupg_cov": _cov_ng, "arms": rows,
+                                      "note": "analyst action/revision overlays (veto downgrades, vetoabove, tiebreak) on full-coverage adaptive flagship"},
+                          "computed_at": timezone.now()})
+            print("Saved BacktestResult[analyst_action_overlays]", flush=True)
+        except Exception as e:
+            print("save skipped:", e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("ANALYST_COV_LAB"):
+        import sys
+        # ── ANALYST-COVERAGE UNLOCK (user alpha #1): the analyst implied-upside signal is coverage-throttled
+        # (~29% universe / ~67% of small-cap picks, PIT-dated Benzinga). Does WIDENING coverage (stale_days dial:
+        # a 6mo-old target is still a data point -> push to 12/24mo) make it clear the bar as (a) a tiebreak OVERLAY
+        # on the drift-P/B flagship or (b) the upside_pb_60 blend value metric? Rebuilds the upside panel per
+        # stale_days (closure rebind seen by run()). If it never beats baseline even at max coverage, coverage is
+        # NOT the binding constraint — the signal is just weak on this engine. ──
+        _fk = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi")
+        base = run(True, True, **_fk)
+        print(f"\n=== ANALYST_COV_LAB: does widening analyst coverage make it additive? (baseline {base['total']:.1f}%) ===", flush=True)
+        print(f"{'arm':>24s} {'cov%':>6s} {'total':>10s} {'vs base':>9s} {'Sharpe':>7s} {'DD':>8s}", flush=True)
+        rows = {"baseline": {k: base[k] for k in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months')}}
+        for sd in [180, 365, 730]:
+            up = _analyst_upside_panel(midx, as_traded, stale_days=sd).reindex(index=midx, columns=common)  # as_traded: split-consistent (see :892)
+            upside_m = up                                   # rebind the closure var run()'s picker reads
+            cov = float(up.notna().values.mean())
+            os.environ["ANALYST_OVERLAY"] = "tiebreak"       # (a) analyst tiebreak layered ON drift-P/B
+            r_tb = run(True, True, **_fk)
+            os.environ.pop("ANALYST_OVERLAY", None)
+            r_bl = run(True, True, value_key="upside_pb_60", growth_fallback=True, **_fk)   # (b) blend value metric
+            for lab, r in [(f"tiebreak sd{sd}", r_tb), (f"upside_pb_60 sd{sd}", r_bl)]:
+                print(f"  {lab:>22s} {cov*100:>5.1f}% {r['total']:>9.1f}% {r['total']-base['total']:>+8.1f} {r['sharpe']:>7.2f} {r['dd']:>7.1f}%", flush=True)
+                rows[lab] = {**{k: r[k] for k in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months')}, "coverage": cov}
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="analyst_coverage_unlock",
+                defaults={"payload": {"computed_at": pd.Timestamp.utcnow().isoformat(), "baseline_total": base["total"],
+                                      "arms": rows, "note": "analyst overlay/blend vs drift-P/B flagship across stale_days coverage dial"},
+                          "computed_at": timezone.now()})
+            print("Saved BacktestResult[analyst_coverage_unlock]", flush=True)
+        except Exception as e:
+            print("save skipped:", e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("UNIV_EXPAND_LAB"):
+        import sys
+        # ── OPPORTUNITY-SET EXPANSION (user alpha #4): the flagship gates picks to US+CA (_is_usca). 176 foreign
+        # names are already IN the survivor pool with 11y candles + PIT financials + FX — relaxing the gate is a
+        # one-line A/B. CAVEAT: survivorship-BIASED (no delisted foreign names exist in the DB), so a positive read
+        # is an UPPER BOUND, not deployable alpha. ADD_ADRS=1 (screened 79 value ADRs) tested in a separate run. ──
+        _fk = dict(regime_switch="either", regime_signal="multi", entry="tl_rsi")
+        base = run(True, True, country_ok=_is_usca, **_fk)
+        glob = run(True, True, country_ok=None, **_fk)               # all in-pool countries pickable
+        print(f"\n=== UNIV_EXPAND_LAB: foreign-gate relaxation (ADD_ADRS={os.environ.get('ADD_ADRS','0')}) ===", flush=True)
+        print(f"{'arm':>18s} {'total':>10s} {'vs base':>9s} {'Sharpe':>7s} {'DD':>8s} {'t':>6s} {'delisted':>9s}", flush=True)
+        rows = {}
+        for lab, r in [("usca (flagship)", base), ("global (no country gate)", glob)]:
+            print(f"  {lab:>16s} {r['total']:>9.1f}% {r['total']-base['total']:>+8.1f} {r['sharpe']:>7.2f} {r['dd']:>7.1f}% {str(r['t_stat']):>6s} {r.get('delisted_picks'):>9}", flush=True)
+            rows[lab] = {k: r[k] for k in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months', 'delisted_picks')}
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind=f"universe_expand_adr{os.environ.get('ADD_ADRS','0')}",
+                defaults={"payload": {"computed_at": pd.Timestamp.utcnow().isoformat(), "baseline_total": base["total"],
+                                      "arms": rows, "add_adrs": os.environ.get("ADD_ADRS", "0"),
+                                      "note": "foreign-gate relaxation on adaptive flagship; survivorship-biased upper bound"},
+                          "computed_at": timezone.now()})
+            print("Saved BacktestResult[universe_expand]", flush=True)
+        except Exception as e:
+            print("save skipped:", e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("REG_SEL_LAB"):
+        import sys
+        # ── REGIME-CONDITIONAL SELECTION on the adaptive flagship: switch the value metric / conviction by the PIT
+        # leadership regime (walk-forward — regime read from prior price + lagged FRED, NOT hand-picked). Both
+        # directions tested so a spurious in-sample fit shows up as its inverse ALSO "winning". ──
+        _fk = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi")
+        base = run(True, True, **_fk)
+        print(f"\n=== REG_SEL_LAB: regime-conditional selection (baseline {base['total']:.1f}%) ===", flush=True)
+        print(f"{'arm':>16s} {'total':>10s} {'vs base':>9s} {'Sharpe':>7s} {'DD':>8s} {'t':>6s}", flush=True)
+        rows = {"baseline": {k: base[k] for k in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months')}}
+        for mode in ["quality_off", "quality_on", "conv_on", "conv_off"]:
+            r = run(True, True, sel_regime=mode, **_fk)
+            print(f"  {mode:>16s} {r['total']:>9.1f}% {r['total']-base['total']:>+8.1f} {r['sharpe']:>7.2f} {r['dd']:>7.1f}% {str(r['t_stat']):>6s}", flush=True)
+            rows[mode] = {k: r[k] for k in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months')}
+        # CONTROLS: constant conviction (no regime timing). If const_conv_6 ~= conv_off, the "regime" framing is
+        # spurious — it's just more conviction (already known to add survivorship-inflated return), NOT regime alpha.
+        for cc in [5.0, 6.0]:
+            r = run(True, True, conv=cc, **_fk)
+            print(f"  {'const_conv_'+str(cc):>16s} {r['total']:>9.1f}% {r['total']-base['total']:>+8.1f} {r['sharpe']:>7.2f} {r['dd']:>7.1f}% {str(r['t_stat']):>6s}", flush=True)
+            rows[f"const_conv_{cc}"] = {k: r[k] for k in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months')}
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="regime_conditional_selection",
+                defaults={"payload": {"computed_at": pd.Timestamp.utcnow().isoformat(), "baseline_total": base["total"],
+                                      "arms": rows, "note": "regime-conditional value-metric/conviction switch on adaptive flagship (_rsig PIT leadership)"},
+                          "computed_at": timezone.now()})
+            print("Saved BacktestResult[regime_conditional_selection]", flush=True)
+        except Exception as e:
+            print("save skipped:", e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("SI_EXCLUDE_LAB"):
+        import sys
+        # ── SHORT-INTEREST EXCLUSION on the DEPLOYED flagship (adaptive). Drop names whose PIT short-interest
+        # (% shares-out; settlement + 10-bday FINRA dissemination lag; /shares from reports) exceeds a threshold,
+        # at selection time. This is the SI anomaly's only return-priority fit — the long-only high-SI leg LAGS SPY,
+        # but as a DEFENSIVE, non-pro-cyclical EXCLUSION it can add return. Reports total/DD + monthly-return
+        # CORRELATION vs baseline (the diversification check that motivated combining it with the value engine). ──
+        _fk = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi")
+        base = run(True, True, **_fk)
+        b_m = {d: r for d, r in base["monthly"]}
+        print(f"\n=== SI_EXCLUDE_LAB: high-short-interest exclusion on adaptive flagship (baseline {base['total']:.1f}%) ===", flush=True)
+        print(f"{'arm':>16s} {'total':>10s} {'vs base':>9s} {'Sharpe':>7s} {'DD':>8s} {'t':>6s} {'corr':>6s}", flush=True)
+        rows = {"baseline": {k: base[k] for k in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months')}}
+        for thr in [0.30, 0.25, 0.20, 0.15, 0.10]:
+            r = run(True, True, exclude_si_pct=thr, **_fk)
+            r_m = {d: v for d, v in r["monthly"]}
+            cm = sorted(set(b_m) & set(r_m))
+            corr = float(np.corrcoef([b_m[d] for d in cm], [r_m[d] for d in cm])[0, 1]) if len(cm) > 2 else float("nan")
+            print(f"  SI>{thr*100:>4.0f}% exclude {r['total']:>9.1f}% {r['total']-base['total']:>+8.1f} {r['sharpe']:>7.2f} {r['dd']:>7.1f}% {str(r['t_stat']):>6s} {corr:>6.2f}", flush=True)
+            k = f"exclude_si_gt_{int(thr*100)}"
+            rows[k] = {kk: r[kk] for kk in ('total', 'annual', 'vs_spy', 'sharpe', 'dd', 't_stat', 'months')}
+            rows[k]["corr_vs_base"] = corr
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="si_exclusion_flagship",
+                defaults={"payload": {"computed_at": pd.Timestamp.utcnow().isoformat(),
+                                      "baseline_total": base["total"], "arms": rows,
+                                      "note": "PIT SI %shares-out exclusion (settlement+10bday) on adaptive flagship"},
+                          "computed_at": timezone.now()})
+            print("Saved BacktestResult[si_exclusion_flagship]", flush=True)
+        except Exception as e:
+            print("save skipped:", e, flush=True)
         sys.exit(0)
 
     if os.environ.get("LIVE_PICK"):
