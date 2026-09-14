@@ -4481,10 +4481,10 @@ def build():
         # alter the normal path). Writes .data/studies/live_flagship_picks.json for the dashboard/scanner. ──
         import sys   # NOTE: use module-level json (a local `import json` here shadows it and breaks the delisted map)
         # GAUNTLET-VALIDATED contrarian stack (2026-09-14, survives split-half + net-cost): SI-gate (buy the most-
-        # shorted = the value-reversal tail), drop sub-$100M junk, conv6 (steeper A/D conviction), bonds-only park
-        # in 0-pick months. tl_rsi KEPT (ungating it failed H2). See [[additive-lever-sprint]].
+        # shorted = the value-reversal tail), drop sub-$100M junk, bonds-only park in 0-pick months. tl_rsi KEPT
+        # (ungating it failed H2). conv6x DROPPED (tail-leverage, user 2026-09-14) -> default conv4x. See [[additive-lever-sprint]].
         _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi",
-                     quality_gate="si_days", small_min=1e8, conv=6.0, no_cash=True)
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
         tr = []; run(True, True, live=True, trace=tr, **_base)               # includes the current (ndate=None) month
         tr2 = []; run(True, True, trace=tr2, **_base)                        # non-live backtest (stops one month short)
         live_month = tr[-1]
@@ -4516,7 +4516,7 @@ def build():
         # FLAGSHIP default = ADAPTIVE: raw-value core + 12-month regime switch. Best risk-adjusted (28447%).
         _cfgkw = {
             "adaptive": dict(regime_switch="either", regime_signal="multi",
-                             quality_gate="si_days", small_min=1e8, conv=6.0, no_cash=True),   # gauntlet-validated stack
+                             quality_gate="si_days", small_min=1e8, no_cash=True),   # gauntlet-validated stack
             "core": dict(),
             "middle": dict(largecap_mode="skip", largecap_keep={"GLD", "SLV", "PPLT", "USO", "UNG", "URA", "LIT",
                                                                  "COPX", "SLX", "REMX", "XLE", "XLB"}),
@@ -4562,8 +4562,8 @@ def build():
         # DD−24.9% (core-level DD, 2.4× the core return), +72% pre-2020. Detects regime from the rotation
         # system's own 12mo value/small leadership signal (slow = matches the multi-year regime, no whipsaw).
         "usca_small_adaptive": run(True, True, country_ok=_is_usca, regime_switch="either", regime_signal="multi",
-                                   entry="tl_rsi", quality_gate="si_days", small_min=1e8, conv=6.0, no_cash=True),
-        # FLAGSHIP: tl_rsi dip + GAUNTLET-validated contrarian stack (SI-gate + drop<$100M + conv6 + bonds-park)
+                                   entry="tl_rsi", quality_gate="si_days", small_min=1e8, no_cash=True),
+        # FLAGSHIP: tl_rsi dip + GAUNTLET-validated contrarian stack (SI-gate + drop<$100M + bonds-park; conv4x default)
         # the demoted aggressive stack (kept for reference; overfit the 2020 recovery, DD−42%)
         "usca_small_upside_pb": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True,
                                     top_n=7, size_mode="upside", largecap_mode="skip"),
