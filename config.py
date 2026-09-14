@@ -210,13 +210,13 @@ SECTOR_ETFS = {
 # removed/reverted because they HURT (ARKK worst sleeve; QTUM/SPLV/NLR/GRID game the accel ranking and
 # displace winners — see sector-adds-hurt memory). Backtest results are UNCHANGED vs fully-removed (they
 # never take a pick slot); this just keeps them visible so we can watch what we're deliberately not buying.
+# 2026-09-14: REACTIVATED ARKK/ARKG/QTUM/NLR/GRID. On the small-cap engine reactivation is byte-identical
+# (verified: 99,892.9%/109,047.9% with vs without) — they hold no qualifying cheap small-cap US/CA value name
+# so the value gate SKIPS them — so re-enabling is free forward optionality (if one ever carries a qualifying
+# pick, it can be caught). SPLV (low-vol) stays out (anti-torque). NOTE: DEACTIVATED_ETFS is read ONLY by
+# survivorship_smallcap_study + fetch_delisted, not the ETF-rotation flagship.
 DEACTIVATED_ETFS = {
-    "Ark Innovation": "ARKK",
-    "Ark Genomics": "ARKG",
-    "Quantum Computing": "QTUM",
     "Low Volatility": "SPLV",
-    "Nuclear & SMR": "NLR",
-    "Grid & Electrification": "GRID",
 }
 
 # Data settings

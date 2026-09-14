@@ -1829,11 +1829,13 @@ def build():
                                         "mae": (_pick_mae(p, date, ndate) if ndate is not None else None),
                                         "conviction": bool(accumulating(p, date))})
             if wsum <= 0 and no_cash:
-                # NEVER sit in full cash (user): if the whole month would be cash, first take the best LARGE-CAP
-                # value pick from the top sectors; if there's still no equity anywhere (all bonds/commodities/
-                # foreign), park in the top-accelerating BOND ETF for the month rather than 0%.
-                _lc = []
-                for etf in top:
+                # NEVER sit in full cash (user): when the whole month would be cash (every top sector skipped =
+                # deep risk-off), park in the top-accelerating BOND ETF. GAUNTLET 2026-09-14: BONDS-ONLY beats the
+                # old large-cap-fallback cascade (+14% / -4pp DD full-window; survives H2) — those 0-pick months
+                # are flight-to-quality, so the accel-ranked bond rallies. Large-cap-value step DISABLED (the
+                # cascade lost -29%); kept as dead code below for reference.
+                _lc = []   # bonds-only park (validated) — skip the large-cap-value fallback
+                for etf in ([] if True else top):          # DISABLED (bonds-only): was the large-cap fallback loop
                     for h in sector_cands(etf, include_delisted):
                         if (country_ok is None or country_ok(h)) and _available_at(px_usd[h], date) \
                            and pd.notna(pb.loc[date, h]) and pb.loc[date, h] > MIN_PB \
@@ -4478,7 +4480,11 @@ def build():
         # a non-live run must produce identical picks on the last COMMON month (proves the live guards didn't
         # alter the normal path). Writes .data/studies/live_flagship_picks.json for the dashboard/scanner. ──
         import sys   # NOTE: use module-level json (a local `import json` here shadows it and breaks the delisted map)
-        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi")
+        # GAUNTLET-VALIDATED contrarian stack (2026-09-14, survives split-half + net-cost): SI-gate (buy the most-
+        # shorted = the value-reversal tail), drop sub-$100M junk, conv6 (steeper A/D conviction), bonds-only park
+        # in 0-pick months. tl_rsi KEPT (ungating it failed H2). See [[additive-lever-sprint]].
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi",
+                     quality_gate="si_days", small_min=1e8, conv=6.0, no_cash=True)
         tr = []; run(True, True, live=True, trace=tr, **_base)               # includes the current (ndate=None) month
         tr2 = []; run(True, True, trace=tr2, **_base)                        # non-live backtest (stops one month short)
         live_month = tr[-1]
@@ -4509,7 +4515,8 @@ def build():
         # CONFIG-parameterized trace so each setup gets its own full doc (subtabs -> per-config trades).
         # FLAGSHIP default = ADAPTIVE: raw-value core + 12-month regime switch. Best risk-adjusted (28447%).
         _cfgkw = {
-            "adaptive": dict(regime_switch="either", regime_signal="multi"),
+            "adaptive": dict(regime_switch="either", regime_signal="multi",
+                             quality_gate="si_days", small_min=1e8, conv=6.0, no_cash=True),   # gauntlet-validated stack
             "core": dict(),
             "middle": dict(largecap_mode="skip", largecap_keep={"GLD", "SLV", "PPLT", "USO", "UNG", "URA", "LIT",
                                                                  "COPX", "SLX", "REMX", "XLE", "XLB"}),
@@ -4555,7 +4562,8 @@ def build():
         # DD−24.9% (core-level DD, 2.4× the core return), +72% pre-2020. Detects regime from the rotation
         # system's own 12mo value/small leadership signal (slow = matches the multi-year regime, no whipsaw).
         "usca_small_adaptive": run(True, True, country_ok=_is_usca, regime_switch="either", regime_signal="multi",
-                                   entry="tl_rsi"),   # FLAGSHIP: dip-in-9mo-uptrend gated to SPY RSI>=45 (best Sharpe/robust)
+                                   entry="tl_rsi", quality_gate="si_days", small_min=1e8, conv=6.0, no_cash=True),
+        # FLAGSHIP: tl_rsi dip + GAUNTLET-validated contrarian stack (SI-gate + drop<$100M + conv6 + bonds-park)
         # the demoted aggressive stack (kept for reference; overfit the 2020 recovery, DD−42%)
         "usca_small_upside_pb": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True,
                                     top_n=7, size_mode="upside", largecap_mode="skip"),
