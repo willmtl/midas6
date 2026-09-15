@@ -3474,11 +3474,11 @@ def build():
                 _e *= (1 + float(_sr)); _spycurve.append(round(_e * 100000))
         out = []
         for key, name, desc, kw in cfgs:
-            # tl_rsi is the wired flagship tilt (all configs) — must match FLAGSHIP_TRACE so the ladder totals equal
-            # the per-config pages / masthead. tl_rsi = tl_support(L9) gated to SPY RSI>=45 (best Sharpe + robust).
-            rF = run(True, True, country_ok=_is_usca, entry="tl_rsi", **kw)
-            rp = run(True, True, country_ok=_is_usca, entry="tl_rsi", end_date="2019-12-31", **kw)
-            rq = run(True, True, country_ok=_is_usca, entry="tl_rsi", start_date="2020-01-31", **kw)
+            # tl_support (ungated) is the wired flagship tilt (all configs) — must match FLAGSHIP_TRACE so the ladder
+            # totals equal the per-config pages / masthead. REGAUNTLET 2026-09-14 flipped tl_rsi->tl_support (+27% net).
+            rF = run(True, True, country_ok=_is_usca, entry="tl_support", **kw)
+            rp = run(True, True, country_ok=_is_usca, entry="tl_support", end_date="2019-12-31", **kw)
+            rq = run(True, True, country_ok=_is_usca, entry="tl_support", start_date="2020-01-31", **kw)
             n_yr = rF["months"] / 12.0
             cagr = ((1 + rF["total"] / 100) ** (1 / n_yr) - 1) * 100 if rF["total"] > -100 else None
             # equity curve + calendar from the monthly returns
@@ -4481,9 +4481,11 @@ def build():
         # alter the normal path). Writes .data/studies/live_flagship_picks.json for the dashboard/scanner. ──
         import sys   # NOTE: use module-level json (a local `import json` here shadows it and breaks the delisted map)
         # GAUNTLET-VALIDATED contrarian stack (2026-09-14, survives split-half + net-cost): SI-gate (buy the most-
-        # shorted = the value-reversal tail), drop sub-$100M junk, bonds-only park in 0-pick months. tl_rsi KEPT
-        # (ungating it failed H2). conv6x DROPPED (tail-leverage, user 2026-09-14) -> default conv4x. See [[additive-lever-sprint]].
-        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_rsi",
+        # shorted = the value-reversal tail), drop sub-$100M junk, bonds-only park in 0-pick months. tl_support
+        # (ungated; 2026-09-14 REGAUNTLET reversed the earlier "failed H2" call — +27% net-of-cost, equal Sharpe,
+        # ties/wins 4/5 sub-periods; the SPY-RSI gate needlessly blocked the best entries in weak markets).
+        # conv6x DROPPED (tail-leverage, user 2026-09-14) -> default conv4x. See [[additive-lever-sprint]].
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
                      quality_gate="si_days", small_min=1e8, no_cash=True)
         tr = []; run(True, True, live=True, trace=tr, **_base)               # includes the current (ndate=None) month
         tr2 = []; run(True, True, trace=tr2, **_base)                        # non-live backtest (stops one month short)
@@ -4524,7 +4526,7 @@ def build():
         }
         _ck = os.environ.get("CONFIG", "adaptive")
         _kw = _cfgkw.get(_ck, _cfgkw["adaptive"])
-        perf = run(True, True, country_ok=_is_usca, trace=tr, entry="tl_rsi", **_kw)  # tl_rsi = tl_support(L9) gated to SPY RSI>=45 (best Sharpe/robust; SPY_RSI_LAB)
+        perf = run(True, True, country_ok=_is_usca, trace=tr, entry="tl_support", **_kw)  # tl_support ungated (REGAUNTLET 2026-09-14: +27% net, ties/wins 4/5 periods)
         out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": f"usca_small_{_ck}", "config": _ck,
                "perf": {k: perf.get(k) for k in ("total", "annual", "vs_spy", "sharpe", "dd", "t_stat", "months",
                                                  "delisted_picks")},
@@ -4562,8 +4564,8 @@ def build():
         # DD−24.9% (core-level DD, 2.4× the core return), +72% pre-2020. Detects regime from the rotation
         # system's own 12mo value/small leadership signal (slow = matches the multi-year regime, no whipsaw).
         "usca_small_adaptive": run(True, True, country_ok=_is_usca, regime_switch="either", regime_signal="multi",
-                                   entry="tl_rsi", quality_gate="si_days", small_min=1e8, no_cash=True),
-        # FLAGSHIP: tl_rsi dip + GAUNTLET-validated contrarian stack (SI-gate + drop<$100M + bonds-park; conv4x default)
+                                   entry="tl_support", quality_gate="si_days", small_min=1e8, no_cash=True),
+        # FLAGSHIP: tl_support (ungated) dip + GAUNTLET-validated contrarian stack (SI-gate + drop<$100M + bonds-park; conv4x default)
         # the demoted aggressive stack (kept for reference; overfit the 2020 recovery, DD−42%)
         "usca_small_upside_pb": run(True, True, country_ok=_is_usca, value_key="upside_pb_60", growth_fallback=True,
                                     top_n=7, size_mode="upside", largecap_mode="skip"),
