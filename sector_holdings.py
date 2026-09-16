@@ -776,6 +776,14 @@ HOLDINGS = {
             "HEXO", "VFF",
         ],
     },
+    "Hydrogen": {
+        "etf": "HYDR",
+        "holdings": ["059090", "126340", "271940", "288620", "336260", "382900", "7203", "APD", "BE", "BLDP", "CMI", "CWR", "F3C", "FCEL", "HY", "ITM", "MZH", "NEL", "PCELL", "PLUG", "QC8"],
+    },
+    "Psychedelics": {
+        "etf": "PSIL",
+        "holdings": ["ABBV", "ALKS", "ANRO", "ATAI", "CMND", "CMPS", "DFTX", "DRUG", "GHRS", "HELP", "IGC", "IXHL", "JNJ", "KTTA", "LLY", "NBIX", "NEUP", "NRXP", "NUMI", "OPTH", "PBM", "QNTM", "RLMD", "SILO", "STIM", "SUPN", "VTGN"],
+    },
 }
 
 

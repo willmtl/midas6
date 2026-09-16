@@ -203,6 +203,11 @@ SECTOR_ETFS = {
 
     # ── Alts ──
     "Cannabis": "MSOS",
+    # ── Thematic optionality sleeves (2026-09-15, user-approved): pre-revenue thematics that sit dormant
+    # (value gate skips negative-book names) and auto-activate as constituents turn book-positive. Snapshot-test
+    # +15% on-sample (single-window/end-loaded — driven by FCEL torque capture; see additive-lever-sprint memory).
+    "Hydrogen": "HYDR",
+    "Psychedelics": "PSIL",
 }
 
 # DEACTIVATED sleeves (2026-08-17, user): kept + their acceleration still CALCULATED and shown for
