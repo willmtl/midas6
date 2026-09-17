@@ -1,0 +1,10 @@
+{
+  "name": "rotation-tv",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dockerized TradingView data/indicator fetcher for the rotation research engine (runs ONLY in Docker)",
+  "type": "commonjs",
+  "dependencies": {
+    "@mathieuc/tradingview": "^3.5.2"
+  }
+}

@@ -222,5 +222,23 @@ services:
     depends_on:
       - backend
 
+  # Dockerized TradingView data/indicator fetcher (@mathieuc/tradingview). Runs ONLY in Docker — the JS lib
+  # is installed inside the image, never on the host. On-demand tool (profiles: tools => not started by
+  # `docker compose up`). Shares the repo ./.data so the Python engine can read fetched series.
+  # Build:  docker compose build tv
+  # Run:    docker compose run --rm tv tv_fetch.js NASDAQ:AAPL D 300
+  tv:
+    build:
+      context: ./tv
+      dockerfile: Dockerfile
+    working_dir: /app
+    volumes:
+      - ./.data:/data
+    environment:
+      TV_SESSION: ${TV_SESSION:-}
+      TV_SIGNATURE: ${TV_SIGNATURE:-}
+    profiles: ["tools"]
+    restart: "no"
+
 volumes:
   pgdata:
