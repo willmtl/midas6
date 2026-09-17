@@ -208,6 +208,11 @@ SECTOR_ETFS = {
     # +15% on-sample (single-window/end-loaded — driven by FCEL torque capture; see additive-lever-sprint memory).
     "Hydrogen": "HYDR",
     "Psychedelics": "PSIL",
+    # TESTED + REVERTED (2026-09-16): "Drones & eVTOL" (JEDI: JOBY/ACHR/LUNR/RCAT/UMAC/RDW/BKSY/PL + AVAV/
+    # KTOS/RDW) A/B'd on the deployed stack: WITH 241,291% vs WITHOUT 255,907% = −14,616pp. HURTS. Unlike
+    # dormant Hydrogen/Psychedelics (all negative-book → value gate skips), JEDI carries POSITIVE-book small-
+    # caps (AVAV/KTOS/RCAT/RDW) that DO qualify → take pick slots + drag (classic sector-adds-hurt). Not a
+    # dormant-optionality sleeve, so it doesn't fit the thesis. Do NOT re-add. See sector-adds-hurt memory.
 }
 
 # DEACTIVATED sleeves (2026-08-17, user): kept + their acceleration still CALCULATED and shown for

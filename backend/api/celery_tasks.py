@@ -606,6 +606,21 @@ def run_rotation_call():
 
 
 @shared_task
+def run_analyst_revision():
+    """Nightly: the 2nd book (uncorrelated w/ the flagship) — analyst target-revision momentum, large-cap.
+    Emits this month's top-quintile tgt_rev_3m picks → BacktestResult[analyst_revision_live]."""
+    import subprocess, os
+    if not os.path.exists("/app/analyst_revision_book.py"):
+        return {"error": "not mounted"}
+    env = {**os.environ, "LIVE_BOOK": "1"}
+    proc = subprocess.run(["python", "-u", "/app/analyst_revision_book.py"], cwd="/app", env=env,
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        logger.error("analyst_revision_book (live) failed (rc=%s): %s", proc.returncode, proc.stderr[-2000:])
+    return proc.returncode
+
+
+@shared_task
 def refresh_expanded_universe():
     """Weekly: pull the full current ETF constituents (EODHD ETF_Data.Holdings) → expanded_holdings.json, so
     the LIVE scanner's universe (top-20 + real constituents) grows automatically as ETF membership changes.

@@ -100,6 +100,8 @@ urlpatterns = [
     path("entry-signal", views.EntrySignalView.as_view(), name="entry-signal"),
     # THE headline rotation call: regime-leaders ∩ value-pick ∩ oversold entry
     path("rotation-call", views.RotationCallView.as_view(), name="rotation-call"),
+    # 2nd book (uncorrelated): analyst target-revision momentum, large-cap
+    path("analyst-revision", views.AnalystRevisionView.as_view(), name="analyst-revision"),
     # Profitability guard: does excluding cheap-P/B value traps (unprofitable+eroding book) help?
     path("profitability-guard", views.ProfitabilityGuardView.as_view(), name="profitability-guard"),
     # Factor lab: sweep filters/tilts/combos on the value pick, ranked to find the best return

@@ -2052,6 +2052,29 @@ class RotationCallView(_StudyResultView):
     json_path = "/app/.data/studies/rotation_call.json"
 
 
+class AnalystRevisionView(_StudyResultView):
+    """The SECOND book (uncorrelated w/ the flagship): analyst target-revision momentum in LARGE-CAPS.
+    Long the top-quintile by `tgt_rev_3m` (3mo consensus-target change / price), EW, monthly, held to
+    month-end. Validated ~Sharpe 0.95 / +109pp vs SPY (two PIT methods agree, both halves positive); high
+    capacity (large-cap liquid). GET reads BacktestResult[analyst_revision_live]; POST re-runs the book's
+    LIVE mode."""
+    kind = "analyst_revision_live"
+    script = "analyst_revision_book.py"
+    json_path = "/app/.data/studies/analyst_revision_live.json"
+
+    def post(self, request):
+        import threading, subprocess, os as _os
+
+        def _run():
+            try:
+                subprocess.run(["python", "-u", "/app/analyst_revision_book.py"], cwd="/app",
+                               env={**_os.environ, "LIVE_BOOK": "1"}, timeout=1800)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+        return Response({"status": "analyst_revision_live recompute started"})
+
+
 class ProfitabilityGuardView(_StudyResultView):
     """Does a PROFITABILITY guard improve the cheapest-P/B value pick? Tests the value-trap thesis (cheap +
     unprofitable + eroding book = melting ice cube). Result: blanket 'profitable-only' HURTS (kills negative-

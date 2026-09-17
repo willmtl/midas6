@@ -22,7 +22,167 @@ MIN_DVOL = 5e6
 OUT = "/app/.data/studies/analyst_revision_book.json"
 
 
+def live():
+    """LIVE PRODUCTION MODE (LIVE_BOOK=1): emit the CURRENT-month top-quintile `tgt_rev_3m` large-cap picks —
+    the validated 2nd book (two PIT methods agree ~Sharpe 0.95, +109pp vs SPY, both halves; uncorrelated w/
+    flagship). SAME signal construction as the backtest. `upside_level` DROPPED (PIT-confirmed look-ahead).
+    Large-cap bucket uses CURRENT market cap (live selection needs current cap, not PIT). Writes
+    BacktestResult[analyst_revision_live] + JSON for the dashboard tab. Monthly EW top-quintile, hold to
+    month-end (no intra-month rules — TP/SL both hurt, see memory)."""
+    import sys
+    from django.db import connection
+    from core.models import Candle, Fundamental, BacktestResult
+    from django.utils import timezone
+    tgt = defaultdict(list)
+    for line in Path(ANALYST).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        tk, d = r.get("ticker"), r.get("date")
+        if tk and d and r.get("price_target"):
+            try:
+                tgt[tk].append((pd.Timestamp(d), float(r["price_target"])))
+            except (TypeError, ValueError):
+                pass
+    for tk in tgt:
+        tgt[tk].sort()
+    covered = sorted(tgt)
+    with connection.cursor() as cur:
+        cur.execute("SET max_parallel_workers_per_gather = 0")
+    havec = set(Candle.objects.filter(ticker__in=covered, interval="1d").values_list("ticker", flat=True).distinct())
+    uni = sorted(set(covered) & havec)
+    cand = {}
+    for i in range(0, len(uni), 40):
+        cand.update(load_candles(uni[i:i + 40]))
+    mcap = dict(Fundamental.objects.filter(ticker__in=uni).values_list("ticker", "market_cap"))
+
+    spy = load_candles(["SPY"]).get("SPY")
+    spy_m = spy["Close"].resample("ME").last()
+    midx = spy_m.index[(spy_m.index >= "2016-01-01")]
+    close_m, dvol = {}, {}
+    for tk, df in cand.items():
+        if df is None or df.empty:
+            continue
+        close_m[tk] = df["Close"].resample("ME").last().reindex(midx)
+        dvol[tk] = (df["Close"] * df["Volume"]).resample("ME").mean().reindex(midx)
+    close_m = pd.DataFrame(close_m); dvol = pd.DataFrame(dvol)
+    tickers = list(close_m.columns)
+    midx_ts = np.array([d.value for d in midx], dtype="int64")
+
+    def consensus_target(tk, win_days=180):
+        pts = tgt.get(tk)
+        if not pts:
+            return pd.Series(np.nan, index=midx)
+        di = np.array([t.value for t, _ in pts]); tv = np.array([v for _, v in pts])
+        win = win_days * 86400 * 10**9; out = np.full(len(midx), np.nan)
+        for j, d in enumerate(midx_ts):
+            a = np.searchsorted(di, d - win, side="right"); b = np.searchsorted(di, d, side="right")
+            if b > a:
+                out[j] = np.median(tv[a:b])
+        return pd.Series(out, index=midx)
+
+    ctar = pd.DataFrame({tk: consensus_target(tk) for tk in tickers})
+    rev = (ctar - ctar.shift(3)) / close_m.where(close_m > 0)          # tgt_rev_3m
+    ups = ctar / close_m.where(close_m > 0) - 1                         # upside_level (display only)
+    liquid = dvol >= MIN_DVOL
+    fret = close_m.pct_change().shift(-1)                               # next-month fwd return per name
+
+    d = midx[-1]                                                        # latest month-end = this month's book
+    s = rev.loc[d]; lq = liquid.loc[d]
+    large = pd.Series({tk: (mcap.get(tk) or 0) >= 2e9 for tk in tickers})
+    m = s.notna() & lq & large
+    names = s[m]
+    k = max(1, int(len(names) * 0.2))
+    top = names.nlargest(k)
+    picks = []
+    for tk in top.index:
+        picks.append({"ticker": tk, "tgt_rev_3m": round(float(top[tk]) * 100, 2),
+                      "upside_pct": round(float(ups.loc[d, tk]) * 100, 1) if pd.notna(ups.loc[d, tk]) else None,
+                      "last_close": round(float(close_m.loc[d, tk]), 2),
+                      "mktcap_usd": float(mcap.get(tk) or 0),
+                      "avg_dollar_vol": round(float(dvol.loc[d, tk]), 0)})
+    # ---- HONEST PIT-membership backtest stat for the tab (NOT the inflated static-cap number). Large-cap
+    # bucket per month via PIT mktcap = as-traded close (undo future splits) × point-in-time shares
+    # (FinancialReport.shares_outstanding ffilled by avail_date). tgt_rev_3m top-quintile, EW, costed 20bps/side.
+    # Two PIT methods previously agreed ~Sharpe 0.95; the static-cap 1.32/+889 was look-ahead inflation. ----
+    import price_basis
+    from core.models import FinancialReport
+    frs = defaultdict(list)
+    for tk, ad, sh in FinancialReport.objects.filter(
+            ticker__in=tickers, shares_outstanding__gt=0).values_list("ticker", "avail_date", "shares_outstanding"):
+        if ad and sh:
+            frs[tk].append((pd.Timestamp(ad).value, float(sh)))
+    shares_m = {}
+    for tk in tickers:
+        pts = sorted(frs.get(tk, []))
+        if not pts:
+            continue
+        di = np.array([t for t, _ in pts]); sv = np.array([v for _, v in pts])
+        o = np.full(len(midx), np.nan)
+        for j, dd in enumerate(midx_ts):
+            b = np.searchsorted(di, dd, side="right")
+            if b > 0:
+                o[j] = sv[b - 1]
+        shares_m[tk] = pd.Series(o, index=midx)
+    shares_m = pd.DataFrame(shares_m).reindex(columns=tickers)
+    mcap_pit = price_basis.as_traded_close(close_m) * shares_m           # PIT market cap panel
+    large_pit = mcap_pit >= 2e9
+    spy_ret = spy_m.reindex(midx).pct_change().shift(-1)
+    spyv = spy_ret.reindex(midx[:-1])
+
+    def _costed_pit(bps=20.0):
+        rets, prev = [], set()
+        for i, dd in enumerate(midx[:-1]):
+            s = rev.loc[dd]; fr = fret.loc[dd]; lq = liquid.loc[dd]; lg = large_pit.loc[dd].fillna(False)
+            mm = s.notna() & fr.notna() & lq & lg; names = s[mm]
+            if len(names) < 20:
+                rets.append(np.nan); prev = set(); continue
+            kk = max(1, int(len(names) * 0.2)); top = set(names.nlargest(kk).index)
+            turn = len(top ^ prev) / max(1, len(top)); rets.append(fr[list(top)].mean() - (bps / 1e4) * turn); prev = top
+        return pd.Series(rets, index=midx[:-1])
+
+    def _stats(r, bench=None):
+        r = r.dropna()
+        if len(r) < 12:
+            return {"n": int(len(r))}
+        eq = (1 + r).prod(); yrs = len(r) / 12.0
+        o = {"n": int(len(r)), "sharpe": float(r.mean() / r.std() * math.sqrt(12)) if r.std() > 0 else 0.0,
+             "cagr_pct": float((eq ** (1 / yrs) - 1) * 100) if eq > 0 else -100.0}
+        if bench is not None:
+            b = bench.reindex(r.index)
+            o["vs_spy_pp"] = float(((eq - 1) - ((1 + b).prod() - 1)) * 100)
+        return o
+
+    cst = _costed_pit()
+    full = cst[cst.index < "2021-01-01"]; h2p = cst[cst.index >= "2021-01-01"]
+    stats = {"basis": "PIT membership (as-traded close × PIT shares), costed 20bps/side",
+             "costed_20bps": _stats(cst, bench=spyv),
+             "h1_2016_2020": _stats(full), "h2_2021_2026": _stats(h2p)}
+    out = {"computed_at": timezone.now().isoformat(), "selection_month": str(d.date()), "signal": "tgt_rev_3m",
+           "universe": "large-cap (>=$2B current mktcap) analyst-covered, liquid ($5M+ ADV)",
+           "n_candidates": int(m.sum()), "n_picks": len(picks), "picks": picks, "validated_stats": stats,
+           "note": ("2nd book — analyst target-revision momentum, large-cap, ~uncorrelated w/ flagship. "
+                    "upside_level dropped (PIT look-ahead). Monthly EW top-quintile, hold to month-end.")}
+    Path(OUT.replace("analyst_revision_book", "analyst_revision_live")).write_text(json.dumps(out, indent=2, default=float))
+    print(f"LIVE analyst-revision picks for {d.date()}: {len(picks)} names (of {int(m.sum())} large-cap candidates)", flush=True)
+    for p in picks[:15]:
+        print(f"  {p['ticker']:6} rev {p['tgt_rev_3m']:+.1f}%  upside {p['upside_pct']}%  ${p['mktcap_usd']/1e9:.1f}B  ${p['last_close']}", flush=True)
+    try:
+        BacktestResult.objects.update_or_create(kind="analyst_revision_live",
+            defaults={"payload": out, "computed_at": timezone.now()})
+        print("Saved BacktestResult[analyst_revision_live]", flush=True)
+    except Exception as e:
+        print("save skipped:", e, flush=True)
+    sys.exit(0)
+
+
 def main():
+    if os.environ.get("LIVE_BOOK"):
+        live()
+        return
     # ---- analyst events per ticker: (ts, target, action) ----
     tgt = defaultdict(list)     # ticker -> [(Timestamp, target)]
     act = defaultdict(list)     # ticker -> [(Timestamp, +1 upgrade / -1 downgrade)]

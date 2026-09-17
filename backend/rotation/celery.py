@@ -265,6 +265,10 @@ app.conf.beat_schedule = {
         "task": "api.celery_tasks.run_rotation_call",
         "schedule": crontab(hour=22, minute=7),
     },
+    "analyst-revision-nightly": {       # 2nd book: analyst target-revision momentum, large-cap (uncorrelated)
+        "task": "api.celery_tasks.run_analyst_revision",
+        "schedule": crontab(hour=22, minute=8),
+    },
     "rotation-picks-regime-nightly": {  # opt-in blend+200MA-regime COPY of the live basket (kept for comparison)
         "task": "api.celery_tasks.run_rotation_picks_regime",
         "schedule": crontab(hour=22, minute=9),
