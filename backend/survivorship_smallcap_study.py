@@ -4532,6 +4532,7 @@ def build():
                                                  "delisted_picks")},
                "params": {"top_n": TOP_N, "small_cap_max": SMALL, "min_dvol": MIN_DVOL, "conv_weight": CONV,
                           "config": _ck, "selector": "cheapest-P/B value in accelerating sectors; " + _ck + " overlay"},
+               "monthly_net": perf.get("monthly"),   # (date, NET monthly return) — deployed series for blend studies
                "months": tr}
         suffix = "" if _ck == "adaptive" else f"_{_ck}"
         fp = Path(f"/app/.data/studies/flagship_history{suffix}.json")
