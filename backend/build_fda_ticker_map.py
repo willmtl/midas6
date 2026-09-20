@@ -75,6 +75,14 @@ def main():
             trad = {tk for tk in cands if tk in have}
             if len(trad) == 1:
                 return next(iter(trad))
+        # 3rd tier: distinctive FIRST TOKEN uniquely identifies a ticker (handles abbrev-truncation like
+        # "AKCEA THERAPS" -> AKCEA THERAPEUTICS, "KERYX BIOPHARMS" -> KERYX). Require token len>=5 + a unique
+        # TRADEABLE ticker among index names starting with that token (conservative).
+        if len(ft) >= 5:
+            tk_all = {idx[k][0] for k in keys}
+            trad = {tk for tk in tk_all if tk in have}
+            if len(trad) == 1:
+                return next(iter(trad))
         return None
 
     smap = {}
