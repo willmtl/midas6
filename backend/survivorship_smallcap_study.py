@@ -4690,6 +4690,80 @@ def build():
             print("save skipped:", _e, flush=True)
         sys.exit(0)
 
+    if os.environ.get("COMPOSITE_AB"):
+        # #1 (user): better pick WITHIN the cheap pool via 2-factor STACKS on tl_support (composite entry). A/B the
+        # existing stacks vs plain tl_support: tl_nodown (+not-net-downgraded), tl_improving (+improving-ROE),
+        # tl_rsidiv (+RSI bullish divergence), tl_rsi (SPY-RSI-gated). Deployed adaptive; both halves. BacktestResult[composite_entry_ab].
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _summ(m):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (m or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 12:
+                    return (float("nan"),) * 4
+                eq = (1 + x).prod(); c = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                dd = ((1 + x).cumprod() / (1 + x).cumprod().cummax() - 1).min()
+                return (round((eq - 1) * 100), round(c * 100, 1), round(x.mean() / x.std() * _np.sqrt(12), 2) if x.std() > 0 else 0, round(dd * 100, 1))
+            mid = len(s) // 2
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:])
+        print("\n=== COMPOSITE_AB: 2-factor entry stacks vs plain tl_support ===", flush=True)
+        print(f"{'entry':>16} {'total%':>13} {'CAGR':>6} {'Sh':>5} {'DD':>7}  {'H1':>18} {'H2':>18}", flush=True)
+        _res = {}
+        for lab, en in [("tl_support", "tl_support"), ("tl_nodown", "tl_nodown"), ("tl_improving", "tl_improving"),
+                        ("tl_rsidiv", "tl_rsidiv"), ("tl_rsi", "tl_rsi")]:
+            perf = run(True, True, entry=en, **_base); full, h1, h2 = _summ(perf.get("monthly"))
+            _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "dd": full[3], "h1": h1, "h2": h2}
+            print(f"{lab:>16} {full[0]:>13,} {full[1]:>5.1f}% {full[2]:>5.2f} {full[3]:>6.1f}%  {str(h1):>18} {str(h2):>18}", flush=True)
+        b = _res["tl_support"]["total"]; best = max(_res, key=lambda k: _res[k]["total"])
+        print(f"\nbaseline tl_support {b:,}%; best={best} {_res[best]['total']:,}% ({_res[best]['total']-b:+,} pp)", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="composite_entry_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("CONC_AB"):
+        # #2 (user): regime-scaled CONCENTRATION — hold fewer sectors when our own value/small-cap regime is favorable,
+        # wider when not. conc_regime=(n_favorable, n_unfavorable). A/B vs fixed TOP_N baseline. Deployed adaptive; both
+        # halves + DD. BacktestResult[conc_regime_ab].
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _summ(m):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (m or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 12:
+                    return (float("nan"),) * 4
+                eq = (1 + x).prod(); c = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                dd = ((1 + x).cumprod() / (1 + x).cumprod().cummax() - 1).min()
+                return (round((eq - 1) * 100), round(c * 100, 1), round(x.mean() / x.std() * _np.sqrt(12), 2) if x.std() > 0 else 0, round(dd * 100, 1))
+            mid = len(s) // 2
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:])
+        print("\n=== CONC_AB: regime-scaled concentration vs fixed TOP_N ===", flush=True)
+        print(f"{'arm':>22} {'total%':>13} {'CAGR':>6} {'Sh':>5} {'DD':>7}  {'H1':>18} {'H2':>18}", flush=True)
+        _res = {}
+        for lab, cr in [("fixed TOP_N (BASE)", None), ("conc (6 fav/12 unfav)", (6, 12)), ("conc (5/12)", (5, 12)),
+                        ("conc (4/15)", (4, 15)), ("conc (8/8 flat-ish)", (8, 8))]:
+            perf = run(True, True, conc_regime=cr, **_base); full, h1, h2 = _summ(perf.get("monthly"))
+            _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "dd": full[3], "h1": h1, "h2": h2}
+            print(f"{lab:>22} {full[0]:>13,} {full[1]:>5.1f}% {full[2]:>5.2f} {full[3]:>6.1f}%  {str(h1):>18} {str(h2):>18}", flush=True)
+        b = _res["fixed TOP_N (BASE)"]["total"]; best = max(_res, key=lambda k: _res[k]["total"])
+        print(f"\nbaseline {b:,}%; best={best} {_res[best]['total']:,}% ({_res[best]['total']-b:+,} pp)", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="conc_regime_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
     if os.environ.get("HOLD_AB"):
         # A/B (user: "hold 1-2 more months for a total of 3?"): rebalance cadence 1 vs 2 vs 3 months (hold each pick
         # longer). Tests return AND drawdown (does slower churn cut the -22% DD?). Deployed adaptive stack; both halves.

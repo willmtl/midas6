@@ -131,6 +131,7 @@ def main():
         st["avg_concurrent"] = round(float(ncon.mean()), 1); st["n_positions"] = len(pos)
         st["h1_cagr"] = h1.get("cagr_pct"); st["h2_cagr"] = h2.get("cagr_pct")
         st["h1_vsxbi"] = h1.get("vs_xbi_pp"); st["h2_vsxbi"] = h2.get("vs_xbi_pp")
+        st["_monthly"] = [(str(d.date()), float(v)) for d, v in ((1 + port).resample("ME").prod() - 1).items()]  # for multi-book blend
         print(f"  {label:26} pos={len(pos):4} conc={st['avg_concurrent']:>4} | net CAGR {st.get('cagr_pct')}%/Sh{st.get('sharpe')}"
               f"/DD{st.get('maxdd_pct')}% | XBI CAGR {st.get('xbi_cagr_pct')}% vs {st.get('vs_xbi_pp')}pp | H1/H2 vsXBI {st['h1_vsxbi']}/{st['h2_vsxbi']}", flush=True)
         return st
