@@ -4690,6 +4690,47 @@ def build():
             print("save skipped:", _e, flush=True)
         sys.exit(0)
 
+    if os.environ.get("VOLUME_AB"):
+        # A/B (user: "test volume"): does a $-VOLUME (accumulation/liquidity) entry tilt beat deployed tl_support?
+        # Existing modes on vol_trend_m (20d/100d $vol): vol_up (building), vol_surge (>1.3x), vol_dry_avoid (skip
+        # drying <0.9), vol_down (driest, control). Deployed adaptive stack; both halves. Saves BacktestResult[volume_tilt_ab].
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _summ(monthly):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (monthly or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 12:
+                    return (float("nan"),) * 3
+                eq = (1 + x).prod(); cagr = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                return (round((eq - 1) * 100), round(cagr * 100, 1), round(x.mean() / x.std() * _np.sqrt(12), 2) if x.std() > 0 else 0)
+            mid = len(s) // 2
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:])
+
+        print("\n=== VOLUME_AB: $-volume entry tilts vs deployed tl_support — deployed adaptive ===", flush=True)
+        print(f"{'entry':>22} {'total%':>13} {'CAGR':>6} {'Sh':>5}  {'H1 t/CAGR/Sh':>16} {'H2 t/CAGR/Sh':>16}", flush=True)
+        _res = {}
+        for lab, en in [("tl_support (BASELINE)", "tl_support"), ("vol_up (building)", "vol_up"),
+                        ("vol_surge (>1.3x)", "vol_surge"), ("vol_dry_avoid", "vol_dry_avoid"),
+                        ("vol_down (control)", "vol_down")]:
+            perf = run(True, True, entry=en, entry_k=5, **_base)
+            full, h1, h2 = _summ(perf.get("monthly"))
+            _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "h1": h1, "h2": h2}
+            print(f"{lab:>22} {full[0]:>13,} {full[1]:>5.1f}% {full[2]:>5.2f}  {str(h1):>16} {str(h2):>16}", flush=True)
+        base = _res["tl_support (BASELINE)"]["total"]; best = max(_res, key=lambda k: _res[k]["total"])
+        print(f"\nbaseline {base:,}%; best={best} {_res[best]['total']:,}% "
+              f"({'+' if _res[best]['total']>base else ''}{_res[best]['total']-base:,} pp)", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="volume_tilt_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+            print("Saved BacktestResult[volume_tilt_ab]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
     if os.environ.get("PREEMPT_AB"):
         # A/B (user: "could we buy the monthly PRE-EMPTIVELY?"): does anticipating next-month's rotation beat entering
         # on current acceleration? Kill-switch FIRST: 'lookahead' = perfect foresight of next-month top sectors (upper
