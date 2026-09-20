@@ -1212,7 +1212,7 @@ tbody tr.clk:hover td{{background:color-mix(in srgb,var(--accent) 10%,transparen
     if(tl in TIER) return TIER[tl];
     if(t===''||t==='—'||t==='n/a') return -Infinity;
     var s=t.replace(/[$,×%\\s]/g,'').replace(/[–—]/g,'');
-    var m=s.match(/^(-?\d*\.?\d+)([BMK])?$/i);
+    var m=s.match(/^(-?\\d*\\.?\\d+)([BMK])?$/i);
     if(m){{var v=parseFloat(m[1]),u=(m[2]||'').toUpperCase(); if(u==='B')v*=1e9; else if(u==='M')v*=1e6; else if(u==='K')v*=1e3; return v;}}
     return tl;
   }}
