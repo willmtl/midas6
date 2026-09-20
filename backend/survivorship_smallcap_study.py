@@ -1213,6 +1213,8 @@ def build():
                 return (max if hi else min)(q, key=lambda h: float(panel.loc[date, h]))
             if entry == "vol_up":       return _pick_by(vol_trend_m, hi=True)   # BUILDING volume among the cheapest (20d/100d $vol highest)
             if entry == "vol_down":     return _pick_by(vol_trend_m, hi=False)  # contrarian control: driest volume
+            if entry == "hivol":        return _pick_by(stock_vol, hi=True)     # VOL TILT: most VOLATILE among the K cheapest (torque; high trailing rvol -> higher fwd return, beta-clean)
+            if entry == "lovol":        return _pick_by(stock_vol, hi=False)    # control: least volatile of the K cheapest
             if entry == "vol_dry_avoid":                                        # cheapest, but skip DRYING-volume names (<0.9)
                 q = [h for h in _K if h in vol_trend_m.columns and pd.notna(vol_trend_m.loc[date, h])
                      and float(vol_trend_m.loc[date, h]) >= 0.9]
@@ -4640,6 +4642,50 @@ def build():
             from django.utils import timezone
             BacktestResult.objects.update_or_create(kind="proxy_etf_ab", defaults={"payload": _res, "computed_at": timezone.now()})
             print("Saved BacktestResult[proxy_etf_ab]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("VOL_AB"):
+        # A/B (user: "use IV/vol as a selection mechanism"): tilt the pick toward high trailing realized-vol (torque)
+        # vs the deployed tl_support entry. hivol/lovol pick the most/least volatile among the entry_k cheapest.
+        # Confirmed signal: high-rvol picks +10.6%/mo vs low +1.2% (beta-clean). Does TILTING there add TOTAL return,
+        # or is it redundant with the existing cheap-P/B + div4x + small-cap torque? Deployed adaptive stack; both halves.
+        # Saves BacktestResult[vol_tilt_ab].
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _summ(monthly):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (monthly or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 12:
+                    return (float("nan"),) * 3
+                eq = (1 + x).prod(); cagr = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                return (round((eq - 1) * 100), round(cagr * 100, 1), round(x.mean() / x.std() * _np.sqrt(12), 2) if x.std() > 0 else 0)
+            mid = len(s) // 2
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:])
+
+        print("\n=== VOL_AB: vol-tilt entry vs deployed tl_support — deployed adaptive ===", flush=True)
+        print(f"{'entry':>22} {'total%':>13} {'CAGR':>6} {'Sh':>5}  {'H1 t/CAGR/Sh':>16} {'H2 t/CAGR/Sh':>16}", flush=True)
+        _res = {}
+        for lab, ek, en in [("tl_support (BASELINE)", 5, "tl_support"), ("hivol k5", 5, "hivol"),
+                            ("hivol k8", 8, "hivol"), ("lovol k5 (control)", 5, "lovol"),
+                            ("tl_support k8", 8, "tl_support")]:
+            perf = run(True, True, entry=en, entry_k=ek, **_base)
+            full, h1, h2 = _summ(perf.get("monthly"))
+            _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "h1": h1, "h2": h2}
+            print(f"{lab:>22} {full[0]:>13,} {full[1]:>5.1f}% {full[2]:>5.2f}  {str(h1):>16} {str(h2):>16}", flush=True)
+        base = _res["tl_support (BASELINE)"]["total"]
+        best = max(_res, key=lambda k: _res[k]["total"])
+        print(f"\nbaseline {base:,}%; best={best} {_res[best]['total']:,}% "
+              f"({'+' if _res[best]['total']>base else ''}{_res[best]['total']-base:,} pp)", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="vol_tilt_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+            print("Saved BacktestResult[vol_tilt_ab]", flush=True)
         except Exception as _e:
             print("save skipped:", _e, flush=True)
         sys.exit(0)
