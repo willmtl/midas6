@@ -4690,6 +4690,47 @@ def build():
             print("save skipped:", _e, flush=True)
         sys.exit(0)
 
+    if os.environ.get("HOLD_AB"):
+        # A/B (user: "hold 1-2 more months for a total of 3?"): rebalance cadence 1 vs 2 vs 3 months (hold each pick
+        # longer). Tests return AND drawdown (does slower churn cut the -22% DD?). Deployed adaptive stack; both halves.
+        # Saves BacktestResult[hold_cadence_ab]. (Memory: churn IS the edge — re-verify on current engine.)
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _summ(monthly):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (monthly or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 6:
+                    return (float("nan"),) * 4
+                eq = (1 + x).prod(); cagr = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                dd = ((1 + x).cumprod() / (1 + x).cumprod().cummax() - 1).min()
+                return (round((eq - 1) * 100), round(cagr * 100, 1),
+                        round(x.mean() / x.std() * _np.sqrt(12), 2) if x.std() > 0 else 0, round(dd * 100, 1))
+            mid = len(s) // 2
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:])
+
+        print("\n=== HOLD_AB: rebalance cadence (hold length) — deployed adaptive ===", flush=True)
+        print(f"{'cadence':>16} {'total%':>13} {'CAGR':>6} {'Sh':>5} {'DD':>7}  {'H1 t/C/Sh/DD':>18} {'H2':>18}", flush=True)
+        _res = {}
+        for lab, rb in [("1mo (BASELINE)", 1), ("2mo hold", 2), ("3mo hold", 3)]:
+            perf = run(True, True, rebal=rb, **_base)
+            full, h1, h2 = _summ(perf.get("monthly"))
+            _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "dd": full[3], "h1": h1, "h2": h2}
+            print(f"{lab:>16} {full[0]:>13,} {full[1]:>5.1f}% {full[2]:>5.2f} {full[3]:>6.1f}%  {str(h1):>18} {str(h2):>18}", flush=True)
+        b = _res["1mo (BASELINE)"]
+        print(f"\nbaseline 1mo {b['total']:,}% (CAGR {b['cagr']} DD {b['dd']}); "
+              f"2mo {_res['2mo hold']['total']:,}% (DD {_res['2mo hold']['dd']}); 3mo {_res['3mo hold']['total']:,}% (DD {_res['3mo hold']['dd']})", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="hold_cadence_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+            print("Saved BacktestResult[hold_cadence_ab]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
     if os.environ.get("VOLUME_AB"):
         # A/B (user: "test volume"): does a $-VOLUME (accumulation/liquidity) entry tilt beat deployed tl_support?
         # Existing modes on vol_trend_m (20d/100d $vol): vol_up (building), vol_surge (>1.3x), vol_dry_avoid (skip
