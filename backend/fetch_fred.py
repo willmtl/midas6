@@ -9,7 +9,9 @@ idempotent (upsert by series+date). Series pulled:
   DTWEXBGS    broad trade-weighted USD (daily)   -> dollar headwind
   BAMLH0A0HYM2 HY OAS credit spread (daily, %)   -> LEADING risk-off signal
   T10Y2Y      10y-2y Treasury curve (daily, %)   -> recession/curve signal
-CLI: python -u fetch_fred.py [--probe] [--run]
+  CPIAUCSL    CPI-U index (monthly)              -> realized inflation (YoY accel), PIT-lagged
+  T10YIE      10y breakeven inflation (daily, %) -> MARKET inflation EXPECTATION (forward-looking)
+CLI: python -u fetch_fred.py [--probe] [--run] [--only S1,S2]
 Run: MSYS_NO_PATHCONV=1 docker exec rotation-backend-1 python -u /app/fetch_fred.py --run
 """
 import os, argparse, urllib.request, io, csv
@@ -19,7 +21,7 @@ django.setup()
 
 from core.models import MacroSeries  # noqa: E402
 
-SERIES = ["M2SL", "WALCL", "RRPONTSYD", "WTREGEN", "DTWEXBGS", "BAMLH0A0HYM2", "T10Y2Y"]
+SERIES = ["M2SL", "WALCL", "RRPONTSYD", "WTREGEN", "DTWEXBGS", "BAMLH0A0HYM2", "T10Y2Y", "CPIAUCSL", "T10YIE"]
 
 
 def fetch(series_id):
@@ -42,9 +44,9 @@ def fetch(series_id):
     return out
 
 
-def backfill(save=True):
+def backfill(save=True, only=None):
     total = 0
-    for sid in SERIES:
+    for sid in (only or SERIES):
         obs = fetch(sid)
         if not obs:
             print(f"  {sid}: no data", flush=True)
@@ -63,10 +65,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", action="store_true")
     ap.add_argument("--run", action="store_true")
+    ap.add_argument("--only", default="")
     a = ap.parse_args()
     if not (a.run or a.probe):
         a.probe = True
-    backfill(save=a.run)
+    backfill(save=a.run, only=[s.strip() for s in a.only.split(",") if s.strip()] or None)
 
 
 if __name__ == "__main__":
