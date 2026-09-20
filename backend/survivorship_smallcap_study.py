@@ -3473,7 +3473,7 @@ def build():
             ("middle", "Middle — commodity exemption", "Skip large-cap-only sectors EXCEPT commodity/miners (keep the real producer). Robust + lower DD.",
              dict(largecap_mode="skip", largecap_keep=MINER)),
             ("adaptive", "Adaptive — regime switch (12mo)", "Detects value/small-cap leadership from the rotation system's own 12-month momentum (regimes are multi-year, so a slow signal avoids whipsaw); aggressive in our regime, core when mega-cap growth leads. Best risk-adjusted config.",
-             dict(regime_switch="either", regime_signal="multi")),
+             dict(regime_switch="either", regime_signal="multi", quality_gate="si_days", small_min=1e8, no_cash=True)),  # match FLAGSHIP_TRACE deployed stack
             ("aggressive", "Aggressive — regime bet", "Skip ALL large-cap-only sectors (pure small-cap). Levered long the post-2020 small-cap/commodity regime.",
              dict(largecap_mode="skip")),
         ]

@@ -458,7 +458,17 @@ def build():
     if best:
         print(f"\n  BEST walk-forward-honest variant: {best[0]} — FULL {best[1]['full']:.0f}% Sharpe {best[1]['sharpe']}", flush=True)
 
-    BacktestResult.objects.update_or_create(kind="finviz_rotation", defaults=dict(computed_at=timezone.now(), payload={
+    def _clean(o):                       # Postgres JSONField rejects Infinity/NaN (e.g. accel div-by-0) -> None
+        import math as _m
+        if isinstance(o, float):
+            return o if _m.isfinite(o) else None
+        if isinstance(o, dict):
+            return {k: _clean(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [_clean(v) for v in o]
+        return o
+
+    BacktestResult.objects.update_or_create(kind="finviz_rotation", defaults=dict(computed_at=timezone.now(), payload=_clean({
         "engine": "finviz_industry_rotation_v2",
         "note": ("SEPARATE Finviz-taxonomy engine: rotate top-accel Finviz INDUSTRIES (equal-weight "
                  "constituent index), buy cheapest-P/B small-cap inside each, monthly. v2 adds the quality/"
@@ -471,7 +481,7 @@ def build():
         "picks_log": full["picks_log"],
         "sections": _aggregate_trace(full.get("tmonths", [])),
         "tmonths": full.get("tmonths", []),
-    }))
+    })))
     print("\nsaved BacktestResult[finviz_rotation]", flush=True)
 
 
