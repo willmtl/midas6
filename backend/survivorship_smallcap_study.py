@@ -4671,8 +4671,8 @@ def build():
         print(f"{'entry':>22} {'total%':>13} {'CAGR':>6} {'Sh':>5}  {'H1 t/CAGR/Sh':>16} {'H2 t/CAGR/Sh':>16}", flush=True)
         _res = {}
         for lab, ek, en in [("tl_support (BASELINE)", 5, "tl_support"), ("hivol k5", 5, "hivol"),
-                            ("hivol k8", 8, "hivol"), ("lovol k5 (control)", 5, "lovol"),
-                            ("tl_support k8", 8, "tl_support")]:
+                            ("lovol k3 (top3->lowvol)", 3, "lovol"), ("lovol k5", 5, "lovol"),
+                            ("hivol k3", 3, "hivol")]:
             perf = run(True, True, entry=en, entry_k=ek, **_base)
             full, h1, h2 = _summ(perf.get("monthly"))
             _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "h1": h1, "h2": h2}
