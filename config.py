@@ -71,7 +71,10 @@ SECTOR_ETFS = {
     "MLPs & Pipelines": "AMLP",
     "IPO & New Listings": "IPO",
     "Mortgage REITs": "REM",
-    "Shipping": "BOAT",
+    # REMOVED "Shipping": "BOAT" (2026-09-17, user): cheapest-P/B in shipping = deep-cyclical value trap
+    # (book value swings with charter rates). A/B (DROP_ETFS=BOAT): flagship 272,220% -> 358,144% (H1 identical,
+    # all gain in H2, Sharpe ~flat 2.05), 6/7 Shipping-pick months the substitute did >=; picks INSW/DAC/GNK lagged
+    # the next-best accelerating sector's value pick. Moved to DEACTIVATED_ETFS so accel stays monitored.
     "Timber & Forestry": "WOOD",
 
     # ── Commodities ──
@@ -227,6 +230,7 @@ SECTOR_ETFS = {
 # survivorship_smallcap_study + fetch_delisted, not the ETF-rotation flagship.
 DEACTIVATED_ETFS = {
     "Low Volatility": "SPLV",
+    "Shipping": "BOAT",   # 2026-09-17 user: deactivated (value-trap picks); accel still monitored. See A/B in SECTOR_ETFS note above.
 }
 
 # Data settings

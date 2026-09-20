@@ -435,8 +435,12 @@ HOLDINGS = {
         "etf": "GLD",
         # Physical gold has no equity; use gold MINERS so the sleeve picks a cheap producer (value)
         # instead of bullion. Pick logic filters to those with candles + positive P/B.
+        # 2026-09-17: "GOLD" -> "B". Barrick renamed to "Barrick Mining Corp" and moved ticker GOLD->B in 2025;
+        # the vacated ticker GOLD was REASSIGNED to "Gold.com, Inc." (Financial Services / Capital Markets, 29M sh)
+        # which the flagship was wrongly buying as a gold miner (EODHD confirmed). B = real Barrick ($71B, large-cap
+        # -> small-cap flagship skips it correctly). (Old ABX ticker also reused -> "Abacus Global"; not in roster.)
         "holdings": [
-            "NEM", "GOLD", "AEM", "KGC", "FNV", "WPM", "RGLD", "AU", "GFI",
+            "NEM", "B", "AEM", "KGC", "FNV", "WPM", "RGLD", "AU", "GFI",
             "BTG", "EGO", "IAG", "NGD", "SSRM", "HMY", "OR", "HL", "PAAS",
         ],
     },
@@ -450,7 +454,10 @@ HOLDINGS = {
     },
     "Platinum": {
         "etf": "PPLT",
-        "holdings": [],  # Holds physical platinum
+        # 2026-09-20: was empty (physical platinum). Added PLG (Platinum Group Metals Ltd) — the ONLY clean US-listed,
+        # USD-reporting, positive-equity PGM equity we have PIT fundamentals for. SBSW (Sibanye ADR) EXCLUDED: its
+        # statements are ZAR while price is USD => P/B would be ~18x fabricated-cheap. GENM excluded (negative equity).
+        "holdings": ["PLG"],
     },
     "Oil": {
         "etf": "USO",
@@ -498,19 +505,24 @@ HOLDINGS = {
     },
     "Copper Miners": {
         "etf": "COPX",
+        # 2026-09-20: added US-listed variants that actually have candles+PIT fundamentals in our DB (TGB/WRN/ERO/HBM)
+        # — the pre-existing .TO/.AX/.L names mostly lack data so the sleeve fielded ~no US/CA value pick. SCCO/FCX kept.
         "holdings": [
             "HBM.TO", "TECK-B.TO", "BHP.AX", "ANTO.L", "FM.TO",
             "KGH.WA", "BOL.ST", "SCCO", "GLEN.L", "LUN.TO", "FCX",
             "IVPAF", "ERO.TO", "TRQ", "CS.TO", "FILO.TO", "OZL.AX",
             "SFR.AX", "SOLG.ST", "CU.TO",
+            "TGB", "WRN", "ERO", "HBM",
         ],
     },
     "Steel": {
         "etf": "SLX",
+        # 2026-09-20: added aluminum (CENX/KALU) + met-coke (SXC) as base-metal producers (no dedicated Aluminum sleeve).
         "holdings": [
             "BHP", "RIO", "NUE", "RIO.AX", "VALE", "STLD", "FMG.AX",
             "MT", "RS", "PKX", "CLF", "X", "AA", "CMC", "GGB",
             "SID", "TX", "SCHN", "WOR", "ZEUS",
+            "CENX", "KALU", "SXC",
         ],
     },
 
@@ -790,6 +802,26 @@ HOLDINGS = {
 import os as _os
 import json as _json
 _EXPANDED = None
+_ROSTER_OVERLAY = None
+
+
+def _roster_overlay() -> dict:
+    """AUTO-SYNC overlay written by backend/sync_etf_rosters.py: current ETF constituents auto-pulled from EODHD for
+    the CORE US-EQUITY sleeves, UNION-ONLY (never removes; keeps delisted names -> no survivorship). Merged into
+    get_holdings() by DEFAULT (disable with env ROSTER_OVERLAY=0). Format {sector_name: [tickers]}. Absent file ->
+    {}. New names without PIT FinancialReport are filtered out by the engine's point-in-time panels anyway."""
+    global _ROSTER_OVERLAY
+    if _ROSTER_OVERLAY is None:
+        _ROSTER_OVERLAY = {}
+        for _p in ("/app/.data/roster_overlay.json",
+                   _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".data", "roster_overlay.json")):
+            try:
+                with open(_p) as _f:
+                    _ROSTER_OVERLAY = _json.load(_f)
+                break
+            except Exception:
+                continue
+    return _ROSTER_OVERLAY
 
 
 def _expanded_holdings() -> dict:
@@ -818,6 +850,12 @@ def get_holdings(sector_name: str, expanded=None) -> list[str]:
     by the nightly validated backtests (whose numbers must stay on the clean top-20 universe)."""
     data = HOLDINGS.get(sector_name)
     base = list(data["holdings"]) if data else []
+    # AUTO-SYNC overlay (default ON, union-only): fold in current ETF constituents for core equity sleeves.
+    if _os.environ.get("ROSTER_OVERLAY", "1") != "0":
+        _seen = set(base)
+        for t in (_roster_overlay().get(sector_name) or []):
+            if t not in _seen:
+                _seen.add(t); base.append(t)
     if expanded is None:
         expanded = bool(_os.environ.get("EXPANDED_UNIVERSE"))
     if expanded:

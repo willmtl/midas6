@@ -288,6 +288,10 @@ PLAY_DEFENSIVE = {"XLP", "XLU", "PBJ", "MOO", "PHO"}        # defensives -> chea
 # everything else (healthcare, biotech, genomics, communications, broad, foreign...) -> the analyst-upside blend
 BOND_ETFS = {"TLT", "TLH", "AGG", "BND", "HYG", "JNK", "TIP", "VTIP", "GOVT", "BIL", "SHV", "SHY", "IEI",
              "IEF", "LQD", "FLOT", "MUB", "CWB", "EMB", "BWX", "IGOV", "TIPX"}
+# Crypto sleeves hold no equity, BUT unlike commodities bitcoin is a TRENDING (not mean-reverting) asset, so
+# holding the ETF proxy is a distinct hypothesis from the refuted commodity-proxy (user: "with crypto you can just
+# buy IBIT"). proxy_etf={"crypto"} holds BTC-USD/IBIT in months the crypto sleeve accelerates into the pick set.
+CRYPTO_ETFS = {"IBIT", "BTC-USD", "GBTC", "FBTC", "BITB", "ETHE", "ETH-USD"}
 GIC_FILE = "/app/.data/delisted_gic.json"
 OUT = Path(__file__).resolve().parent / ".data" / "studies" / "survivorship_smallcap.json"
 
@@ -328,7 +332,9 @@ def build():
     from django.db import connection
     with connection.cursor() as cur:
         cur.execute("SET max_parallel_workers_per_gather = 0")
-    etfs = {n: e for n, e in config.SECTOR_ETFS.items() if e not in CRYPTO}
+    # crypto sleeves are normally excluded from the rotation universe (CRYPTO set); CRYPTO_INCLUDE=1 lets them in so
+    # BTC-USD/IBIT can accelerate into the pick set (needed to test the proxy_etf={"crypto"} "just buy IBIT" idea).
+    etfs = {n: e for n, e in config.SECTOR_ETFS.items() if e not in CRYPTO or os.environ.get("CRYPTO_INCLUDE")}
     try:                                     # ticker -> company name, for the flagship-history trace (optional)
         NAMEMAP = json.load(open("/app/.data/ticker_names.json"))
     except Exception:
@@ -1442,6 +1448,9 @@ def build():
                 _c = a[a > 0].dropna().sort_values(ascending=False)          # (top over-extended already ran)
                 _c = _c.iloc[2:] if len(_c) > _tn + 2 else _c              # skip the 2 most-extended sleeves
                 top = _c.head(_tn).index
+            elif _sr == "lookahead":                   # ⚠️ LOOK-AHEAD UPPER BOUND (backtest-only kill-switch): pick
+                _na = accel.iloc[i + 1] if i + 1 < len(accel) else a        # NEXT month's top-accel sectors (perfect
+                top = _na.reindex(a.dropna().index).dropna().sort_values(ascending=False).head(_tn).index  # foresight)
             else:
                 top = a.dropna().sort_values(ascending=False).head(_tn).index
             if flow_gate and not sector_flow_m.empty:      # ETF FUND-FLOW confirm: from the accel ranking, keep only
@@ -1606,7 +1615,8 @@ def build():
                                               "accel": _f(accel.loc[date, etf]) if etf in accel.columns else None})
                     if proxy_etf:
                         # proxy_etf True = hold ANY skipped ETF; or a set of types {"commodity","bond","foreign"}
-                        _typ = "commodity" if etf in COMMODITY_ETFS else ("bond" if etf in BOND_ETFS else "foreign")
+                        _typ = ("commodity" if etf in COMMODITY_ETFS else "bond" if etf in BOND_ETFS
+                                else "crypto" if etf in CRYPTO_ETFS else "foreign")
                         if (proxy_etf is True) or (_typ in proxy_etf):
                             re = etf_m[etf].iloc[i + _step] / etf_m[etf].iloc[i] - 1 if etf in etf_m.columns else np.nan
                             if np.isfinite(re):
@@ -4539,6 +4549,231 @@ def build():
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(json.dumps(out, indent=2, default=str))
         print(f"FLAGSHIP_TRACE[{_ck}] written: {fp}  months={len(tr)}  total={perf.get('total')}%", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("GATE_AB"):
+        # A/B REMOVING the small-cap gate on the DEPLOYED adaptive flagship (user: mega sleeves like Mag7/QQQ never
+        # pick because their AAPL/MSFT/NVDA constituents fail the small-cap cap — let them in). small_only True (base)
+        # vs False (all-cap). Reports total/CAGR/Sharpe + halves + how many picks are large-cap (>=$2B) + whether any
+        # mega/index sleeve fielded a pick. Same adaptive stack otherwise.
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+        MEGA = {"Mag 7", "Nasdaq 100", "S&P 500", "Dow Jones", "Total Market", "Russell 1000 / Large Cap",
+                "Equal-Weight S&P", "Growth", "Value", "Momentum", "Dividend", "Mid Cap"}
+
+        def _halves(monthly):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (monthly or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 12:
+                    return (float("nan"),) * 3
+                eq = (1 + x).prod(); cagr = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                return (round((eq - 1) * 100), round(cagr * 100, 1), round(x.mean() / x.std() * _np.sqrt(12), 2) if x.std() > 0 else 0)
+            mid = len(s) // 2
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:])
+
+        print("\n=== GATE_AB: small-cap gate ON (flagship) vs OFF (all-cap) — deployed adaptive ===", flush=True)
+        print(f"{'arm':>18} {'total%':>11} {'CAGR':>6} {'Sh':>5}   {'H1':>20} {'H2':>20}  {'%largecap':>9} {'megaSleevePicks':>15}", flush=True)
+        _res = {}
+        for lab, so in [("gate ON (small)", True), ("gate OFF (all-cap)", False)]:
+            tr = []
+            perf = run(True, so, trace=tr, **_base)
+            full, h1, h2 = _halves(perf.get("monthly"))
+            allp = [p for m in tr for p in m.get("picks", []) if p.get("ticker")]
+            nlarge = sum(1 for p in allp if (p.get("mktcap_usd") or 0) >= 2e9)
+            mega = sorted({p["sector"] for p in allp if p.get("sector") in MEGA})
+            _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "h1": h1, "h2": h2,
+                         "pct_largecap": round(100 * nlarge / max(1, len(allp)), 1), "mega_sleeve_picks": mega}
+            print(f"{lab:>18} {perf.get('total'):>11.0f} {full[1]:>5.1f}% {full[2]:>5.2f}   {str(h1):>20} {str(h2):>20}  "
+                  f"{100*nlarge/max(1,len(allp)):>8.1f}% {(','.join(mega) if mega else 'none'):>15}", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="smallcap_gate_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+            print("Saved BacktestResult[smallcap_gate_ab]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("PROXY_AB"):
+        # A/B (user): when an accelerating sector fields NO qualifying small-cap value stock — its roster is large-cap
+        # majors (Oil/Energy XOM/CVX/EOG, Gold NEM/Barrick/AEM) or a raw commodity ETF (USO/GLD/PPLT) — the deployed
+        # flagship SKIPS the slot. Test HOLDING the ETF proxy instead: proxy_etf=False (deployed skip) vs True (hold any
+        # skipped ETF) vs {"commodity"} (hold only commodity ETFs, still skip foreign/bond). Same deployed adaptive
+        # stack. Reports total/CAGR/Sharpe/DD + both halves + per-year. Relitigates [[etf-proxy-and-skips-refuted]] on
+        # the CURRENT engine. Saves BacktestResult[proxy_etf_ab].
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _summ(monthly):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (monthly or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 12:
+                    return (float("nan"),) * 4
+                eq = (1 + x).prod(); cagr = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                dd = ((1 + x).cumprod() / (1 + x).cumprod().cummax() - 1).min()
+                return (round((eq - 1) * 100), round(cagr * 100, 1),
+                        round(x.mean() / x.std() * _np.sqrt(12), 2) if x.std() > 0 else 0, round(dd * 100, 1))
+            mid = len(s) // 2
+            py = {int(y): round(((1 + s[s.index.year == y]).prod() - 1) * 100, 1) for y in sorted(set(s.index.year))}
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:]), py
+
+        print("\n=== PROXY_AB: SKIP (deployed) vs HOLD-ETF-PROXY in no-value-name sectors — deployed adaptive ===", flush=True)
+        print(f"{'arm':>22} {'total%':>13} {'CAGR':>6} {'Sh':>5} {'DD':>7}  {'H1 t/CAGR/Sh':>18} {'H2 t/CAGR/Sh':>18}", flush=True)
+        _res = {}
+        for lab, pe in [("skip (DEPLOYED)", False), ("proxy ALL", True), ("proxy COMMODITY", {"commodity"})]:
+            perf = run(True, True, proxy_etf=pe, **_base)
+            full, h1, h2, py = _summ(perf.get("monthly"))
+            _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "dd": full[3],
+                         "h1": h1, "h2": h2, "yearly": py}
+            print(f"{lab:>22} {full[0]:>13,} {full[1]:>5.1f}% {full[2]:>5.2f} {full[3]:>6.1f}%  "
+                  f"{str(h1[:3]):>18} {str(h2[:3]):>18}", flush=True)
+        print(f"\n  per-year %:  {'year':>6} {'skip':>10} {'proxyALL':>10} {'proxyCOMMOD':>12}", flush=True)
+        for y in sorted(_res["skip (DEPLOYED)"]["yearly"]):
+            print(f"           {y:>6} {_res['skip (DEPLOYED)']['yearly'].get(y,0):>+9.1f}% "
+                  f"{_res['proxy ALL']['yearly'].get(y,0):>+9.1f}% {_res['proxy COMMODITY']['yearly'].get(y,0):>+11.1f}%", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="proxy_etf_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+            print("Saved BacktestResult[proxy_etf_ab]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("PREEMPT_AB"):
+        # A/B (user: "could we buy the monthly PRE-EMPTIVELY?"): does anticipating next-month's rotation beat entering
+        # on current acceleration? Kill-switch FIRST: 'lookahead' = perfect foresight of next-month top sectors (upper
+        # bound; if even cheating doesn't beat baseline, pre-emption is dead). Then PIT pre-emptive rules: accel_inflect
+        # (rising accel = just-starting), early (accel>0 but price hasn't run), accel_cap (skip blow-offs). Deployed
+        # adaptive stack; total/CAGR/Sharpe/both-halves/per-year. Saves BacktestResult[preempt_ab].
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _summ(monthly):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (monthly or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 12:
+                    return (float("nan"),) * 3
+                eq = (1 + x).prod(); cagr = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                return (round((eq - 1) * 100), round(cagr * 100, 1), round(x.mean() / x.std() * _np.sqrt(12), 2) if x.std() > 0 else 0)
+            mid = len(s) // 2
+            py = {int(y): round(((1 + s[s.index.year == y]).prod() - 1) * 100, 1) for y in sorted(set(s.index.year))}
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:]), py
+
+        print("\n=== PREEMPT_AB: current accel vs pre-emptive/anticipatory sector selection — deployed adaptive ===", flush=True)
+        print(f"{'rule':>16} {'total%':>13} {'CAGR':>6} {'Sh':>5}  {'H1 t/CAGR/Sh':>16} {'H2 t/CAGR/Sh':>16}", flush=True)
+        _res = {}
+        for lab, sr in [("accel (BASELINE)", None), ("lookahead (CHEAT)", "lookahead"),
+                        ("accel_inflect", "accel_inflect"), ("early", "early"), ("accel_cap", "accel_cap")]:
+            perf = run(True, True, sector_rule=sr, **_base)
+            full, h1, h2, py = _summ(perf.get("monthly"))
+            _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "h1": h1, "h2": h2, "yearly": py}
+            print(f"{lab:>16} {full[0]:>13,} {full[1]:>5.1f}% {full[2]:>5.2f}  {str(h1):>16} {str(h2):>16}", flush=True)
+        base_t = _res["accel (BASELINE)"]["total"]
+        print(f"\nbaseline {base_t:,}%; lookahead(cheat) {_res['lookahead (CHEAT)']['total']:,}% "
+              f"({'+' if _res['lookahead (CHEAT)']['total']>base_t else ''}{_res['lookahead (CHEAT)']['total']-base_t:,} pp)", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="preempt_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+            print("Saved BacktestResult[preempt_ab]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("CRYPTO_AB"):
+        # A/B (user: "with crypto you can just buy IBIT"): hold the crypto ETF (BTC-USD/IBIT) when the crypto sleeve
+        # accelerates into the pick set, vs deployed SKIP. Distinct from the refuted commodity-proxy because bitcoin
+        # TRENDS (doesn't mean-revert). proxy_etf={"crypto"} only. Reports total/CAGR/Sharpe/DD + halves + per-year +
+        # how many months crypto was actually held. Saves BacktestResult[crypto_proxy_ab].
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _summ(monthly):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (monthly or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 12:
+                    return (float("nan"),) * 4
+                eq = (1 + x).prod(); cagr = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                dd = ((1 + x).cumprod() / (1 + x).cumprod().cummax() - 1).min()
+                return (round((eq - 1) * 100), round(cagr * 100, 1),
+                        round(x.mean() / x.std() * _np.sqrt(12), 2) if x.std() > 0 else 0, round(dd * 100, 1))
+            mid = len(s) // 2
+            py = {int(y): round(((1 + s[s.index.year == y]).prod() - 1) * 100, 1) for y in sorted(set(s.index.year))}
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:]), py
+
+        print("\n=== CRYPTO_AB: SKIP (deployed) vs HOLD crypto ETF (BTC/IBIT) when crypto sleeve accelerates ===", flush=True)
+        print(f"{'arm':>22} {'total%':>13} {'CAGR':>6} {'Sh':>5} {'DD':>7} {'cryptoMo':>8}  {'H1 t/CAGR/Sh':>18} {'H2 t/CAGR/Sh':>18}", flush=True)
+        _res = {}
+        for lab, pe in [("skip (DEPLOYED)", False), ("proxy CRYPTO", {"crypto"})]:
+            tr = []
+            perf = run(True, True, proxy_etf=pe, trace=tr, **_base)
+            full, h1, h2, py = _summ(perf.get("monthly"))
+            cm = sum(1 for m in tr for p in m.get("picks", []) if p.get("ticker") in CRYPTO_ETFS or p.get("sector") in ("Bitcoin", "Ethereum"))
+            _res[lab] = {"total": full[0], "cagr": full[1], "sharpe": full[2], "dd": full[3],
+                         "h1": h1, "h2": h2, "yearly": py, "crypto_months": cm}
+            print(f"{lab:>22} {full[0]:>13,} {full[1]:>5.1f}% {full[2]:>5.2f} {full[3]:>6.1f}% {cm:>8}  "
+                  f"{str(h1[:3]):>18} {str(h2[:3]):>18}", flush=True)
+        print(f"\n  per-year %:  {'year':>6} {'skip':>10} {'proxyCRYPTO':>12}", flush=True)
+        for y in sorted(_res["skip (DEPLOYED)"]["yearly"]):
+            print(f"           {y:>6} {_res['skip (DEPLOYED)']['yearly'].get(y,0):>+9.1f}% "
+                  f"{_res['proxy CRYPTO']['yearly'].get(y,0):>+11.1f}%", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="crypto_proxy_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+            print("Saved BacktestResult[crypto_proxy_ab]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("CEIL_AB"):
+        # A/B an absolute P/B CEILING on the DEPLOYED adaptive flagship (drop fake-value high-P/B growth picks like
+        # TWLO@27 / SPOT@16 that the value gate is forced into when a growth sleeve accelerates). Same adaptive stack
+        # as LIVE_PICK; only pb_ceiling varies. Reports total/CAGR/Sharpe + both halves (from perf['monthly']).
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _halves(monthly):
+            s = pd.Series({pd.Timestamp(d): float(v) for d, v in (monthly or [])}).sort_index()
+
+            def _st(x):
+                if len(x) < 12:
+                    return (float("nan"),) * 3
+                eq = (1 + x).prod(); cagr = eq ** (12 / len(x)) - 1 if eq > 0 else -1
+                sh = x.mean() / x.std() * _np.sqrt(12) if x.std() > 0 else 0
+                return (round((eq - 1) * 100), round(cagr * 100, 1), round(sh, 2))
+            mid = len(s) // 2
+            return _st(s), _st(s.iloc[:mid]), _st(s.iloc[mid:])
+
+        arms = [("baseline (no ceiling)", None), ("flat pb<=10", 10.0), ("flat pb<=8", 8.0), ("flat pb<=5", 5.0),
+                ("tiered 5/8/12", {"micro": 5, "small": 8, "large": 12}),
+                ("tiered 4/6/10", {"micro": 4, "small": 6, "large": 10}),
+                ("tiered 3/5/8", {"micro": 3, "small": 5, "large": 8})]
+        print("\n=== CEIL_AB: P/B ceiling on the DEPLOYED adaptive flagship ===", flush=True)
+        print(f"{'arm':>24} {'total%':>11} {'CAGR':>6} {'Sh':>5}   {'H1 (t/cagr/sh)':>22} {'H2 (t/cagr/sh)':>22}", flush=True)
+        _res = {}
+        for lab, ceil in arms:
+            perf = run(True, True, pb_ceiling=ceil, **_base)
+            full, h1, h2 = _halves(perf.get("monthly"))
+            _res[lab] = {"perf_total": perf.get("total"), "full": full, "h1": h1, "h2": h2, "sharpe": perf.get("sharpe"), "dd": perf.get("dd")}
+            print(f"{lab:>24} {perf.get('total'):>11.0f} {full[1]:>5.1f}% {full[2]:>5.2f}   {str(h1):>22} {str(h2):>22}", flush=True)
+        try:
+            from core.models import BacktestResult
+            from django.utils import timezone
+            BacktestResult.objects.update_or_create(kind="pb_ceiling_ab", defaults={"payload": _res, "computed_at": timezone.now()})
+            print("Saved BacktestResult[pb_ceiling_ab]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
         sys.exit(0)
 
     results = {
