@@ -858,15 +858,61 @@ def build():
             entry = float(base)
         return float(end / entry - 1.0) if entry > 0 else None
     reps = load_financial_reports(universe)
-    # PIT INTEGRITY: clamp avail_date to a realistic public-availability FLOOR (period_end + 45d). Some EODHD
-    # filing_dates are bad — ~14% of records have avail_date <= period_end (financials "available" before the quarter
-    # even ended = LOOK-AHEAD; min -244d). Never let a report be usable before period_end+45d even if the feed says
-    # earlier. (Too-LATE avail_dates are left as-is: stale, not look-ahead.) Fixes every downstream PIT panel at once.
-    _AVFLOOR = pd.Timedelta(days=int(os.environ.get("AVFLOOR_DAYS", 45)))
+    # PIT INTEGRITY: resolve each report's public-availability date. PRIMARY = the authoritative SEC EDGAR filing date
+    # (fetch_edgar_filing_dates.py stores, per reportDate, the EARLIEST 10-Q/10-K filed date — user rule 2026-09-21:
+    # "use the 10-Q unless a 10-K with a better [earlier] date is available"). EODHD's own avail_date is unreliable:
+    # ~14% are impossible (<= period_end = LOOK-AHEAD; min -244d), and missing ones fall back to a flat +45d guess that
+    # is too early for the fiscal-year-end 10-K (which files ~60-90d out). Evidence (2026-09-21): where EODHD is VALID
+    # it already equals the 10-K to the day — so EDGAR is a surgical REPAIR of the broken rows, not a wholesale shift.
+    # Names EDGAR can't serve (foreign ADRs, delisted w/o a CIK match) fall back to max(EODHD, period_end + FREQUENCY-
+    # aware floor): quarterly 45d / semi-annual 90d / annual 120d (10-Q vs 10-K vs 20-F deadlines). Fixes every
+    # downstream PIT panel (monthly/TTM/shares) at once.
+    _edgar = {}
+    if os.environ.get("EDGAR_DATES", "1") != "0":
+        try:
+            _ej = json.load(open("/app/.data/edgar_filing_dates.json"))
+            for _t, _m in _ej.items():
+                _edgar[_t.upper()] = {pd.Timestamp(_rd): pd.Timestamp(_v["filed"]) for _rd, _v in _m.items()}
+        except Exception:
+            _edgar = {}
+    _AVFLOOR_Q = pd.Timedelta(days=int(os.environ.get("AVFLOOR_DAYS", 45)))
+    _AVFLOOR_S = pd.Timedelta(days=int(os.environ.get("AVFLOOR_SEMI_DAYS", 90)))
+    _AVFLOOR_A = pd.Timedelta(days=int(os.environ.get("AVFLOOR_ANN_DAYS", 120)))
+    _TOL = pd.Timedelta(days=10)     # EDGAR reportDate vs EODHD period_end can drift (52/53-week fiscal calendars)
+    # DIGEST ENTRY LAG (DEPLOYED DEFAULT 8bd, 2026-09-21): add N business days to EVERY avail_date so the value pick acts
+    # on book the MARKET HAS DIGESTED (~1.5wk after the earnings 8-K), not the instant it's public. Validated look-ahead-
+    # SAFE (uses later data) + robust: beats 0bd on Sharpe in ALL 5 disjoint ~2yr rolling-WF folds, both halves, 5-12bd
+    # plateau, DD equal-or-better; craters only past ~20bd. See BacktestResult[digest_lag_ab]. Env overrides for tests.
+    _EXTRA = int(os.environ.get("AVAIL_EXTRA_LAG_BD", 8))
+    _n_edgar = _n_floor = 0
     for _tk, _r in reps.items():
-        if "period_end" in _r.columns and "avail_date" in _r.columns:
-            _pe = pd.to_datetime(_r["period_end"]); _av = pd.to_datetime(_r["avail_date"])
-            _r["avail_date"] = _av.where(_av >= _pe + _AVFLOOR, _pe + _AVFLOOR)
+        if "period_end" not in _r.columns or "avail_date" not in _r.columns:
+            continue
+        _pe = pd.to_datetime(_r["period_end"]); _av = pd.to_datetime(_r["avail_date"])
+        _gap = _pe.diff().dt.days.median()
+        _floor = _AVFLOOR_Q if (pd.isna(_gap) or _gap < 135) else (_AVFLOOR_S if _gap < 270 else _AVFLOOR_A)
+        _new = _av.where(_av >= _pe + _floor, _pe + _floor)          # frequency-aware floor (fallback / non-EDGAR)
+        _em = _edgar.get(_tk.upper())
+        if _em:
+            _rds = pd.Series(sorted(_em.keys()))
+            for _i in _pe.index:
+                _p = _pe[_i]
+                if pd.isna(_p):
+                    continue
+                _d = (_rds - _p).abs()                                # nearest EDGAR reportDate within tolerance
+                _j = _d.idxmin()
+                if _d[_j] <= _TOL:
+                    _new[_i] = _em[_rds[_j]]; _n_edgar += 1           # authoritative SEC filed date
+                else:
+                    _n_floor += 1
+        else:
+            _n_floor += int(_pe.notna().sum())
+        if _EXTRA:                                                       # market-digestion lag test (does NOT change source)
+            _new = _new + pd.tseries.offsets.BusinessDay(_EXTRA)
+        _r["avail_date"] = _new
+    if os.environ.get("FLAGSHIP_TRACE") or os.environ.get("LIVE_PICK"):
+        print(f"avail_date: {_n_edgar} rows from SEC EDGAR, {_n_floor} from EODHD+freq-floor"
+              f"{f' (+{_EXTRA}bd digest lag)' if _EXTRA else ''}", flush=True)
     _splits = price_basis.load_splits()
     sh_adj = _adj_shares_panel(reps, _splits, midx)   # split-consistent shares (today's basis) — see fn docstring
     eq, ni, dt = (_pit_monthly_panel(reps, f, midx) for f in ("total_equity", "net_income", "total_debt"))
@@ -1007,6 +1053,7 @@ def build():
     ps_ttm = mktcap / ttm_rev.where(ttm_rev > 0)            # cheapest P/S (TTM sales)
     evebit_ttm = _ev / ttm_opinc.where(ttm_opinc > 0)      # cheapest EV/EBIT (TTM, positive EBIT)
     fcfy_ttm = -(ttm_fcf / _ev.where(_ev > 0))             # highest FCF/EV -> negate so min = best
+    pfcf_ttm = mktcap / ttm_fcf.where(ttm_fcf > 0)         # cheapest POSITIVE Price/Free-Cash-Flow (user A/B 2026-09-21)
     # ANALYST implied-upside panel (PIT): (latest target within 90d) / month-close − 1. For mixing the Benzinga
     # signal into the flagship pick (tie-breaker / gate). Higher = more analyst upside.
     upside_m = _analyst_upside_panel(midx, as_traded).reindex(index=midx, columns=common)  # as_traded (nominal): target/price is split-consistent (px is split-back-adjusted -> future-split look-ahead)
@@ -1803,8 +1850,9 @@ def build():
                 elif value_key == "pb_roe":     # crude heuristic
                     q = [x for x in g if pd.notna(pb_roe.loc[date, x])]
                     p = min(q, key=lambda h: pb_roe.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
-                elif value_key in ("pe_ttm", "ps_ttm", "evebit_ttm", "fcfy_ttm"):  # TTM value-metric bake-off
-                    _M = {"pe_ttm": pe_ttm_pos, "ps_ttm": ps_ttm, "evebit_ttm": evebit_ttm, "fcfy_ttm": fcfy_ttm}[value_key]
+                elif value_key in ("pe_ttm", "ps_ttm", "evebit_ttm", "fcfy_ttm", "pfcf"):  # TTM value-metric bake-off
+                    _M = {"pe_ttm": pe_ttm_pos, "ps_ttm": ps_ttm, "evebit_ttm": evebit_ttm,
+                          "fcfy_ttm": fcfy_ttm, "pfcf": pfcf_ttm}[value_key]
                     q = [x for x in g if pd.notna(_M.loc[date, x])]
                     p = min(q, key=lambda h: _M.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
                 elif value_key == "justified":  # rigorous #1: P/B vs (ROE-g)/(r-g)
@@ -4634,6 +4682,94 @@ def build():
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(json.dumps(out, indent=2, default=str))
         print(f"FLAGSHIP_TRACE[{_ck}] written: {fp}  months={len(tr)}  total={perf.get('total')}%", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("PFCF_AB"):
+        # A/B: swap the flagship VALUE SELECTOR to Price/Free-Cash-Flow (cheapest POSITIVE P/FCF) vs the deployed
+        # drift-P/B, on the identical adaptive stack (user test 2026-09-21). EDGAR_DATES honored as set in env.
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _half(perf):
+            m = perf.get("monthly") or []
+            if not m:
+                return (None, None)
+            r = [x[1] for x in m]; h = len(r) // 2
+            return (round((_np.prod([1 + x for x in r[:h]]) - 1) * 100, 1),
+                    round((_np.prod([1 + x for x in r[h:]]) - 1) * 100, 1))
+        for _lab, _vk in [("drift-P/B (deployed)", None), ("P/FCF (cheapest +ve)", "pfcf")]:
+            kw = dict(_base)
+            if _vk:
+                kw["value_key"] = _vk
+            p = run(True, True, **kw)
+            h1, h2 = _half(p)
+            print(f"[{_lab:22}] total={p.get('total'):>12,.0f}%  CAGR={p.get('annual'):.1f}  "
+                  f"Sharpe={p.get('sharpe'):.2f}  DD={p.get('dd'):.1f}%  vsSPY={p.get('vs_spy')}  "
+                  f"half1={h1}% half2={h2}%", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("DIGEST_AB"):
+        # SECONDARY-HYPOTHESIS test (user 2026-09-21): does the value/P-B pick improve when book has had time to be
+        # DIGESTED by the market? Add N business days to EVERY (8-K-based) avail_date and sweep. SHARPE rising with the
+        # lag = a real, usable effect (book the market has repriced selects better); only the TOTAL moving = tail-noise.
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _half(perf):
+            m = perf.get("monthly") or []
+            if not m:
+                return (None, None)
+            r = [x[1] for x in m]; h = len(r) // 2
+            return (round((_np.prod([1 + x for x in r[:h]]) - 1) * 100, 1),
+                    round((_np.prod([1 + x for x in r[h:]]) - 1) * 100, 1))
+        # SINGLE run honoring the ambient AVAIL_EXTRA_LAG_BD (applied when panels were built) — the lag must be set as a
+        # PROCESS env (docker -e), because build() constructs the avail panels ONCE; loop-in-process can't rebuild them.
+        p = run(True, True, **_base)
+        h1, h2 = _half(p)
+        print(f"[digest +{os.environ.get('AVAIL_EXTRA_LAG_BD', '0')}bd] total={p.get('total'):>12,.0f}%  "
+              f"CAGR={p.get('annual'):.1f}  Sharpe={p.get('sharpe'):.3f}  DD={p.get('dd'):.1f}%  "
+              f"half1={h1}% half2={h2}%", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("ROLL_DIGEST"):
+        # ROLLING walk-forward of the digest lag (user 2026-09-21): for the ambient AVAIL_EXTRA_LAG_BD, evaluate the
+        # adaptive stack over 5 DISJOINT ~2-year folds. Run one process per lag (detached). A robust effect = a positive
+        # lag beats lag 0 on Sharpe in MOST folds; a fragile one flips fold-to-fold.
+        import sys
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+        _lag = os.environ.get("AVAIL_EXTRA_LAG_BD", "0")
+        FOLDS = [("F1_16-18", "2016-05-01", "2018-04-30"), ("F2_18-20", "2018-05-01", "2020-04-30"),
+                 ("F3_20-22", "2020-05-01", "2022-04-30"), ("F4_22-24", "2022-05-01", "2024-04-30"),
+                 ("F5_24-26", "2024-05-01", None)]
+        for _pn, _sd, _ed in FOLDS:
+            kw = dict(_base, start_date=_sd)
+            if _ed:
+                kw["end_date"] = _ed
+            p = run(True, True, **kw)
+            print(f"[lag +{_lag:>2}bd | {_pn:9}] Sharpe={p.get('sharpe'):.3f}  CAGR={p.get('annual'):.1f}  "
+                  f"DD={p.get('dd'):.1f}%  total={p.get('total'):>10,.0f}%", flush=True)
+        sys.exit(0)
+
+    if os.environ.get("WF_DIGEST"):
+        # WALK-FORWARD validation of the digest lag (user 2026-09-21): for the ambient AVAIL_EXTRA_LAG_BD (applied at
+        # panel-build), evaluate the adaptive stack over FULL + two disjoint sub-periods. Run one process per lag. If the
+        # Sharpe-optimal lag is STABLE (~same) across BOTH halves -> real, usable; if it jumps around -> overfit, drop.
+        import sys
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+        _lag = os.environ.get("AVAIL_EXTRA_LAG_BD", "0")
+        for _pn, _sd, _ed in [("FULL", None, None), ("H1_16-21", None, "2021-05-31"), ("H2_21-26", "2021-06-01", None)]:
+            kw = dict(_base)
+            if _sd:
+                kw["start_date"] = _sd
+            if _ed:
+                kw["end_date"] = _ed
+            p = run(True, True, **kw)
+            print(f"[lag +{_lag:>2}bd | {_pn:9}] total={p.get('total'):>12,.0f}%  CAGR={p.get('annual'):.1f}  "
+                  f"Sharpe={p.get('sharpe'):.3f}  DD={p.get('dd'):.1f}%", flush=True)
         sys.exit(0)
 
     if os.environ.get("GATE_AB"):
