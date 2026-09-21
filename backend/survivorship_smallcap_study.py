@@ -4913,6 +4913,107 @@ def build():
             print("save skipped:", _e, flush=True)
         sys.exit(0)
 
+    if os.environ.get("SYNTH_ADAPT"):
+        # REGIME-ADAPTIVE value entry tilt (user 2026-09-21): among cheap-value names, time the within-sector entry by RS,
+        # FLIPPING with the flagship's own regime signal (multi_fav): value-favorable regime -> oversold-vs-sector (mean-
+        # reversion); momentum regime -> RS breakout. Compare adaptive vs oversold-only vs breakout-only. Survivorship-
+        # free, MEDIAN edge vs same-gate-fold baseline, 5 folds. If adaptive is + in ALL folds it's a wireable tilt.
+        import sys
+        from collections import defaultdict as _ddict
+        _WK = bool(os.environ.get("WEEKLY"))            # timeframe: daily (default) or weekly bars for the RS ratio
+        _H = 13 if _WK else 63                          # ~3mo forward: 13 weekly bars or 63 trading days
+        _THR = 30; _MINLEN = 60 if _WK else 300; _PW = 3 if _WK else 10; _BW = 26 if _WK else 126
+        _res = (lambda s: s.resample("W-FRI").last().dropna()) if _WK else (lambda s: s)
+        FOLDS = [("F1_16-18", "2016-05-01", "2018-04-30"), ("F2_18-20", "2018-05-01", "2020-04-30"),
+                 ("F3_20-22", "2020-05-01", "2022-04-30"), ("F4_22-24", "2022-05-01", "2024-04-30"),
+                 ("F5_24-26", "2024-05-01", "2100-01-01")]
+        _bspy = etf_daily[BENCH]["Close"] if BENCH in etf_daily else None
+        _reg = multi_fav.reindex(midx).astype(bool)     # flagship value/small/commodity regime (True=value-favorable)
+
+        def _rsi(c, n):
+            d = c.diff(); up = d.clip(lower=0.0); dn = (-d).clip(lower=0.0)
+            ru = up.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+            rd = dn.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+            return (100.0 - 100.0 / (1.0 + ru / rd.replace(0.0, np.nan))).fillna(50.0)
+
+        def _tstat(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            return float("nan") if (len(a) < 3 or a.std(ddof=1) == 0) else float(a.mean() / (a.std(ddof=1) / np.sqrt(len(a))))
+        _primed = {}
+        for _e in list(accel.columns):
+            _ed = etf_daily.get(_e)
+            if _ed is None or _bspy is None:
+                continue
+            _ix = _ed["Close"].index.intersection(_bspy.index)
+            _sr = _res((_ed["Close"].reindex(_ix) / _bspy.reindex(_ix)).replace([np.inf, -np.inf], np.nan).dropna())
+            if len(_sr) < _MINLEN:
+                continue
+            _sR = _rsi(_sr, 14); _x = (_sR.shift(1) < _THR) & (_sR >= _THR)
+            _primed[_e] = _x.rolling(_PW, min_periods=1).max().fillna(0).astype(bool)
+        _eof = {}
+        for _e in list(accel.columns):
+            for _c in sector_cands(_e, True):
+                _eof.setdefault(_c, _e)
+        VARIS = ["oversold", "breakout", "adaptive"]
+        _acc = _ddict(list); _base = _ddict(list)
+        for _stk, _e in _eof.items():
+            _sd = stock_daily.get(_stk); _ed = etf_daily.get(_e)
+            if _sd is None or _ed is None or "Close" not in _sd:
+                continue
+            _sc = _sd["Close"].dropna(); _sc = _sc[_sc > 0]; _sc = _res(_sc)
+            if len(_sc) < _MINLEN:
+                continue
+            _isdel = _stk in delisted_sector; _lastp = 0.0 if _stk in bankrupt_tk else float(_sc.iloc[-1])
+            _sf = _sc.shift(-_H)
+            if _isdel:
+                _sf = _sf.fillna(_lastp)
+            _sret = _sf / _sc - 1.0
+            _ec = _res(_ed["Close"])
+            _ix = _sc.index.intersection(_ec.index)
+            _rs = (_sc.reindex(_ix) / _ec.reindex(_ix)).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(_rs) < _MINLEN:
+                continue
+            _sR = _rsi(_rs, 14); _sr2 = _sret.reindex(_rs.index)
+            _pr = _primed.get(_e)
+            _oversold = ((_sR.shift(1) < _THR) & (_sR >= _THR)).fillna(False) & (_pr.reindex(_rs.index).fillna(False) if _pr is not None else False)
+            _pm = _rs.shift(1).rolling(_BW, min_periods=max(20, _BW // 2)).max()
+            _breakout = (_rs > _pm) & (_rs.shift(1) <= _pm)
+            _regd = _reg.reindex(_rs.index, method="ffill").fillna(True)
+            _adaptive = (_regd & _oversold.fillna(False)) | ((~_regd) & _breakout.fillna(False))
+            _ent = {"oversold": _oversold.fillna(False), "breakout": _breakout.fillna(False), "adaptive": _adaptive.fillna(False)}
+            _pbL = pb[_stk].reindex(_rs.index, method="ffill") if _stk in pb.columns else pd.Series(np.nan, index=_rs.index)
+            _gate = (_pbL > 0) & (_pbL < 1.5)                              # cheap P/B (best value gate for both timers)
+            for _fn, _s0, _s1 in FOLDS:
+                _fm = pd.Series((_rs.index >= pd.Timestamp(_s0)) & (_rs.index <= pd.Timestamp(_s1)), index=_rs.index) & _sr2.notna() & _gate.fillna(False)
+                _base[_fn].extend(_sr2[_fm].tolist())
+                for _v in VARIS:
+                    _acc[(_v, _fn)].extend(_sr2[_ent[_v] & _fm].tolist())
+
+        def _med(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            return (len(a), round(float(np.median(a)) * 100, 2), round(float((a > 0).mean()) * 100, 1)) if len(a) >= 8 else (len(a), None, None)
+        print(f"\n=== REGIME-ADAPTIVE value entry [{'WEEKLY' if _WK else 'DAILY'}] (cheap P/B; oversold in value-regime, breakout in momentum) — 5-fold MEDIAN edge ===", flush=True)
+        _out = {}
+        for _v in VARIS:
+            cells = []; pos = 0
+            for _fn, _, _ in FOLDS:
+                n, m, w = _med(_acc[(_v, _fn)]); bn, bm, bw = _med(_base[_fn])
+                e = round(m - bm, 2) if (m is not None and bm is not None) else None
+                cells.append((_fn, n, e)); _out[f"{_v}|{_fn}"] = dict(n=n, edge=e, win=w)
+                if isinstance(e, float) and e > 0:
+                    pos += 1
+            print(f"  [{_v:9}] folds+={pos}/5  " + "  ".join(
+                f"{fn.split('_')[0]}:{'NA' if e is None else f'{e:+.2f}'}(n{n})" for fn, n, e in cells), flush=True)
+        try:
+            from core.models import BacktestResult as _BR
+            from django.utils import timezone as _tz
+            _kind = "synth_adaptive_wk" if _WK else "synth_adaptive"
+            _BR.objects.update_or_create(kind=_kind, defaults=dict(payload=_out, computed_at=_tz.now()))
+            print(f"saved BacktestResult[{_kind}]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
     if os.environ.get("TREND_SYNTH"):
         # TREND indicators on the synthetic stock/sector ratio (user 2026-09-21): Heikin-Ashi flip + MA golden-cross +
         # reclaim-100 + new-126d-high, value-gated (cheap P/E+$5M vol, cheap P/B), survivorship-free, 5 folds. Hypothesis:
