@@ -4798,6 +4798,101 @@ def build():
             print("save skipped:", _e, flush=True)
         sys.exit(0)
 
+    if os.environ.get("SYNTH_CONFL"):
+        # CONFLUENCE (user 2026-09-21): buy a stock only when the SECTOR is oversold-and-turning vs SPY (sector/SPY RSI14
+        # crossed up through THR within the last 10d = "primed") AND the STOCK is oversold-and-turning vs that sector
+        # (stock/sector RSI14 crosses up through the SAME THR). Survivorship-free (with-delisted, delisting-aware fwd 63d),
+        # robust metrics MEDIAN/win/t (means are outlier-garbage on delisted microcaps), both halves. THR in {20,30}.
+        import sys
+        from collections import defaultdict as _ddict
+        _H = 63; _SP = pd.Timestamp("2021-05-31"); _PRIME = 10
+        _bspy = etf_daily[BENCH]["Close"] if BENCH in etf_daily else None
+
+        def _rsi(c, n):
+            d = c.diff(); up = d.clip(lower=0.0); dn = (-d).clip(lower=0.0)
+            ru = up.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+            rd = dn.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+            return (100.0 - 100.0 / (1.0 + ru / rd.replace(0.0, np.nan))).fillna(50.0)
+
+        def _tstat(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            return float("nan") if (len(a) < 3 or a.std(ddof=1) == 0) else float(a.mean() / (a.std(ddof=1) / np.sqrt(len(a))))
+        # sector "primed" per (ETF, THR): sector/SPY RSI14 crossed up through THR within the last _PRIME days
+        _primed = {}
+        for _e in list(accel.columns):
+            _ed = etf_daily.get(_e)
+            if _ed is None or _bspy is None:
+                continue
+            _ix = _ed["Close"].index.intersection(_bspy.index)
+            _sr = (_ed["Close"].reindex(_ix) / _bspy.reindex(_ix)).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(_sr) < 300:
+                continue
+            _sR = _rsi(_sr, 14)
+            for _thr in (20, 30):
+                _x = (_sR.shift(1) < _thr) & (_sR >= _thr)
+                _primed[(_e, _thr)] = _x.rolling(_PRIME, min_periods=1).max().fillna(0).astype(bool)
+        _eof = {}
+        for _e in list(accel.columns):
+            for _c in sector_cands(_e, True):
+                _eof.setdefault(_c, _e)
+        _acc = _ddict(list); _base = _ddict(list)
+        for _stk, _e in _eof.items():
+            _sd = stock_daily.get(_stk); _ed = etf_daily.get(_e)
+            if _sd is None or _ed is None or "Close" not in _sd:
+                continue
+            _sc = _sd["Close"].dropna(); _sc = _sc[_sc > 0]
+            if len(_sc) < 300:
+                continue
+            _isdel = _stk in delisted_sector; _lastp = 0.0 if _stk in bankrupt_tk else float(_sc.iloc[-1])
+            _sf = _sc.shift(-_H)
+            if _isdel:
+                _sf = _sf.fillna(_lastp)
+            _sret = _sf / _sc - 1.0
+            _ix = _sc.index.intersection(_ed["Close"].index)
+            _rs = (_sc.reindex(_ix) / _ed["Close"].reindex(_ix)).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(_rs) < 300:
+                continue
+            _sR = _rsi(_rs, 14); _sr2 = _sret.reindex(_rs.index)
+            for _thr in (20, 30):
+                _pr = _primed.get((_e, _thr))
+                if _pr is None:
+                    continue
+                _stkx = (_sR.shift(1) < _thr) & (_sR >= _thr)
+                _entry = _stkx.fillna(False) & _pr.reindex(_rs.index).fillna(False)
+                for _half, _m in [("full", pd.Series(True, index=_rs.index)),
+                                  ("H1", pd.Series(_rs.index <= _SP, index=_rs.index)),
+                                  ("H2", pd.Series(_rs.index > _SP, index=_rs.index))]:
+                    _bm = _m & _sr2.notna()
+                    _base[(_thr, _half)].extend(_sr2[_bm].tolist())
+                    _acc[(_thr, _half)].extend(_sr2[_entry & _bm].tolist())
+
+        def _rob(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            if len(a) < 8:
+                return None
+            return dict(n=len(a), med=round(float(np.median(a)) * 100, 2), win=round(float((a > 0).mean()) * 100, 1),
+                        t=round(_tstat(a), 2), mean=round(float(a.mean()) * 100, 1))
+        print(f"\n=== CONFLUENCE (sector oversold vs SPY + stock oversold vs sector) — survivorship-free, MEDIAN fwd 63d ===", flush=True)
+        _out = {}
+        for _thr in (20, 30):
+            for _half in ("full", "H1", "H2"):
+                s = _rob(_acc[(_thr, _half)]); b = _rob(_base[(_thr, _half)])
+                _out[f"thr{_thr}|{_half}"] = {"sig": s, "base": b}
+                if s and b:
+                    edge = round(s["med"] - b["med"], 2)
+                    print(f"  THR{_thr} {_half:4}  n={s['n']:>5}  med={s['med']:+.2f}% (base {b['med']:+.2f}, "
+                          f"MEDedge={edge:+.2f})  win={s['win']}% (base {b['win']})  t={s['t']}  mean={s['mean']}", flush=True)
+                else:
+                    print(f"  THR{_thr} {_half:4}  n={(s or {}).get('n', 0)} (too few)", flush=True)
+        try:
+            from core.models import BacktestResult as _BR
+            from django.utils import timezone as _tz
+            _BR.objects.update_or_create(kind="synth_confluence", defaults=dict(payload=_out, computed_at=_tz.now()))
+            print("saved BacktestResult[synth_confluence]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
     if os.environ.get("PFCF_AB"):
         # A/B: swap the flagship VALUE SELECTOR to Price/Free-Cash-Flow (cheapest POSITIVE P/FCF) vs the deployed
         # drift-P/B, on the identical adaptive stack (user test 2026-09-21). EDGAR_DATES honored as set in env.
