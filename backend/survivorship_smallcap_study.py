@@ -855,6 +855,26 @@ def build():
     common = stock_m.columns.intersection(sh_adj.columns).intersection(eq.columns)
     R = lambda p: p.reindex(index=midx, columns=common)
     px = stock_m[common]; sh, eq, ni, dt = R(sh_adj), R(eq), R(ni), R(dt)
+    # ── CURRENCY-CONSISTENCY FIX: US-listed foreign ADRs report statements in a foreign ccy (GDS/TCOM=CNY, GGAL=ARS)
+    # but trade (and so mktcap = px×shares) in USD -> pb=mktcap/eq was fake-cheap by the FX rate and auto-won the
+    # cheapest-P/B pick. Convert those ADRs' statement $ (eq/ni/dt, + ttm_ni below) to USD via the reporting-ccy FX.
+    # reporting_ccy.json = {ticker: reporting_ccy} for no-dot names whose Balance_Sheet.currency_symbol != USD.
+    # Statement-to-statement ratios (ROE, D/E) stay invariant (num+den both scaled); price ratios (P/B, P/E) get fixed.
+    _repfx = {}
+    try:
+        _repccy = json.load(open("/app/.data/reporting_ccy.json"))
+    except Exception:
+        _repccy = {}
+    if _repccy:
+        _frm_fx = (midx[0] - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+        for _tk, _ccy in _repccy.items():
+            if _tk in eq.columns:
+                _fx = _fx_monthly(_ccy, midx, _frm_fx)          # USD per unit of the reporting currency
+                _repfx[_tk] = _fx
+                for _p in (eq, ni, dt):
+                    _p[_tk] = _p[_tk] * _fx.values
+        if _repfx:
+            print(f"currency-fix: {len(_repfx)} US-listed foreign-ADR statements -> USD ({sorted(_repfx)})", flush=True)
     as_traded = price_basis.as_traded_close(px, splits=_splits)
     # market cap = ADJUSTED close × ADJUSTED (today-basis) shares -> both in today's split units, so the product
     # is the true split-INVARIANT market cap. Identical to the old as_traded×nominal-shares for non-splitters and
@@ -890,6 +910,9 @@ def build():
     # Here we build the STANDARD signed trailing P/E = MktCap / TTM-net-income (= Price / TTM-EPS), negative when
     # loss-making. This does NOT feed any ranking (usca_small ranks on raw pb; pb_roe is unchanged).
     ttm_ni = R(_pit_ttm_ni(reps, midx))
+    for _tk, _fx in _repfx.items():                        # same USD conversion for TTM-NI (P/E + drift accrual)
+        if _tk in ttm_ni.columns:
+            ttm_ni[_tk] = ttm_ni[_tk] * _fx.values
     roe_ttm = ttm_ni / eq.where(eq != 0)                   # trailing-12m ROE (signed)
     droe_ttm = roe_ttm - roe_ttm.shift(12)                  # YoY change in TTM ROE (improving-profitability catalyst)
     pe_ttm = mktcap / ttm_ni.where(ttm_ni != 0)            # signed trailing P/E = Price / TTM-EPS
