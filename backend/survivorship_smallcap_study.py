@@ -1210,6 +1210,26 @@ def build():
         rsi_bull_m[t] = bull.resample("ME").last().reindex(midx).fillna(False).astype(bool)
         freshcross_m[t] = (cross.rolling(15).max() > 0).resample("ME").last().reindex(midx).fillna(False).astype(bool)
     print("two-stage secondary-signal panels built", flush=True)
+    # WEEKLY RS-30-cross recency (user 2026-09-21): weekly bars since the stock/sector-ETF RS RSI(14) last crossed UP
+    # through 30 (from below). Lower = fresher entry. Feeds the 'rswk30' within-sector value entry-timing selector.
+    rswk30_m = {}
+    for t in common:
+        _e2 = surv_sector.get(t) or delisted_sector.get(t)
+        _ed2 = etf_daily.get(_e2); _sd2 = stock_daily.get(t)
+        if _ed2 is None or _sd2 is None or "Close" not in _sd2:
+            continue
+        _sc2 = _sd2["Close"].dropna(); _sc2 = _sc2[_sc2 > 0]
+        _ws = _sc2.resample("W-FRI").last(); _we = _ed2["Close"].resample("W-FRI").last()
+        _ix2 = _ws.index.intersection(_we.index)
+        _r2 = (_ws.reindex(_ix2) / _we.reindex(_ix2)).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(_r2) < 40:
+            continue
+        _rw = _rsi(_r2, 14); _cx = (_rw.shift(1) < 30) & (_rw >= 30)
+        _num = pd.Series(range(len(_r2)), index=_r2.index, dtype=float)
+        _since = _num - _num.where(_cx).ffill()          # weekly bars since last cross-up-30 (NaN before first)
+        rswk30_m[t] = _since.reindex(midx, method="ffill")
+    rswk30_m = pd.DataFrame(rswk30_m).reindex(index=midx, columns=common)
+    print(f"weekly RS-30-cross recency panel: {int(rswk30_m.notna().any().sum())} names", flush=True)
     dvol, adl_m, dvol100 = {}, {}, {}
     for t in common:
         d = stock_daily.get(t)
@@ -1912,6 +1932,13 @@ def build():
                     else:                                      # CALM regime -> cheapest P/B among profitable
                         q = [x for x in g if pd.notna(roe_ttm.loc[date, x]) and roe_ttm.loc[date, x] > 0]
                         p = min(q, key=lambda h: pb.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
+                elif value_key == "rswk30":       # VALUE + weekly RS-30 entry timing (user 2026-09-21): among the 5
+                    # cheapest-P/B names, prefer the freshest WEEKLY (stock/sector) RS-RSI(14) cross-up through 30 within
+                    # the last quarter (<=12 wk); else fall back to cheapest-P/B (= flagship). A within-sector entry tilt.
+                    _pool = sorted(g, key=lambda h: pb.loc[date, h])[:5]
+                    _cx = [(h, rswk30_m.loc[date, h]) for h in _pool
+                           if pd.notna(rswk30_m.loc[date, h]) and rswk30_m.loc[date, h] <= 12]
+                    p = min(_cx, key=lambda x: x[1])[0] if _cx else _pool[0]
                 elif value_key == "expensive":   # SHORT-LEG selector: MOST expensive (highest P/B) name in the sector
                     p = max(g, key=lambda h: pb.loc[date, h])
                 else:
@@ -4911,6 +4938,29 @@ def build():
             print("saved BacktestResult[synth_confluence_gated]", flush=True)
         except Exception as _e:
             print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("RSWK30_AB"):
+        # DEPLOYED A/B: does the weekly RS-30 entry tilt lift the flagship's actual TOTAL return? Same adaptive stack,
+        # within-sector pick = cheapest-P/B (baseline) vs rswk30 (freshest weekly RS-30 cross among top-5 cheap). (user)
+        import sys, numpy as _np
+        _base = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", entry="tl_support",
+                     quality_gate="si_days", small_min=1e8, no_cash=True)
+
+        def _half(p):
+            m = p.get("monthly") or []
+            if not m:
+                return (None, None)
+            r = [x[1] for x in m]; h = len(r) // 2
+            return (round((_np.prod([1 + x for x in r[:h]]) - 1) * 100, 1),
+                    round((_np.prod([1 + x for x in r[h:]]) - 1) * 100, 1))
+        for _lab, _vk in [("flagship (cheapest-P/B)", None), ("+ weekly RS-30 entry tilt", "rswk30")]:
+            kw = dict(_base)
+            if _vk:
+                kw["value_key"] = _vk
+            p = run(True, True, **kw); h1, h2 = _half(p)
+            print(f"[{_lab:26}] total={p.get('total'):>12,.0f}%  CAGR={p.get('annual'):.1f}  Sharpe={p.get('sharpe'):.2f}  "
+                  f"DD={p.get('dd'):.1f}%  vsSPY={p.get('vs_spy')}  half1={h1}% half2={h2}%", flush=True)
         sys.exit(0)
 
     if os.environ.get("SYNTH_ADAPT"):
