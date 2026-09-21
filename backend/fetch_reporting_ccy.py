@@ -11,8 +11,17 @@ import django; django.setup()
 import sector_holdings as sh, config
 from core.models import FinancialReport
 from api.tasks import _eodhd_get
+from survivorship_smallcap_study import SUF_CCY   # exchange-suffix -> QUOTE currency
 
 OUT = "/app/.data/reporting_ccy.json"
+
+
+def quote_ccy(tk):
+    return "USD" if "." not in tk else SUF_CCY.get(tk.rsplit(".", 1)[1], "USD")
+
+
+def eodhd_sym(tk):
+    return f"{tk}.US" if "." not in tk else tk
 
 
 def main():
@@ -20,26 +29,26 @@ def main():
     for name in config.SECTOR_ETFS:
         for t in sh.get_holdings(name):
             tks.add(t)
-    nodot = sorted(t for t in tks if "." not in t)
-    have = set(FinancialReport.objects.filter(ticker__in=nodot).values_list("ticker", flat=True).distinct())
-    cand = [t for t in nodot if t in have]
-    print(f"scanning reporting ccy for {len(cand)} US-listed candidates...", flush=True)
+    have = set(FinancialReport.objects.filter(ticker__in=list(tks)).values_list("ticker", flat=True).distinct())
+    cand = sorted(t for t in tks if t in have)      # ALL candidates (dotted + no-dot)
+    print(f"scanning reporting ccy for {len(cand)} candidates (store where reporting != QUOTE ccy)...", flush=True)
 
-    foreign = {}
+    mism = {}
     for i, tk in enumerate(cand, 1):
+        q = quote_ccy(tk)
         try:
-            f = _eodhd_get(f"fundamentals/{tk}.US")
+            f = _eodhd_get(f"fundamentals/{eodhd_sym(tk)}")
             bs = (f or {}).get("Financials", {}).get("Balance_Sheet", {}) if isinstance(f, dict) else {}
-            ccy = bs.get("currency_symbol")
+            rep = bs.get("currency_symbol")
         except Exception:
-            ccy = None
-        if ccy and ccy not in ("USD", "", None):
-            foreign[tk] = ccy
-            print(f"  [{i}] {tk}: reporting {ccy}", flush=True)
-        if i % 100 == 0:
-            print(f"  ...{i}/{len(cand)} scanned, {len(foreign)} foreign so far", flush=True)
-    json.dump(foreign, open(OUT, "w"), indent=1)
-    print(f"\nWROTE {OUT}: {len(foreign)} US-listed foreign-reporting ADRs -> {foreign}", flush=True)
+            rep = None
+        if rep and rep not in ("", None) and rep != q:      # reporting ccy differs from the quote ccy -> P/B mis-scaled
+            mism[tk] = rep
+            print(f"  [{i}] {tk}: reporting {rep} vs quote {q}", flush=True)
+        if i % 150 == 0:
+            print(f"  ...{i}/{len(cand)} scanned, {len(mism)} mismatched so far", flush=True)
+    json.dump(mism, open(OUT, "w"), indent=1)
+    print(f"\nWROTE {OUT}: {len(mism)} reporting!=quote names -> {mism}", flush=True)
 
 
 if __name__ == "__main__":

@@ -867,14 +867,27 @@ def build():
         _repccy = {}
     if _repccy:
         _frm_fx = (midx[0] - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
-        for _tk, _ccy in _repccy.items():
-            if _tk in eq.columns:
-                _fx = _fx_monthly(_ccy, midx, _frm_fx)          # USD per unit of the reporting currency
-                _repfx[_tk] = _fx
-                for _p in (eq, ni, dt):
-                    _p[_tk] = _p[_tk] * _fx.values
+        _fxc = {}
+
+        def _uspr(_c):                                       # USD per unit of ccy (None => USD, factor 1.0)
+            if _c == "USD":
+                return None
+            if _c not in _fxc:
+                _fxc[_c] = _fx_monthly(_c, midx, _frm_fx)
+            return _fxc[_c]
+        for _tk, _rep in _repccy.items():
+            if _tk not in eq.columns:
+                continue
+            _q = "USD" if "." not in _tk else SUF_CCY.get(_tk.rsplit(".", 1)[1], "USD")
+            if _rep == _q:
+                continue
+            _pr, _pq = _uspr(_rep), _uspr(_q)               # convert statement REPORTING ccy -> QUOTE ccy (mktcap's ccy)
+            _fac = (_pr.values if _pr is not None else 1.0) / (_pq.values if _pq is not None else 1.0)  # quote per reporting
+            _repfx[_tk] = _fac
+            for _p in (eq, ni, dt):
+                _p[_tk] = _p[_tk] * _fac
         if _repfx:
-            print(f"currency-fix: {len(_repfx)} US-listed foreign-ADR statements -> USD ({sorted(_repfx)})", flush=True)
+            print(f"currency-fix: converted {len(_repfx)} names' statements reporting->quote ccy ({sorted(_repfx)})", flush=True)
     as_traded = price_basis.as_traded_close(px, splits=_splits)
     # market cap = ADJUSTED close × ADJUSTED (today-basis) shares -> both in today's split units, so the product
     # is the true split-INVARIANT market cap. Identical to the old as_traded×nominal-shares for non-splitters and
@@ -910,9 +923,9 @@ def build():
     # Here we build the STANDARD signed trailing P/E = MktCap / TTM-net-income (= Price / TTM-EPS), negative when
     # loss-making. This does NOT feed any ranking (usca_small ranks on raw pb; pb_roe is unchanged).
     ttm_ni = R(_pit_ttm_ni(reps, midx))
-    for _tk, _fx in _repfx.items():                        # same USD conversion for TTM-NI (P/E + drift accrual)
+    for _tk, _fac in _repfx.items():                       # same reporting->quote conversion for TTM-NI (P/E + drift accrual)
         if _tk in ttm_ni.columns:
-            ttm_ni[_tk] = ttm_ni[_tk] * _fx.values
+            ttm_ni[_tk] = ttm_ni[_tk] * _fac
     roe_ttm = ttm_ni / eq.where(eq != 0)                   # trailing-12m ROE (signed)
     droe_ttm = roe_ttm - roe_ttm.shift(12)                  # YoY change in TTM ROE (improving-profitability catalyst)
     pe_ttm = mktcap / ttm_ni.where(ttm_ni != 0)            # signed trailing P/E = Price / TTM-EPS
