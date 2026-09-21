@@ -532,6 +532,24 @@ def build():
 
     universe = sorted(all_holds | set(delisted_sector))
     stock_daily = load_candles(universe)
+    # BANKRUPTCY set (user fix 2026-09-21): a delisted name whose TERMINAL price signature = distress (penny <$1, or
+    # collapsed to <15% of its trailing-252d high) is a confirmed FAILURE -> book -100% when it delists mid-hold, instead
+    # of _ret_delist's last-traded-price (which under-penalizes a halt-then-zero bankruptcy). Acquisitions delist at a
+    # meaningful/deal price (no distress signature) so they KEEP the last-price exit. Conservative on purpose (survivorship
+    # ~neutral; over-penalizing was a past bug — [[delisted-survivorship]]). Env BANKRUPTCY_100=0 disables.
+    bankrupt_tk = set()
+    if os.environ.get("BANKRUPTCY_100", "1") != "0":
+        for _tk in delisted_sector:
+            _dd = stock_daily.get(_tk)
+            if _dd is None or "Close" not in _dd:
+                continue
+            _c = _dd["Close"].dropna(); _c = _c[_c > 0]
+            if len(_c) < 20:
+                continue
+            _term = float(_c.iloc[-1]); _hi = float(_c.iloc[-252:].max())
+            if _term < 1.0 or (_hi > 0 and _term < 0.15 * _hi):
+                bankrupt_tk.add(_tk)
+        print(f"bankruptcy set: {len(bankrupt_tk)}/{len(delisted_sector)} delisted names flagged distress -> -100% on delist", flush=True)
     stock_m = _monthly_close(stock_daily).reindex(midx)
     smom6 = stock_m.pct_change(6)     # per-stock 6-month price momentum (for the growth-sector 'buy the winner' rule)
     smret_m = stock_m.pct_change()    # per-stock MONTHLY returns (downside-correlation / diversification metric)
@@ -1915,6 +1933,11 @@ def build():
                         r = (1.0 + _lr) * float(_fx) - 1.0                              # to USD (monthly FX over the hold)
                 else:
                     r = _ret_delist(px_usd[p], date, ndate, daily=_dly)                # FLAGSHIP: USD hold; delisting realized on daily
+                if (r is not None and np.isfinite(r) and p in bankrupt_tk and ndate is not None):
+                    _pn = px_usd[p]                                                     # BANKRUPTCY -100%: delisted mid-hold
+                    _has_end = (ndate in _pn.index) and pd.notna(_pn.loc[ndate]) and _pn.loc[ndate] > 0
+                    if not _has_end:                                                    # no valid price at hold-end = it died here
+                        r = -1.0                                                       # confirmed-distress delisting -> total loss
                 if r is None or not np.isfinite(r):
                     if tr is not None:
                         tr["picks"].append({"sector": etf_name.get(etf, etf), "etf": etf, "ticker": p,
