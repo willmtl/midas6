@@ -4707,6 +4707,97 @@ def build():
         print(f"FLAGSHIP_TRACE[{_ck}] written: {fp}  months={len(tr)}  total={perf.get('total')}%", flush=True)
         sys.exit(0)
 
+    if os.environ.get("SYNTH_ALPHA"):
+        # SURVIVORSHIP-FREE RS-ratio alpha test (user 2026-09-21): re-run the synthetic-stock signals on the flagship's
+        # WITH-DELISTED universe, with DELISTING-AWARE forward returns (a name that dies mid-window realizes at its last
+        # price, or -100% if in bankrupt_tk) — so we can tell if rsi14_ob80 ("RS leader pullback") is real alpha or just
+        # survivors. stock/sector-ETF AND stock/SPY; RSI(14) on the ratio close; 63d fwd; both halves (2016-21/2021-26).
+        import sys
+        from collections import defaultdict as _ddict
+        _H = 63; _SP = pd.Timestamp("2021-05-31")
+        _spyc = etf_daily[BENCH]["Close"] if BENCH in etf_daily else None   # ETFs/SPY live in etf_daily, NOT stock_daily
+
+        def _tstat(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            return float("nan") if (len(a) < 3 or a.std(ddof=1) == 0) else float(a.mean() / (a.std(ddof=1) / np.sqrt(len(a))))
+
+        def _rsi(c, n):
+            d = c.diff(); up = d.clip(lower=0.0); dn = (-d).clip(lower=0.0)
+            ru = up.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+            rd = dn.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+            return (100.0 - 100.0 / (1.0 + ru / rd.replace(0.0, np.nan))).fillna(50.0)
+        _eof = {}
+        for _e in list(accel.columns):
+            for _c in sector_cands(_e, True):
+                _eof.setdefault(_c, _e)
+        _acc = _ddict(lambda: {"stk": [], "ratio": []}); _base = _ddict(list)
+        _ndel = sum(1 for _s in _eof if _s in delisted_sector)
+        for _stk, _e in _eof.items():
+            _sd = stock_daily.get(_stk); _ed = etf_daily.get(_e)          # stock from stock_daily, sector ETF from etf_daily
+            if _sd is None or _ed is None or "Close" not in _sd or "Close" not in _ed:
+                continue
+            _sc = _sd["Close"].dropna(); _sc = _sc[_sc > 0]
+            if len(_sc) < 300:
+                continue
+            _isdel = _stk in delisted_sector
+            _lastp = 0.0 if _stk in bankrupt_tk else float(_sc.iloc[-1])
+            _sf = _sc.shift(-_H)
+            if _isdel:
+                _sf = _sf.fillna(_lastp)                        # delisting-aware: realize at death/last (or 0 if bankrupt)
+            _sret = _sf / _sc - 1.0
+            for _pair, _bc in [("sector", _ed["Close"]), ("spy", _spyc)]:
+                if _bc is None:
+                    continue
+                _idx = _sc.index.intersection(_bc.index)
+                if len(_idx) < 300:
+                    continue
+                _r = (_sc.reindex(_idx) / _bc.reindex(_idx)).replace([np.inf, -np.inf], np.nan).dropna()
+                if len(_r) < 300:
+                    continue
+                _r14 = _rsi(_r, 14)
+                _sig = {"rsi14_os30": (_r14.shift(1) < 30) & (_r14 >= 30),
+                        "rsi14_os20": (_r14.shift(1) < 20) & (_r14 >= 20),
+                        "rsi14_ob80": (_r14.shift(1) > 80) & (_r14 <= 80)}
+                _rret = _r.shift(-_H) / _r - 1.0
+                _sr = _sret.reindex(_r.index)
+                for _half, _mm in [("full", pd.Series(True, index=_r.index)),
+                                   ("H1", pd.Series(_r.index <= _SP, index=_r.index)),
+                                   ("H2", pd.Series(_r.index > _SP, index=_r.index))]:
+                    _bm = _mm & _sr.notna()
+                    _base[(_pair, _half)].extend(_sr[_bm].tolist())
+                    for _ind, _sg in _sig.items():
+                        _m = _sg.fillna(False) & _bm
+                        _acc[(_pair, _ind, _half)]["stk"].extend(_sr[_m].tolist())
+                        _acc[(_pair, _ind, _half)]["ratio"].extend(_rret.reindex(_r.index)[_m].tolist())
+
+        def _ag(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            return (len(a), round(float(a.mean()) * 100, 3), round(_tstat(a), 2), round(float((a > 0).mean()) * 100, 1)) if len(a) else (0, None, None, None)
+        _bm2 = {k: (np.nanmean(v) * 100 if v else 0) for k, v in _base.items()}
+        print(f"\n=== SURVIVORSHIP-FREE RS-ratio (with-delisted; {_ndel} delisted in {len(_eof)} names) — edge + H1/H2 ===", flush=True)
+        _out = {"note": "survivorship-free, delisting-aware fwd 63d", "signals": {}}
+        for _pair in ("sector", "spy"):
+            for _ind in ("rsi14_os30", "rsi14_os20", "rsi14_ob80"):
+                _line = []
+                for _half in ("full", "H1", "H2"):
+                    n, m, t, w = _ag(_acc[(_pair, _ind, _half)]["stk"])
+                    _edge = round((m - _bm2.get((_pair, _half), 0)), 3) if m is not None else None
+                    _line.append((_half, n, _edge, t, w))
+                    _out["signals"][f"{_pair}|{_ind}|{_half}"] = dict(n=n, edge=_edge, stk_mean=m, t=t, win=w)
+                f = {h: (e, t, w) for h, n, e, t, w in _line}
+                _fm = lambda x: (f"{x:+.3f}" if isinstance(x, (int, float)) else "NA")
+                ok = "OK " if (isinstance(f["H1"][0], (int, float)) and isinstance(f["H2"][0], (int, float)) and f["H1"][0] > 0 and f["H2"][0] > 0) else "   "
+                print(f"  {ok}{_pair:6}|{_ind:11}  full edge={_fm(f['full'][0])} (t{f['full'][1]} win{f['full'][2]})  "
+                      f"H1={_fm(f['H1'][0])} H2={_fm(f['H2'][0])}", flush=True)
+        try:
+            from core.models import BacktestResult as _BR
+            from django.utils import timezone as _tz
+            _BR.objects.update_or_create(kind="synth_alpha_survfree", defaults=dict(payload=_out, computed_at=_tz.now()))
+            print("saved BacktestResult[synth_alpha_survfree]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
     if os.environ.get("PFCF_AB"):
         # A/B: swap the flagship VALUE SELECTOR to Price/Free-Cash-Flow (cheapest POSITIVE P/FCF) vs the deployed
         # drift-P/B, on the identical adaptive stack (user test 2026-09-21). EDGAR_DATES honored as set in env.
