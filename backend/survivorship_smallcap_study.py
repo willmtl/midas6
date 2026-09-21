@@ -4835,7 +4835,10 @@ def build():
         for _e in list(accel.columns):
             for _c in sector_cands(_e, True):
                 _eof.setdefault(_c, _e)
+        # gated: _base[(gate,half)] = gate-only universe; _acc[(thr,gate,half)] = gate AND double-oversold confluence.
+        # gates add the flagship VALUE (P/E, P/B) selection + a MIN-VOLUME liquidity floor on top of the confluence.
         _acc = _ddict(list); _base = _ddict(list)
+        _GATES = ["raw", "pePos", "peC20", "peC15", "vol5", "peC15_vol5", "pbC15"]
         for _stk, _e in _eof.items():
             _sd = stock_daily.get(_stk); _ed = etf_daily.get(_e)
             if _sd is None or _ed is None or "Close" not in _sd:
@@ -4853,42 +4856,59 @@ def build():
             if len(_rs) < 300:
                 continue
             _sR = _rsi(_rs, 14); _sr2 = _sret.reindex(_rs.index)
+            # PIT value (monthly panels ffilled to daily) + trailing avg $volume as-of each day
+            _peL = pe_ttm[_stk].reindex(_rs.index, method="ffill") if _stk in pe_ttm.columns else pd.Series(np.nan, index=_rs.index)
+            _pbL = pb[_stk].reindex(_rs.index, method="ffill") if _stk in pb.columns else pd.Series(np.nan, index=_rs.index)
+            _dv = ((_sc * _sd["Volume"]).rolling(63, min_periods=20).mean().reindex(_rs.index)
+                   if "Volume" in _sd else pd.Series(np.nan, index=_rs.index))
+            _gate = {"raw": pd.Series(True, index=_rs.index),
+                     "pePos": _peL > 0, "peC20": (_peL > 0) & (_peL < 20), "peC15": (_peL > 0) & (_peL < 15),
+                     "vol5": _dv >= 5e6, "peC15_vol5": (_peL > 0) & (_peL < 15) & (_dv >= 5e6),
+                     "pbC15": (_pbL > 0) & (_pbL < 1.5)}
+            _ent = {}
             for _thr in (20, 30):
                 _pr = _primed.get((_e, _thr))
-                if _pr is None:
-                    continue
                 _stkx = (_sR.shift(1) < _thr) & (_sR >= _thr)
-                _entry = _stkx.fillna(False) & _pr.reindex(_rs.index).fillna(False)
-                for _half, _m in [("full", pd.Series(True, index=_rs.index)),
-                                  ("H1", pd.Series(_rs.index <= _SP, index=_rs.index)),
-                                  ("H2", pd.Series(_rs.index > _SP, index=_rs.index))]:
-                    _bm = _m & _sr2.notna()
-                    _base[(_thr, _half)].extend(_sr2[_bm].tolist())
-                    _acc[(_thr, _half)].extend(_sr2[_entry & _bm].tolist())
+                _ent[_thr] = _stkx.fillna(False) & (_pr.reindex(_rs.index).fillna(False) if _pr is not None else False)
+            for _half, _m in [("full", pd.Series(True, index=_rs.index)),
+                              ("H1", pd.Series(_rs.index <= _SP, index=_rs.index)),
+                              ("H2", pd.Series(_rs.index > _SP, index=_rs.index))]:
+                _bm = _m & _sr2.notna()
+                for _g in _GATES:
+                    _gm = _gate[_g].fillna(False) & _bm
+                    _base[(_g, _half)].extend(_sr2[_gm].tolist())
+                    for _thr in (20, 30):
+                        _acc[(_thr, _g, _half)].extend(_sr2[_ent[_thr] & _gm].tolist())
 
         def _rob(a):
             a = np.asarray(a, float); a = a[np.isfinite(a)]
             if len(a) < 8:
                 return None
             return dict(n=len(a), med=round(float(np.median(a)) * 100, 2), win=round(float((a > 0).mean()) * 100, 1),
-                        t=round(_tstat(a), 2), mean=round(float(a.mean()) * 100, 1))
-        print(f"\n=== CONFLUENCE (sector oversold vs SPY + stock oversold vs sector) — survivorship-free, MEDIAN fwd 63d ===", flush=True)
+                        t=round(_tstat(a), 2))
+        print("\n=== CONFLUENCE + VALUE(P/E,P/B)/LIQUIDITY gates — survivorship-free, MEDIAN fwd 63d (edge vs SAME-gate base) ===", flush=True)
         _out = {}
         for _thr in (20, 30):
-            for _half in ("full", "H1", "H2"):
-                s = _rob(_acc[(_thr, _half)]); b = _rob(_base[(_thr, _half)])
-                _out[f"thr{_thr}|{_half}"] = {"sig": s, "base": b}
-                if s and b:
-                    edge = round(s["med"] - b["med"], 2)
-                    print(f"  THR{_thr} {_half:4}  n={s['n']:>5}  med={s['med']:+.2f}% (base {b['med']:+.2f}, "
-                          f"MEDedge={edge:+.2f})  win={s['win']}% (base {b['win']})  t={s['t']}  mean={s['mean']}", flush=True)
-                else:
-                    print(f"  THR{_thr} {_half:4}  n={(s or {}).get('n', 0)} (too few)", flush=True)
+            for _g in _GATES:
+                for _half in ("full", "H1", "H2"):
+                    _out[f"thr{_thr}|{_g}|{_half}"] = {"sig": _rob(_acc[(_thr, _g, _half)]), "base": _rob(_base[(_g, _half)])}
+                sf = _rob(_acc[(_thr, _g, "full")]); bf = _rob(_base[(_g, "full")])
+                if not (sf and bf):
+                    continue
+
+                def _edg(h):
+                    _s = _rob(_acc[(_thr, _g, h)]); _b = _rob(_base[(_g, h)])
+                    return round(_s["med"] - _b["med"], 2) if (_s and _b) else None
+                e1 = _edg("H1"); e2 = _edg("H2")
+                _fm = lambda x: (f"{x:+.2f}" if isinstance(x, (int, float)) else "NA")
+                ok = "OK " if (isinstance(e1, float) and isinstance(e2, float) and e1 > 0 and e2 > 0) else "   "
+                print(f"  {ok}THR{_thr} {_g:12} n={sf['n']:>5} MEDedge={round(sf['med'] - bf['med'], 2):+.2f} "
+                      f"(H1 {_fm(e1)} H2 {_fm(e2)}) win={sf['win']}(b{bf['win']}) t={sf['t']}", flush=True)
         try:
             from core.models import BacktestResult as _BR
             from django.utils import timezone as _tz
-            _BR.objects.update_or_create(kind="synth_confluence", defaults=dict(payload=_out, computed_at=_tz.now()))
-            print("saved BacktestResult[synth_confluence]", flush=True)
+            _BR.objects.update_or_create(kind="synth_confluence_gated", defaults=dict(payload=_out, computed_at=_tz.now()))
+            print("saved BacktestResult[synth_confluence_gated]", flush=True)
         except Exception as _e:
             print("save skipped:", _e, flush=True)
         sys.exit(0)
