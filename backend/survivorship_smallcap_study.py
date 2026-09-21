@@ -849,6 +849,15 @@ def build():
             entry = float(base)
         return float(end / entry - 1.0) if entry > 0 else None
     reps = load_financial_reports(universe)
+    # PIT INTEGRITY: clamp avail_date to a realistic public-availability FLOOR (period_end + 45d). Some EODHD
+    # filing_dates are bad — ~14% of records have avail_date <= period_end (financials "available" before the quarter
+    # even ended = LOOK-AHEAD; min -244d). Never let a report be usable before period_end+45d even if the feed says
+    # earlier. (Too-LATE avail_dates are left as-is: stale, not look-ahead.) Fixes every downstream PIT panel at once.
+    _AVFLOOR = pd.Timedelta(days=int(os.environ.get("AVFLOOR_DAYS", 45)))
+    for _tk, _r in reps.items():
+        if "period_end" in _r.columns and "avail_date" in _r.columns:
+            _pe = pd.to_datetime(_r["period_end"]); _av = pd.to_datetime(_r["avail_date"])
+            _r["avail_date"] = _av.where(_av >= _pe + _AVFLOOR, _pe + _AVFLOOR)
     _splits = price_basis.load_splits()
     sh_adj = _adj_shares_panel(reps, _splits, midx)   # split-consistent shares (today's basis) — see fn docstring
     eq, ni, dt = (_pit_monthly_panel(reps, f, midx) for f in ("total_equity", "net_income", "total_debt"))
