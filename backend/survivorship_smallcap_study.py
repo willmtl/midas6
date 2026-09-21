@@ -41,7 +41,12 @@ def _pit_ttm_panel(reports_map, field, midx):
         if len(d) < 4:
             continue
         d = d.sort_values("period_end")
-        d["ttm"] = d[field].rolling(4).sum()
+        # FREQUENCY-AWARE TTM (math fix 2026-09-21): rolling(4) assumed QUARTERLY, but ~45 universe names file
+        # semi-annually (gap ~183d) or annually (~365d) — summing 4 of those = 2yr/4yr, overstating TTM 2-4x
+        # (-> inflated ROE, understated drift-P/B). Use N = reports-per-year by the median period gap.
+        _gap = pd.to_datetime(d["period_end"]).diff().dt.days.median()
+        _nq = 4 if (pd.isna(_gap) or _gap < 135) else (2 if _gap < 270 else 1)   # quarterly / semi-annual / annual
+        d["ttm"] = d[field].rolling(_nq).sum()
         s = pd.Series(d["ttm"].values, index=pd.to_datetime(d["avail_date"])).dropna()
         if s.empty:
             continue
@@ -929,7 +934,8 @@ def build():
     _nominal_px = px / _divfac                           # split-adjusted NOMINAL price (future-dividend deflation removed)
     _ndp = int((_divfac < 0.999).any().sum())
     print(f"div-lookahead-fix: nominal-price recovered for {_ndp} dividend-paying names (mktcap/P/B only)", flush=True)
-    as_traded = price_basis.as_traded_close(px, splits=_splits)
+    as_traded = price_basis.as_traded_close(_nominal_px, splits=_splits)   # NOMINAL (div-removed) as-traded price
+    # -> the $5 min-price / liquidity gates now test the ACTUAL traded price, consistent with mktcap/P/B (no div deflation)
     # market cap = ADJUSTED close × ADJUSTED (today-basis) shares -> both in today's split units, so the product
     # is the true split-INVARIANT market cap. Identical to the old as_traded×nominal-shares for non-splitters and
     # for names with no split between their last filing and the month; only fixes the stale-shares split window.
