@@ -4719,6 +4719,9 @@ def build():
         }
         _ck = os.environ.get("CONFIG", "adaptive")
         _kw = _cfgkw.get(_ck, _cfgkw["adaptive"])
+        _vk = os.environ.get("VALUE_KEY")
+        if _vk:
+            _kw = dict(_kw, value_key=_vk)          # override the within-sector selector (e.g. rswk30) for a trace dump
         perf = run(True, True, country_ok=_is_usca, trace=tr, entry="tl_support", **_kw)  # tl_support ungated (REGAUNTLET 2026-09-14: +27% net, ties/wins 4/5 periods)
         out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": f"usca_small_{_ck}", "config": _ck,
                "perf": {k: perf.get(k) for k in ("total", "annual", "vs_spy", "sharpe", "dd", "t_stat", "months",
@@ -4728,6 +4731,8 @@ def build():
                "monthly_net": perf.get("monthly"),   # (date, NET monthly return) — deployed series for blend studies
                "months": tr}
         suffix = "" if _ck == "adaptive" else f"_{_ck}"
+        if _vk:
+            suffix += f"_{_vk}"                      # keep the deployed flagship_history.json untouched
         fp = Path(f"/app/.data/studies/flagship_history{suffix}.json")
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(json.dumps(out, indent=2, default=str))
