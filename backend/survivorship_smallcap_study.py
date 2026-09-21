@@ -74,9 +74,12 @@ def _option_panels(midx, cols):
     return out
 
 
-def _short_interest_panel(midx, cols, stale_days=45):
+def _short_interest_panel(midx, cols, stale_days=45, pub_lag_bd=10):
     """PIT monthly short-interest (days-to-cover) panel from .data/short_interest.jsonl (Polygon/FINRA bi-monthly,
-    dated by settlement_date). Value = latest days_to_cover as of each month-end, if within `stale_days`."""
+    dated by settlement_date). Value = latest days_to_cover as of each month-end, if within `stale_days`.
+    LOOK-AHEAD FIX (2026-09-20): FINRA disseminates SI ~10 business days AFTER settlement_date, so a reading is only
+    AVAILABLE at settlement_date + pub_lag_bd bdays (was keyed on settlement_date directly = ~2wk look-ahead; matches
+    the sibling _si_pct_panel convention)."""
     import json
     from collections import defaultdict
     p = Path("/app/.data/short_interest.jsonl")
@@ -91,7 +94,8 @@ def _short_interest_panel(midx, cols, stale_days=45):
         except Exception:
             continue
         if r.get("days_to_cover") is not None and r.get("settlement_date") and r.get("ticker") in cols:
-            byt[r["ticker"]].append((pd.Timestamp(r["settlement_date"]), float(r["days_to_cover"])))
+            _av = pd.Timestamp(r["settlement_date"]) + pd.tseries.offsets.BusinessDay(pub_lag_bd)   # dissemination lag
+            byt[r["ticker"]].append((_av, float(r["days_to_cover"])))
     out = {}
     midx_ser = pd.Series(midx, index=midx)
     for tk, pts in byt.items():
