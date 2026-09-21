@@ -4913,6 +4913,202 @@ def build():
             print("save skipped:", _e, flush=True)
         sys.exit(0)
 
+    if os.environ.get("TREND_SYNTH"):
+        # TREND indicators on the synthetic stock/sector ratio (user 2026-09-21): Heikin-Ashi flip + MA golden-cross +
+        # reclaim-100 + new-126d-high, value-gated (cheap P/E+$5M vol, cheap P/B), survivorship-free, 5 folds. Hypothesis:
+        # trend/momentum is the COMPLEMENT to oversold — works in the momentum-bull regime (F3 2020-22) where oversold fails.
+        import sys
+        from collections import defaultdict as _ddict
+        _H = 63
+        FOLDS = [("F1_16-18", "2016-05-01", "2018-04-30"), ("F2_18-20", "2018-05-01", "2020-04-30"),
+                 ("F3_20-22", "2020-05-01", "2022-04-30"), ("F4_22-24", "2022-05-01", "2024-04-30"),
+                 ("F5_24-26", "2024-05-01", "2100-01-01")]
+
+        def _tstat(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            return float("nan") if (len(a) < 3 or a.std(ddof=1) == 0) else float(a.mean() / (a.std(ddof=1) / np.sqrt(len(a))))
+
+        def _ha_open(o, h, l, c):
+            hc = (o + h + l + c) / 4.0; ho = hc.to_numpy(dtype=float, copy=True)
+            ho[0] = (float(o.iloc[0]) + float(c.iloc[0])) / 2.0; cv = hc.to_numpy(dtype=float)
+            for i in range(1, len(ho)):
+                ho[i] = (ho[i - 1] + cv[i - 1]) / 2.0
+            return pd.Series(ho, index=c.index), hc
+        _eof = {}
+        for _e in list(accel.columns):
+            for _c in sector_cands(_e, True):
+                _eof.setdefault(_c, _e)
+        GATES = ["raw", "peC15_vol5", "pbC15"]
+        INDS = ["ha_flip", "ma_gx", "reclaim100", "newhi126"]
+        _acc = _ddict(list); _base = _ddict(list)
+        for _stk, _e in _eof.items():
+            _sd = stock_daily.get(_stk); _ed = etf_daily.get(_e)
+            if _sd is None or _ed is None or "Close" not in _sd or "Open" not in _sd or "Open" not in _ed:
+                continue
+            _sc = _sd["Close"].dropna(); _sc = _sc[_sc > 0]
+            if len(_sc) < 300:
+                continue
+            _isdel = _stk in delisted_sector; _lastp = 0.0 if _stk in bankrupt_tk else float(_sc.iloc[-1])
+            _sf = _sc.shift(-_H)
+            if _isdel:
+                _sf = _sf.fillna(_lastp)
+            _sret = _sf / _sc - 1.0
+            _ix = _sc.index.intersection(_ed["Close"].index)
+            if len(_ix) < 300:
+                continue
+            # ratio OHLC (approx): high = stock_high/etf_low, low = stock_low/etf_high
+            _ro = (_sd["Open"].reindex(_ix) / _ed["Open"].reindex(_ix))
+            _rh = (_sd["High"].reindex(_ix) / _ed["Low"].reindex(_ix))
+            _rl = (_sd["Low"].reindex(_ix) / _ed["High"].reindex(_ix))
+            _rc = (_sc.reindex(_ix) / _ed["Close"].reindex(_ix))
+            _df = pd.DataFrame({"o": _ro, "h": _rh, "l": _rl, "c": _rc}).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(_df) < 300:
+                continue
+            _rc = _df["c"]
+            _ho, _hc = _ha_open(_df["o"], _df["h"], _df["l"], _rc)
+            _green = _hc > _ho
+            _s20 = _rc.rolling(20, min_periods=20).mean(); _s50 = _rc.rolling(50, min_periods=50).mean()
+            _s100 = _rc.rolling(100, min_periods=100).mean(); _pm = _rc.shift(1).rolling(126, min_periods=100).max()
+            _sig = {"ha_flip": _green & (~_green.shift(1).fillna(False)),
+                    "ma_gx": (_s20 > _s50) & (_s20.shift(1) <= _s50.shift(1)),
+                    "reclaim100": (_rc > _s100) & (_rc.shift(1) <= _s100.shift(1)),
+                    "newhi126": (_rc > _pm) & (_rc.shift(1) <= _pm)}
+            _peL = pe_ttm[_stk].reindex(_df.index, method="ffill") if _stk in pe_ttm.columns else pd.Series(np.nan, index=_df.index)
+            _pbL = pb[_stk].reindex(_df.index, method="ffill") if _stk in pb.columns else pd.Series(np.nan, index=_df.index)
+            _dv = ((_sc * _sd["Volume"]).rolling(63, min_periods=20).mean().reindex(_df.index)
+                   if "Volume" in _sd else pd.Series(np.nan, index=_df.index))
+            _gate = {"raw": pd.Series(True, index=_df.index),
+                     "peC15_vol5": (_peL > 0) & (_peL < 15) & (_dv >= 5e6), "pbC15": (_pbL > 0) & (_pbL < 1.5)}
+            _sr2 = _sret.reindex(_df.index)
+            for _fn, _s0, _s1 in FOLDS:
+                _fm = pd.Series((_df.index >= pd.Timestamp(_s0)) & (_df.index <= pd.Timestamp(_s1)), index=_df.index) & _sr2.notna()
+                for _g in GATES:
+                    _gm = _gate[_g].fillna(False) & _fm
+                    _base[(_g, _fn)].extend(_sr2[_gm].tolist())
+                    for _in in INDS:
+                        _acc[(_in, _g, _fn)].extend(_sr2[_sig[_in].fillna(False) & _gm].tolist())
+
+        def _med(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            return (len(a), round(float(np.median(a)) * 100, 2)) if len(a) >= 8 else (len(a), None)
+        print("\n=== TREND indicators on synthetic stock/sector — value-gated, survivorship-free, MEDIAN edge vs same-gate-fold base, 5 folds ===", flush=True)
+        _out = {}
+        for _in in INDS:
+            for _g in ("peC15_vol5", "pbC15"):
+                cells = []; pos = 0
+                for _fn, _, _ in FOLDS:
+                    n, m = _med(_acc[(_in, _g, _fn)]); bn, bm = _med(_base[(_g, _fn)])
+                    e = round(m - bm, 2) if (m is not None and bm is not None) else None
+                    cells.append((_fn, n, e)); _out[f"{_in}|{_g}|{_fn}"] = dict(n=n, edge=e)
+                    if isinstance(e, float) and e > 0:
+                        pos += 1
+                print(f"  [{_in:10} {_g:11}] folds+={pos}/5  " + "  ".join(
+                    f"{fn.split('_')[0]}:{'NA' if e is None else f'{e:+.2f}'}(n{n})" for fn, n, e in cells), flush=True)
+        try:
+            from core.models import BacktestResult as _BR
+            from django.utils import timezone as _tz
+            _BR.objects.update_or_create(kind="trend_synth", defaults=dict(payload=_out, computed_at=_tz.now()))
+            print("saved BacktestResult[trend_synth]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
+    if os.environ.get("ROLL_CONFL"):
+        # ROLLING walk-forward of the VALUE-GATED double-oversold confluence (the wireable signal). 5 disjoint ~2yr folds,
+        # THR30, gates {raw, cheapP/E<15+$5M vol, cheapP/B<1.5}, survivorship-free, MEDIAN edge vs same-gate-same-fold
+        # baseline. Robust if edge > 0 in MOST folds. Env for wiring decision.
+        import sys
+        from collections import defaultdict as _ddict
+        _H = 63; _THR = 30
+        FOLDS = [("F1_16-18", "2016-05-01", "2018-04-30"), ("F2_18-20", "2018-05-01", "2020-04-30"),
+                 ("F3_20-22", "2020-05-01", "2022-04-30"), ("F4_22-24", "2022-05-01", "2024-04-30"),
+                 ("F5_24-26", "2024-05-01", "2100-01-01")]
+        _bspy = etf_daily[BENCH]["Close"] if BENCH in etf_daily else None
+
+        def _rsi(c, n):
+            d = c.diff(); up = d.clip(lower=0.0); dn = (-d).clip(lower=0.0)
+            ru = up.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+            rd = dn.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+            return (100.0 - 100.0 / (1.0 + ru / rd.replace(0.0, np.nan))).fillna(50.0)
+
+        def _tstat(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            return float("nan") if (len(a) < 3 or a.std(ddof=1) == 0) else float(a.mean() / (a.std(ddof=1) / np.sqrt(len(a))))
+        _primed = {}
+        for _e in list(accel.columns):
+            _ed = etf_daily.get(_e)
+            if _ed is None or _bspy is None:
+                continue
+            _ix = _ed["Close"].index.intersection(_bspy.index)
+            _sr = (_ed["Close"].reindex(_ix) / _bspy.reindex(_ix)).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(_sr) < 300:
+                continue
+            _sR = _rsi(_sr, 14); _x = (_sR.shift(1) < _THR) & (_sR >= _THR)
+            _primed[_e] = _x.rolling(10, min_periods=1).max().fillna(0).astype(bool)
+        _eof = {}
+        for _e in list(accel.columns):
+            for _c in sector_cands(_e, True):
+                _eof.setdefault(_c, _e)
+        GATES = ["raw", "peC15_vol5", "pbC15"]
+        _acc = _ddict(list); _base = _ddict(list)
+        for _stk, _e in _eof.items():
+            _sd = stock_daily.get(_stk); _ed = etf_daily.get(_e)
+            if _sd is None or _ed is None or "Close" not in _sd:
+                continue
+            _sc = _sd["Close"].dropna(); _sc = _sc[_sc > 0]
+            if len(_sc) < 300:
+                continue
+            _isdel = _stk in delisted_sector; _lastp = 0.0 if _stk in bankrupt_tk else float(_sc.iloc[-1])
+            _sf = _sc.shift(-_H)
+            if _isdel:
+                _sf = _sf.fillna(_lastp)
+            _sret = _sf / _sc - 1.0
+            _ix = _sc.index.intersection(_ed["Close"].index)
+            _rs = (_sc.reindex(_ix) / _ed["Close"].reindex(_ix)).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(_rs) < 300:
+                continue
+            _sR = _rsi(_rs, 14); _sr2 = _sret.reindex(_rs.index)
+            _pr = _primed.get(_e)
+            _stkx = (_sR.shift(1) < _THR) & (_sR >= _THR)
+            _entry = _stkx.fillna(False) & (_pr.reindex(_rs.index).fillna(False) if _pr is not None else False)
+            _peL = pe_ttm[_stk].reindex(_rs.index, method="ffill") if _stk in pe_ttm.columns else pd.Series(np.nan, index=_rs.index)
+            _pbL = pb[_stk].reindex(_rs.index, method="ffill") if _stk in pb.columns else pd.Series(np.nan, index=_rs.index)
+            _dv = ((_sc * _sd["Volume"]).rolling(63, min_periods=20).mean().reindex(_rs.index)
+                   if "Volume" in _sd else pd.Series(np.nan, index=_rs.index))
+            _gate = {"raw": pd.Series(True, index=_rs.index),
+                     "peC15_vol5": (_peL > 0) & (_peL < 15) & (_dv >= 5e6),
+                     "pbC15": (_pbL > 0) & (_pbL < 1.5)}
+            for _fn, _s0, _s1 in FOLDS:
+                _fm = pd.Series((_rs.index >= pd.Timestamp(_s0)) & (_rs.index <= pd.Timestamp(_s1)), index=_rs.index) & _sr2.notna()
+                for _g in GATES:
+                    _gm = _gate[_g].fillna(False) & _fm
+                    _base[(_g, _fn)].extend(_sr2[_gm].tolist())
+                    _acc[(_g, _fn)].extend(_sr2[_entry & _gm].tolist())
+
+        def _med(a):
+            a = np.asarray(a, float); a = a[np.isfinite(a)]
+            return (len(a), round(float(np.median(a)) * 100, 2), round(float((a > 0).mean()) * 100, 1), round(_tstat(a), 2)) if len(a) >= 8 else (len(a), None, None, None)
+        print("\n=== ROLLING WF: value-gated double-oversold confluence (THR30) — MEDIAN edge vs same-gate-same-fold base ===", flush=True)
+        _out = {}
+        for _g in GATES:
+            _pos = 0; _cells = []
+            for _fn, _, _ in FOLDS:
+                n, m, w, t = _med(_acc[(_g, _fn)]); bn, bm, bw, bt = _med(_base[(_g, _fn)])
+                edge = round(m - bm, 2) if (m is not None and bm is not None) else None
+                _cells.append((_fn, n, edge, w, t)); _out[f"{_g}|{_fn}"] = dict(n=n, edge=edge, sig_med=m, base_med=bm, win=w, t=t)
+                if isinstance(edge, float) and edge > 0:
+                    _pos += 1
+            print(f"  [{_g:11}] folds+={_pos}/5  " + "  ".join(
+                f"{fn.split('_')[0]}:{'NA' if e is None else f'{e:+.2f}'}(n{n})" for fn, n, e, w, t in _cells), flush=True)
+        try:
+            from core.models import BacktestResult as _BR
+            from django.utils import timezone as _tz
+            _BR.objects.update_or_create(kind="confl_rolling_wf", defaults=dict(payload=_out, computed_at=_tz.now()))
+            print("saved BacktestResult[confl_rolling_wf]", flush=True)
+        except Exception as _e:
+            print("save skipped:", _e, flush=True)
+        sys.exit(0)
+
     if os.environ.get("PFCF_AB"):
         # A/B: swap the flagship VALUE SELECTOR to Price/Free-Cash-Flow (cheapest POSITIVE P/FCF) vs the deployed
         # drift-P/B, on the identical adaptive stack (user test 2026-09-21). EDGAR_DATES honored as set in env.
