@@ -888,11 +888,39 @@ def build():
                 _p[_tk] = _p[_tk] * _fac
         if _repfx:
             print(f"currency-fix: converted {len(_repfx)} names' statements reporting->quote ccy ({sorted(_repfx)})", flush=True)
+    # ── DIVIDEND-ADJUSTMENT LOOK-AHEAD FIX (valuation ratios only) ──────────────────────────────────────────
+    # Candle close = EODHD adjusted_close (split+DIV adjusted). Correct for RETURNS (total return), but a LOOK-AHEAD
+    # for mktcap/P/B: adjusted_close(D) is deflated by dividends paid AFTER D, so a name's historical P/B is made
+    # cheaper by its FUTURE dividends -> the cheapest-P/B ranking favors future-dividend-payers (info not known at D).
+    # Recover the split-adjusted NOMINAL price = adjusted / forward-dividend-factor (rebuilt from DividendHistory,
+    # px-at-ex proxied by the adjusted month-close) and use it for mktcap/P/B ONLY. Returns keep the adjusted series.
+    from core.models import DividendHistory as _DH
+    from collections import defaultdict as _dd
+    _acc = _dd(lambda: _dd(lambda: 1.0))                 # ex-month -> ticker -> product of (1 - div/px_ex)
+    _dmap = _dd(list)
+    for _tk, _ex, _amt in _DH.objects.filter(ticker__in=list(common)).exclude(amount=None).values_list("ticker", "ex_date", "amount"):
+        _dmap[_tk].append((pd.Timestamp(_ex), float(_amt)))
+    for _tk, _divs in _dmap.items():
+        for _ex, _amt in _divs:
+            _pos = midx.searchsorted(_ex)
+            if _pos >= len(midx) or _amt <= 0:
+                continue
+            _m = midx[_pos]; _pxex = px[_tk].get(_m)
+            if pd.notna(_pxex) and _pxex > 0 and _amt < _pxex:
+                _acc[_m][_tk] *= (1.0 - _amt / _pxex)
+    _mrat = pd.DataFrame(1.0, index=midx, columns=common)
+    for _m, _row in _acc.items():
+        for _tk, _r in _row.items():
+            _mrat.at[_m, _tk] = _r
+    _divfac = _mrat[::-1].cumprod()[::-1].shift(-1).fillna(1.0).clip(lower=0.2)   # prod of ratios for ex-months > D
+    _nominal_px = px / _divfac                           # split-adjusted NOMINAL price (future-dividend deflation removed)
+    _ndp = int((_divfac < 0.999).any().sum())
+    print(f"div-lookahead-fix: nominal-price recovered for {_ndp} dividend-paying names (mktcap/P/B only)", flush=True)
     as_traded = price_basis.as_traded_close(px, splits=_splits)
     # market cap = ADJUSTED close × ADJUSTED (today-basis) shares -> both in today's split units, so the product
     # is the true split-INVARIANT market cap. Identical to the old as_traded×nominal-shares for non-splitters and
     # for names with no split between their last filing and the month; only fixes the stale-shares split window.
-    mktcap = px * sh                              # QUOTE-currency market cap -> used for P/B (ratio, currency cancels)
+    mktcap = _nominal_px * sh                     # QUOTE-ccy market cap on the NOMINAL (div-lookahead-removed) price
     pb = mktcap / eq.where(eq != 0)
     de = dt / eq.where(eq != 0)                    # debt-to-equity (PIT) — for the flagship-history trace
     # POINT-IN-TIME FX: we trade in USD, so returns must include FX gain/loss. Convert the price series to USD at
