@@ -1072,6 +1072,15 @@ def build():
     evebit_ttm = _ev / ttm_opinc.where(ttm_opinc > 0)      # cheapest EV/EBIT (TTM, positive EBIT)
     fcfy_ttm = -(ttm_fcf / _ev.where(_ev > 0))             # highest FCF/EV -> negate so min = best
     pfcf_ttm = mktcap / ttm_fcf.where(ttm_fcf > 0)         # cheapest POSITIVE Price/Free-Cash-Flow (user A/B 2026-09-21)
+    # PEG (trailing, PIT — user 2026-09-23): P/E ÷ TTM-earnings growth%. Lynch cheap-vs-growth. Defined ONLY where
+    # BOTH current and prior TTM net income are POSITIVE (clean positive->positive growth), P/E>0, and growth>0 ->
+    # lower = cheaper per unit of growth. NO analyst forward growth (would be look-ahead / low coverage) -> trailing
+    # realized growth only. peg = 1y YoY growth base; peg3 = 3y CAGR base (smoother, less 1-year earnings noise).
+    _ni0, _ni12, _ni36 = ttm_ni, ttm_ni.shift(12), ttm_ni.shift(36)
+    _g1 = (_ni0 / _ni12 - 1).where((_ni0 > 0) & (_ni12 > 0))
+    _g3 = ((_ni0 / _ni36).where((_ni0 > 0) & (_ni36 > 0))) ** (1 / 3) - 1
+    peg_ttm = pe_ttm_pos / (100 * _g1.where(_g1 > 0))       # cheapest trailing PEG (1y growth)
+    peg3_ttm = pe_ttm_pos / (100 * _g3.where(_g3 > 0))      # cheapest trailing PEG (3y CAGR growth)
     # ANALYST implied-upside panel (PIT): (latest target within 90d) / month-close − 1. For mixing the Benzinga
     # signal into the flagship pick (tie-breaker / gate). Higher = more analyst upside.
     upside_m = _analyst_upside_panel(midx, as_traded).reindex(index=midx, columns=common)  # as_traded (nominal): target/price is split-consistent (px is split-back-adjusted -> future-split look-ahead)
@@ -1210,6 +1219,39 @@ def build():
         rsi_bull_m[t] = bull.resample("ME").last().reindex(midx).fillna(False).astype(bool)
         freshcross_m[t] = (cross.rolling(15).max() > 0).resample("ME").last().reindex(midx).fillna(False).astype(bool)
     print("two-stage secondary-signal panels built", flush=True)
+    # ── SORTINO-RSI entry panel (user's standalone 'sortinorsitechnique' ported as a flagship ENTRY tilt, 2026-09-23).
+    # ADRIDEM Sortino = SMA(own_ret,WIN) / pop-stdev(min(own_ret,0),WIN), SMA-smoothed; Wilder RSI14 of the smoothed
+    # Sortino. A fresh UP-cross of that RSI14 through its SMA14 while <GATE(50) ARMS the entry (persists until RSI14
+    # hits 50 or crosses back below its SMA); fires GREEN when RSI(color) on CLOSE > GREEN(51) = "buy the dip in an
+    # uptrend." Monthly panels at each rebalance date: sort_sig_m (armed & green now) + sort_depth_m (RSI14 at the
+    # arming cross; lower = deeper dip, for the deepest-dip tiebreak). All rolling/backward -> PIT-safe.
+    _SWIN = int(os.environ.get("SORT_WIN", 14)); _SSMO = int(os.environ.get("SORT_SMOOTH", 14))
+    _SGATE = float(os.environ.get("SORT_GATE", 50)); _SGRN = float(os.environ.get("SORT_GREEN", 51))
+    _SCLEN = int(os.environ.get("SORT_COLOR", 14))
+    sort_sig_m = pd.DataFrame(False, index=midx, columns=common)
+    sort_depth_m = pd.DataFrame(np.nan, index=midx, columns=common)
+    for t in common:
+        d = stock_daily.get(t)
+        if d is None or "Close" not in d or len(d) < 60:
+            continue
+        c = d["Close"]; c = c[c > 0]
+        if len(c) < 60:
+            continue
+        r = c.pct_change()
+        srt = r.rolling(_SWIN).mean() / r.clip(upper=0.0).rolling(_SWIN).std(ddof=0).replace(0.0, np.nan)
+        srt_s = srt.rolling(_SSMO, min_periods=_SSMO).mean().ffill().fillna(0.0)
+        r14 = _rsi(srt_s, 14); sm = r14.rolling(14).mean()
+        up = (r14.shift(1) <= sm.shift(1)) & (r14 > sm) & (r14 < _SGATE)      # fresh arming cross (<gate)
+        disarm = (r14 >= _SGATE) | (r14 <= sm)
+        idxn = pd.Series(np.arange(len(r14), dtype=float), index=r14.index)
+        lc = idxn.where(up, -1.0).cummax(); ld = idxn.where(disarm, -1.0).cummax()   # last-arm vs last-disarm index (-1 = none yet)
+        armed = (lc > ld) & (lc >= 0)
+        sig = (armed & (_rsi(c, _SCLEN) > _SGRN)).fillna(False)
+        depth = r14.where(up).ffill()                                         # RSI14 at the most-recent arming cross
+        sort_sig_m[t] = sig.resample("ME").last().reindex(midx).fillna(False).astype(bool)
+        sort_depth_m[t] = depth.resample("ME").last().reindex(midx)
+    print(f"sortino-RSI entry panel: {int(sort_sig_m.any().sum())} names ever armed+green, "
+          f"{100*float(sort_sig_m.to_numpy().mean()):.1f}% cell-firing", flush=True)
     # WEEKLY RS-30-cross recency (user 2026-09-21): weekly bars since the stock/sector-ETF RS RSI(14) last crossed UP
     # through 30 (from below). Lower = fresher entry. Feeds the 'rswk30' within-sector value entry-timing selector.
     rswk30_m = {}
@@ -1317,7 +1359,7 @@ def build():
             regime_lookback=6, regime_signal="vs", regime_hyst=0, no_cash=False, book="value",
             conv=None, conc_regime=None, entry=None, entry_k=5, flow_gate=False, live=False, conv_signal="ad",
             wait_entry=None, small_max=None, lev_regime=None, small_min=0.0, min_dvol=None, rebal=1,
-            exclude_si_pct=None, sel_regime=None):
+            exclude_si_pct=None, sel_regime=None, rank_panel=None):
         rets, spies, dl_picks, mrets = [], [], 0, []
         _step = int(rebal) if rebal else 1                 # rebalance cadence in months (1=monthly, 3=quarterly)
         _min_dvol = float(min_dvol) if min_dvol is not None else MIN_DVOL   # $/day liquidity floor (executability)
@@ -1330,7 +1372,15 @@ def build():
             entry=None reproduces the flagship exactly. Modes gate/reorder the `entry_k` cheapest names."""
             if not cands:
                 return None
-            _K = sorted(cands, key=lambda h: pb.loc[date, h])
+            # POOL RANKING: default cheapest-drift-P/B (flagship). rank_panel (e.g. PEG3) swaps the value metric
+            # that ORDERS the pool the entry tilt then times among; names missing that metric fall back to P/B
+            # ordering so exposure is never lost (PEG-gate + tl_rsi entry = fair A/B vs the deployed flagship).
+            if rank_panel is None:
+                _K = sorted(cands, key=lambda h: pb.loc[date, h])
+            else:
+                _rv = [h for h in cands if pd.notna(rank_panel.loc[date, h])]
+                _K = (sorted(_rv, key=lambda h: float(rank_panel.loc[date, h])) if _rv
+                      else sorted(cands, key=lambda h: pb.loc[date, h]))
             # ── ADDITIVE analyst overlays (ANALYST_OVERLAY_LAB): layered ON TOP of the deployed pick, they
             # only reshape the candidate pool, never replace the drift-P/B + entry logic. PIT-safe. ──
             _ov = os.environ.get("ANALYST_OVERLAY")
@@ -1412,6 +1462,16 @@ def build():
                      and float(earn_soon_m.loc[date, h]) > 0]
                 _ok = [h for h in _K if h not in q]
                 return _ok[0] if _ok else _K[0]
+            if entry == "sortino_rsi":   # SortinoRSI dip-in-uptrend among the K cheapest: prefer armed+green names,
+                # DEEPEST Sortino-RSI dip (lowest RSI14-at-cross) first; else fall back to cheapest-P/B (flagship).
+                q = [h for h in _K if h in sort_sig_m.columns and bool(sort_sig_m.loc[date, h])]
+                if q:
+                    return min(q, key=lambda h: (float(sort_depth_m.loc[date, h])
+                                                 if pd.notna(sort_depth_m.loc[date, h]) else 99.0))
+                return _K[0]
+            if entry == "sortino_gate":  # CHEAPEST-P/B name that is armed+green (else cheapest) — value-first, dip-timed
+                q = [h for h in _K if h in sort_sig_m.columns and bool(sort_sig_m.loc[date, h])]
+                return q[0] if q else _K[0]
             if entry == "nearlow":      return _pick_by(near_low_m, hi=False)   # closest to 52-week low (deep value)
             if entry == "newhigh":      return _pick_by(near_low_m, hi=True)    # breakout: furthest above 52w low
             if entry == "squeeze":      return _pick_by(squeeze_m, hi=False)    # tightest coil (wedge/triangle proxy)
@@ -1888,9 +1948,9 @@ def build():
                 elif value_key == "pb_roe":     # crude heuristic
                     q = [x for x in g if pd.notna(pb_roe.loc[date, x])]
                     p = min(q, key=lambda h: pb_roe.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
-                elif value_key in ("pe_ttm", "ps_ttm", "evebit_ttm", "fcfy_ttm", "pfcf"):  # TTM value-metric bake-off
+                elif value_key in ("pe_ttm", "ps_ttm", "evebit_ttm", "fcfy_ttm", "pfcf", "peg", "peg3"):  # TTM value-metric bake-off
                     _M = {"pe_ttm": pe_ttm_pos, "ps_ttm": ps_ttm, "evebit_ttm": evebit_ttm,
-                          "fcfy_ttm": fcfy_ttm, "pfcf": pfcf_ttm}[value_key]
+                          "fcfy_ttm": fcfy_ttm, "pfcf": pfcf_ttm, "peg": peg_ttm, "peg3": peg3_ttm}[value_key]
                     q = [x for x in g if pd.notna(_M.loc[date, x])]
                     p = min(q, key=lambda h: _M.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
                 elif value_key == "justified":  # rigorous #1: P/B vs (ROE-g)/(r-g)
@@ -1908,6 +1968,11 @@ def build():
                 elif value_key == "resid_mf":           # alt C: multi-factor fair-value residual
                     q = [x for x in g if pd.notna(resid_mf.loc[date, x])]
                     p = min(q, key=lambda h: resid_mf.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
+                elif value_key == "peg3_pool_pb":   # CONFOUND: same positive-earnings-now+3y-ago pool PEG3 selects
+                    # from, but ranked by RAW P/B (not PEG). Isolates the growth-adjustment from the
+                    # "3yr profitable history" restriction. If this matches peg3, the edge is the RESTRICTION.
+                    q = [x for x in g if pd.notna(peg3_ttm.loc[date, x])]
+                    p = min(q, key=lambda h: pb.loc[date, h]) if q else min(g, key=lambda h: pb.loc[date, h])
                 elif value_key == "pb_prof":   # CONFOUND CHECK: cheapest RAW P/B among PROFITABLE (ROE>0) names.
                     # crude P/B÷ROE == P/E, ranked among ni>0. This isolates whether the win is the P/E RANKING
                     # or just the profitable-only restriction (same restriction, but rank by P/B not P/E).
@@ -2723,11 +2788,89 @@ def build():
         for lab, vk in [
             ("pb  (FLAGSHIP, drift)", "pb"), ("pe_ttm", "pe_ttm"), ("ps_ttm", "ps_ttm"),
             ("evebit_ttm", "evebit_ttm"), ("fcfy_ttm", "fcfy_ttm"), ("pb_roe (=P/E proxy)", "pb_roe"),
+            ("peg (P/E / 1y growth)", "peg"), ("peg3 (P/E / 3y CAGR)", "peg3"),
             ("roe_gate (quality gate)", "roe_gate"), ("gpa_gate (gross-prof gate)", "gpa_gate"),
             ("pb_prof (cheap among profitable)", "pb_prof"), ("justified (P/B vs ROE-g)", "justified"),
             ("residual (below P/B~ROE line)", "residual"), ("resid_rk (robust)", "resid_rk"),
             ("upside (analyst target)", "upside"), ("upside_pb_60 (blend)", "upside_pb_60")]:
             _row(lab, dict(value_key=vk))
+        sys.exit(0)
+
+    if os.environ.get("PEG_LAB"):
+        # ── PEG gauntlet (user 2026-09-23 "try the peg ratio"). A/B on the REAL DEPLOYED flagship base
+        # (div4x conv=4.0 + drift + regime + tl_rsi entry tilt, ~215k), NOT the de-tuned no-entry base. Because a
+        # `value_key` branch BYPASSES the entry tilt, PEG is tested the CORRECT way: as the pool-RANKING gate
+        # (rank_panel=) that the tl_rsi entry then times among — so it stacks with, not replaces, the deployed
+        # entry logic. Controls: pure peg3 value_key (no entry) + peg3-pool ranked by raw P/B (isolate the
+        # profitable-3yr restriction from the growth-adjustment). FULL / OOS2020+ / cost / per-year. ──
+        import sys
+        import numpy as _np
+        FLAG = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", conv=4.0, entry="tl_rsi")
+        peg3_pool_pb_panel = pb.where(peg3_ttm.notna())   # raw P/B, masked to the PEG3-eligible (profitable-3yr) pool
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        # (label, kwargs) on the deployed flagship base
+        ROWS = [
+            ("FLAGSHIP pb+tl_rsi", dict()),                                  # the real deployed flagship
+            ("peg3-gate + tl_rsi", dict(rank_panel=peg3_ttm)),              # PEG3 ranks pool, tl_rsi times it
+            ("peg1-gate + tl_rsi", dict(rank_panel=peg_ttm)),
+            ("peg3pool-pb + tl_rsi", dict(rank_panel=peg3_pool_pb_panel)),   # same pool, ranked by raw P/B
+            ("peg3 value_key (no entry)", dict(value_key="peg3", entry=None)),  # pure selector, tilt off
+        ]
+        def _R(kw):
+            return run(True, True, **{**FLAG, **kw})
+        print("\n=== PEG_LAB (honest 2016-2026): PEG on the DEPLOYED flagship (conv4+drift+regime+tl_rsi) ===", flush=True)
+        res = {lab: _R(kw) for lab, kw in ROWS}
+        print(f"\n  {'variant':26}{'FULL':>11}{'OOS20+':>10}{'+25bps':>9}{'+50bps':>9}{'DD':>8}{'Shrp':>7}", flush=True)
+        for lab, kw in ROWS:
+            r = res[lab]
+            oos = _R({**kw, "start_date": "2020-01-01"})
+            c25 = _R({**kw, "cost_bps": 25}); c50 = _R({**kw, "cost_bps": 50})
+            print(f"  {lab:26}{r['total']:>11.0f}%{oos['total']:>9.0f}%{c25['total']:>8.0f}%"
+                  f"{c50['total']:>8.0f}%{r['dd']:>7.1f}%{r['sharpe']:>7.2f}", flush=True)
+        yrs = sorted({d[:4] for d, _ in res["FLAGSHIP pb+tl_rsi"]["monthly"]})
+        print(f"\n  per-yr %  " + "".join(f"{y[2:]:>6}" for y in yrs), flush=True)
+        for lab, kw in ROWS:
+            pr = res[lab]["monthly"]
+            print(f"  {lab[:20]:20}" + "".join(f"{_yr(pr,y):>6.0f}" for y in yrs), flush=True)
+        sys.exit(0)
+
+    if os.environ.get("SORTINO_LAB"):
+        # ── SortinoRSI ([[sortinorsitechnique]]) ported to the flagship as an ENTRY tilt (user 2026-09-23 "try
+        # applying it to the flagship"). The standalone is a breadth-driven dip-in-uptrend timer; here it TIMES the
+        # entry among the top-5 cheapest-P/B value names instead of tl_rsi. A/B on the REAL DEPLOYED base
+        # (conv=4.0 + drift + regime), varying only the entry rule, so it's measured against the deployed flagship
+        # (pb + tl_rsi) — same discipline as PEG_LAB. sortino_rsi = deepest-dip among armed+green; sortino_gate =
+        # cheapest armed+green. FULL / OOS2020+ / cost / DD / Sharpe / per-year. ──
+        import sys
+        import numpy as _np
+        FLAG = dict(country_ok=_is_usca, regime_switch="either", regime_signal="multi", conv=4.0)
+        def _yr(pairs, yr):
+            xs = [r for d, r in pairs if d[:4] == yr]
+            return (float(_np.prod([1 + r for r in xs]) - 1) * 100) if xs else 0.0
+        ROWS = [
+            ("FLAGSHIP pb+tl_rsi", dict(entry="tl_rsi")),
+            ("cheapest (no entry)", dict(entry=None)),
+            ("sortino_rsi (deep dip)", dict(entry="sortino_rsi")),
+            ("sortino_gate (cheap a+g)", dict(entry="sortino_gate")),
+        ]
+        def _R(kw):
+            return run(True, True, **{**FLAG, **kw})
+        print("\n=== SORTINO_LAB (honest 2016-2026): SortinoRSI as flagship entry (conv4+drift+regime) ===", flush=True)
+        res = {lab: _R(kw) for lab, kw in ROWS}
+        print(f"\n  {'variant':26}{'FULL':>11}{'OOS20+':>10}{'+25bps':>9}{'+50bps':>9}{'DD':>8}{'Shrp':>7}", flush=True)
+        for lab, kw in ROWS:
+            r = res[lab]
+            oos = _R({**kw, "start_date": "2020-01-01"})
+            c25 = _R({**kw, "cost_bps": 25}); c50 = _R({**kw, "cost_bps": 50})
+            print(f"  {lab:26}{r['total']:>11.0f}%{oos['total']:>9.0f}%{c25['total']:>8.0f}%"
+                  f"{c50['total']:>8.0f}%{r['dd']:>7.1f}%{r['sharpe']:>7.2f}", flush=True)
+        yrs = sorted({d[:4] for d, _ in res["FLAGSHIP pb+tl_rsi"]["monthly"]})
+        print(f"\n  per-yr %  " + "".join(f"{y[2:]:>6}" for y in yrs), flush=True)
+        for lab, kw in ROWS:
+            pr = res[lab]["monthly"]
+            print(f"  {lab[:20]:20}" + "".join(f"{_yr(pr,y):>6.0f}" for y in yrs), flush=True)
         sys.exit(0)
 
     if os.environ.get("EVENT_LAB"):
@@ -4944,6 +5087,21 @@ def build():
         except Exception as _e:
             print("save skipped:", _e, flush=True)
         sys.exit(0)
+
+    if os.environ.get("EXPORT_PANELS"):
+        # GENERIC research-data export (NOT strategy logic): pickle the expensive PIT panels + universe / sector maps
+        # so standalone research scripts can reuse them without re-deriving EDGAR-PIT fundamentals. Env EXPORT_PANELS=<path>.
+        import sys, pickle
+        _path = os.environ["EXPORT_PANELS"]
+        _bundle = dict(pb=pb, pe_ttm=pe_ttm, mktcap_usd=mktcap_usd, midx=midx, common=list(common),
+                       surv_sector=dict(surv_sector), delisted_sector=dict(delisted_sector),
+                       bankrupt_tk=set(bankrupt_tk), bench=BENCH)
+        with open(_path, "wb") as _fh:
+            pickle.dump(_bundle, _fh, protocol=4)
+        print(f"EXPORT_PANELS: wrote {_path} (pb{pb.shape} pe{pe_ttm.shape} mcap{mktcap_usd.shape} "
+              f"universe={len(common)} sectors={len(set(surv_sector.values()))})", flush=True)
+        sys.exit(0)
+
 
     if os.environ.get("RSWK30_AB"):
         # DEPLOYED A/B: does the weekly RS-30 entry tilt lift the flagship's actual TOTAL return? Same adaptive stack,

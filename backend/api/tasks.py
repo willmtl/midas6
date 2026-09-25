@@ -1251,7 +1251,11 @@ _EODHD_SUFFIX_REMAP = {
 }
 
 # Per-ticker overrides for edge cases the suffix map can't express (populate as needed).
-_EODHD_SYM_OVERRIDE = {}
+_EODHD_SYM_OVERRIDE = {
+    # crypto lives on EODHD's `.CC` exchange, NOT `.US` (BTC-USD.US 404s → BTC silently froze on the
+    # stale-data path). Map the kept crypto pair explicitly.
+    "BTC-USD": "BTC-USD.CC",
+}
 
 
 def _eodhd_sym(tk):

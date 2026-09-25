@@ -1,0 +1,1072 @@
+//@version=6
+indicator(
+     "DD Downside + Sortino + OHLC4 RSI",
+     shorttitle="DD Sortino OHLC4",
+     overlay=false,
+     max_labels_count=500
+)
+
+
+// =====================================================
+// 1. ROLLING SORTINO SETTINGS
+// =====================================================
+
+sortinoLength = input.int(
+     14,
+     "Rolling Sortino Window",
+     minval=1,
+     group="1. Rolling Sortino"
+)
+
+sortinoSmoothingLength = input.int(
+     14,
+     "Sortino SMA Smoothing",
+     minval=1,
+     group="1. Rolling Sortino"
+)
+
+sortinoRsiLength = input.int(
+     14,
+     "RSI of Sortino Length",
+     minval=1,
+     group="1. Rolling Sortino"
+)
+
+sortinoRsiEmaLength = input.int(
+     14,
+     "EMA of Sortino RSI",
+     minval=1,
+     group="1. Rolling Sortino"
+)
+
+riskFreeRate = input.float(
+     0.02,
+     "Annual Risk-Free Rate",
+     minval=0.0,
+     step=0.001,
+     group="1. Rolling Sortino"
+)
+
+confirmationWindow = input.int(
+     10,
+     "Bars Allowed After Bull Sortino Cross",
+     minval=0,
+     group="1. Rolling Sortino"
+)
+
+
+// =====================================================
+// 2. NORMAL RSI - OHLC4
+// =====================================================
+//
+// This is the NORMAL RSI used for SELL confirmation.
+//
+// Source:
+// OHLC4 = (O + H + L + C) / 4
+//
+
+normalRsiLength = input.int(
+     14,
+     "OHLC4 RSI Length",
+     minval=1,
+     group="2. OHLC4 RSI"
+)
+
+normalRsiMaLength = input.int(
+     14,
+     "OHLC4 RSI EMA Length",
+     minval=1,
+     group="2. OHLC4 RSI"
+)
+
+
+// =====================================================
+// 3. DD DOWNSIDE SCORE
+// =====================================================
+
+ddReturnLength = input.int(
+     14,
+     "Return EMA Length",
+     minval=2,
+     group="3. DD Downside Score"
+)
+
+ddDownsideLength = input.int(
+     14,
+     "Downside Risk Length",
+     minval=2,
+     group="3. DD Downside Score"
+)
+
+ddDrawdownLength = input.int(
+     60,
+     "Drawdown Lookback",
+     minval=5,
+     group="3. DD Downside Score"
+)
+
+ddWeight = input.float(
+     0.10,
+     "Drawdown Penalty Weight",
+     minval=0.0,
+     step=0.01,
+     group="3. DD Downside Score"
+)
+
+ddSmoothLength = input.int(
+     3,
+     "DD Score Smoothing",
+     minval=1,
+     group="3. DD Downside Score"
+)
+
+ddHardSell = input.float(
+     3.0,
+     "Hard Sell DD Score",
+     step=0.1,
+     group="3. DD Downside Score"
+)
+
+
+// =====================================================
+// 4. ULCER INDEX
+// =====================================================
+
+ulcerLength = input.int(
+     14,
+     "Ulcer Length",
+     minval=2,
+     group="4. Ulcer Index"
+)
+
+ulcerPeakLength = input.int(
+     14,
+     "Ulcer Peak Lookback",
+     minval=2,
+     group="4. Ulcer Index"
+)
+
+ulcerMinimum = input.float(
+     10.0,
+     "Minimum Ulcer For BUY",
+     minval=0.0,
+     step=0.5,
+     group="4. Ulcer Index"
+)
+
+
+// =====================================================
+// 5. DISPLAY
+// =====================================================
+
+showDD = input.bool(
+     true,
+     "Show DD Score",
+     group="5. Display"
+)
+
+showUlcer = input.bool(
+     false,
+     "Show Ulcer Index",
+     group="5. Display"
+)
+
+showReasons = input.bool(
+     true,
+     "Show Buy/Sell Reasons",
+     group="5. Display"
+)
+
+showSortinoCrosses = input.bool(
+     false,
+     "Show Sortino Cross Markers",
+     group="5. Display"
+)
+
+showNormalRsiCrosses = input.bool(
+     false,
+     "Show OHLC4 RSI Cross Markers",
+     group="5. Display"
+)
+
+
+// =====================================================
+// RISK-FREE RATE ADJUSTMENT
+// =====================================================
+//
+// Same method as your supplied Sortino script.
+//
+
+minutesPerYear = 525600.0
+
+barsPerYear =
+     minutesPerYear /
+     timeframe.multiplier
+
+adjustedRiskFreeRate =
+     math.pow(
+         1.0 + riskFreeRate,
+         1.0 / barsPerYear
+     ) - 1.0
+
+
+// =====================================================
+// ROLLING SORTINO
+// =====================================================
+//
+// Matches your original implementation:
+//
+// return
+// -> SMA return
+// -> STDEV of min(return, 0)
+// -> excess return / downside deviation
+// -> SMA 14 smoothing
+//
+
+currentDailyReturn =
+     ta.change(close) /
+     close[1]
+
+currentMeanReturn =
+     ta.sma(
+         currentDailyReturn,
+         sortinoLength
+     )
+
+currentDownsideReturn =
+     math.min(
+         currentDailyReturn,
+         0.0
+     )
+
+currentDownsideDeviation =
+     ta.stdev(
+         currentDownsideReturn,
+         sortinoLength
+     )
+
+currentExcessReturn =
+     currentMeanReturn -
+     adjustedRiskFreeRate
+
+currentSortinoRatio =
+     currentDownsideDeviation != 0.0
+     ? currentExcessReturn /
+       currentDownsideDeviation
+     : na
+
+
+// =====================================================
+// SMA 14 OF SORTINO
+// =====================================================
+
+smoothedSortino =
+     ta.sma(
+         currentSortinoRatio,
+         sortinoSmoothingLength
+     )
+
+
+// =====================================================
+// RSI 14 OF SORTINO
+// =====================================================
+
+sortinoRSI =
+     ta.rsi(
+         smoothedSortino,
+         sortinoRsiLength
+     )
+
+
+// =====================================================
+// EMA 14 OF SORTINO RSI
+// =====================================================
+
+sortinoRsiEMA =
+     ta.ema(
+         sortinoRSI,
+         sortinoRsiEmaLength
+     )
+
+
+// =====================================================
+// SORTINO CROSS EVENTS
+// =====================================================
+
+sortinoCrossUp =
+     barstate.isconfirmed and
+     ta.crossover(
+         sortinoRSI,
+         sortinoRsiEMA
+     )
+
+sortinoCrossDown =
+     barstate.isconfirmed and
+     ta.crossunder(
+         sortinoRSI,
+         sortinoRsiEMA
+     )
+
+
+// =====================================================
+// NORMAL RSI 14 OF OHLC4
+// =====================================================
+//
+// IMPORTANT:
+//
+// This is:
+//
+// RSI(14, OHLC4)
+//
+// NOT RSI of close.
+//
+
+normalRSI =
+     ta.rsi(
+         ohlc4,
+         normalRsiLength
+     )
+
+normalRsiEMA =
+     ta.ema(
+         normalRSI,
+         normalRsiMaLength
+     )
+
+
+// =====================================================
+// OHLC4 RSI CROSS EVENTS
+// =====================================================
+
+normalRsiCrossDown =
+     barstate.isconfirmed and
+     ta.crossunder(
+         normalRSI,
+         normalRsiEMA
+     )
+
+normalRsiCrossUp =
+     barstate.isconfirmed and
+     ta.crossover(
+         normalRSI,
+         normalRsiEMA
+     )
+
+normalRsiAbove =
+     normalRSI >
+     normalRsiEMA
+
+normalRsiBelow =
+     normalRSI <
+     normalRsiEMA
+
+
+// =====================================================
+// DD SCORE FUNCTION
+// =====================================================
+
+calcDDScore(src) =>
+
+    ret =
+         src / src[1] - 1.0
+
+
+    // Mean return
+    meanReturn =
+         ta.ema(
+             ret,
+             ddReturnLength
+         )
+
+
+    // Downside return
+    downsideReturn =
+         math.min(
+             ret,
+             0.0
+         )
+
+    downsideSquared =
+         downsideReturn *
+         downsideReturn
+
+
+    // Downside deviation
+    downsideVariance =
+         ta.ema(
+             downsideSquared,
+             ddDownsideLength
+         )
+
+    downsideDeviation =
+         math.sqrt(
+             downsideVariance
+         )
+
+
+    // Drawdown
+    highestClose =
+         ta.highest(
+             src,
+             ddDrawdownLength
+         )
+
+    drawdown =
+         highestClose > 0
+         ? src / highestClose - 1.0
+         : 0.0
+
+    absoluteDrawdown =
+         math.max(
+             -drawdown,
+             0.0
+         )
+
+
+    // Drawdown penalty
+    drawdownPenalty =
+         absoluteDrawdown *
+         ddWeight
+
+
+    // Total downside risk
+    totalRisk =
+         downsideDeviation +
+         drawdownPenalty
+
+
+    // Raw DD score
+    rawScore =
+         totalRisk > 0
+         ? meanReturn / totalRisk
+         : 0.0
+
+
+    // Smooth DD score
+    finalScore =
+         ta.ema(
+             rawScore,
+             ddSmoothLength
+         )
+
+    finalScore
+
+
+// =====================================================
+// DD SCORE
+// =====================================================
+
+ddScore =
+     calcDDScore(
+         close
+     )
+
+ddPositive =
+     ddScore > 0.0
+
+ddNegative =
+     ddScore < 0.0
+
+
+// =====================================================
+// ULCER INDEX
+// =====================================================
+
+ulcerPeak =
+     ta.highest(
+         close,
+         ulcerPeakLength
+     )
+
+ulcerDrawdown =
+     ulcerPeak > 0
+     ? 100.0 *
+       (close / ulcerPeak - 1.0)
+     : 0.0
+
+ulcerSquared =
+     ulcerDrawdown *
+     ulcerDrawdown
+
+ulcerIndex =
+     math.sqrt(
+         ta.sma(
+             ulcerSquared,
+             ulcerLength
+         )
+     )
+
+ulcerHigh =
+     ulcerIndex >
+     ulcerMinimum
+
+
+// =====================================================
+// BUY CROSS MEMORY
+// =====================================================
+
+var int bullCrossBar = na
+
+
+if sortinoCrossUp
+    bullCrossBar := bar_index
+
+
+// A bearish Sortino cross cancels an unconfirmed buy.
+if sortinoCrossDown
+    bullCrossBar := na
+
+
+// Expire old bullish setup.
+if not na(bullCrossBar)
+
+    if bar_index - bullCrossBar > confirmationWindow
+        bullCrossBar := na
+
+
+barsAfterBullCross =
+     not na(bullCrossBar)
+     ? bar_index - bullCrossBar
+     : na
+
+validBullCross =
+     not na(bullCrossBar) and
+     barsAfterBullCross >= 0 and
+     barsAfterBullCross <= confirmationWindow
+
+sortinoBullNow =
+     sortinoRSI >
+     sortinoRsiEMA
+
+
+// =====================================================
+// POSITION STATE
+// =====================================================
+
+var bool inPosition = false
+var int entryBar = na
+
+
+// =====================================================
+// BEARISH EXIT STATE
+// =====================================================
+//
+// The Sortino bearish cross happens FIRST.
+//
+// If OHLC4 RSI is already below its EMA,
+// RSI confirmation already exists.
+//
+// If OHLC4 RSI is still ABOVE its EMA,
+// wait until OHLC4 RSI crosses DOWN.
+//
+
+var bool bearishSortinoWarning = false
+
+var bool waitingForNormalRsi = false
+
+var int bearishSortinoBar = na
+
+
+// =====================================================
+// SORTINO CROSSES DOWN WHILE LONG
+// =====================================================
+
+if inPosition and
+   sortinoCrossDown
+
+    bearishSortinoWarning := true
+    bearishSortinoBar := bar_index
+
+    // Normal OHLC4 RSI is still bullish:
+    // WAIT for its bearish crossover.
+    if normalRsiAbove
+        waitingForNormalRsi := true
+
+    // Normal OHLC4 RSI is already bearish:
+    // No need to wait for another crossover.
+    else
+        waitingForNormalRsi := false
+
+
+// =====================================================
+// OHLC4 RSI LATER CROSSES DOWN
+// =====================================================
+//
+// Only matters after Sortino already warned.
+//
+
+if inPosition and
+   bearishSortinoWarning and
+   waitingForNormalRsi and
+   normalRsiCrossDown
+
+    waitingForNormalRsi := false
+
+
+// =====================================================
+// SORTINO RECOVERS BEFORE RSI CONFIRMS
+// =====================================================
+//
+// Cancel the pending normal exit if the Sortino RSI
+// crosses back above its EMA before confirmation.
+//
+
+if inPosition and
+   bearishSortinoWarning and
+   sortinoCrossUp
+
+    bearishSortinoWarning := false
+    waitingForNormalRsi := false
+    bearishSortinoBar := na
+
+
+// =====================================================
+// BUY RULE
+// =====================================================
+//
+// BUY:
+//
+// 1. RSI14 of smoothed Rolling Sortino14
+//    crossed above EMA14.
+//
+// 2. Cross occurred within previous 10 bars.
+//
+// 3. Sortino RSI remains above EMA.
+//
+// 4. DD Score > 0.
+//
+// 5. Ulcer Index > 10.
+//
+// Normal OHLC4 RSI is NOT used for entry.
+//
+
+buySignal =
+     barstate.isconfirmed and
+     not inPosition and
+     validBullCross and
+     sortinoBullNow and
+     ddPositive and
+     ulcerHigh
+
+
+// =====================================================
+// NORMAL SELL CONFIRMATION
+// =====================================================
+//
+// Sortino crossed DOWN first.
+//
+// If OHLC4 RSI was above EMA:
+//     wait for RSI cross down.
+//
+// If OHLC4 RSI was already below EMA:
+//     no waiting.
+//
+// DD must be < 0.
+//
+
+normalExitReady =
+     bearishSortinoWarning and
+     not waitingForNormalRsi and
+     normalRsiBelow
+
+
+normalSellSignal =
+     barstate.isconfirmed and
+     inPosition and
+     normalExitReady and
+     ddNegative
+
+
+// =====================================================
+// HARD DD >= 3 SELL
+// =====================================================
+//
+// Overrides everything.
+//
+// No Sortino cross required.
+// No OHLC4 RSI cross required.
+//
+
+hardDDSell =
+     barstate.isconfirmed and
+     inPosition and
+     not na(entryBar) and
+     bar_index > entryBar and
+     ddScore >= ddHardSell
+
+
+// =====================================================
+// FINAL SELL
+// =====================================================
+
+sellSignal =
+     normalSellSignal or
+     hardDDSell
+
+
+// =====================================================
+// EXECUTE BUY
+// =====================================================
+
+if buySignal
+
+    inPosition := true
+    entryBar := bar_index
+
+    bullCrossBar := na
+
+    bearishSortinoWarning := false
+    waitingForNormalRsi := false
+    bearishSortinoBar := na
+
+
+// =====================================================
+// EXECUTE SELL
+// =====================================================
+
+if sellSignal
+
+    inPosition := false
+    entryBar := na
+
+    bullCrossBar := na
+
+    bearishSortinoWarning := false
+    waitingForNormalRsi := false
+    bearishSortinoBar := na
+
+
+// =====================================================
+// BUY ON PRICE CHART
+// =====================================================
+
+plotshape(
+     buySignal,
+     title="BUY",
+     text="BUY",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.lime,
+     textcolor=color.black,
+     size=size.small,
+     force_overlay=true
+)
+
+
+// =====================================================
+// NORMAL SELL ON PRICE CHART
+// =====================================================
+
+plotshape(
+     normalSellSignal and
+     not hardDDSell,
+     title="SELL",
+     text="SELL",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=color.red,
+     textcolor=color.white,
+     size=size.small,
+     force_overlay=true
+)
+
+
+// =====================================================
+// DD3 HARD SELL
+// =====================================================
+
+plotshape(
+     hardDDSell,
+     title="DD3 SELL",
+     text="DD3 SELL",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=color.orange,
+     textcolor=color.black,
+     size=size.small,
+     force_overlay=true
+)
+
+
+// =====================================================
+// OPTIONAL SORTINO CROSS MARKERS
+// =====================================================
+
+plotshape(
+     showSortinoCrosses and
+     sortinoCrossUp,
+     title="Sortino Bull Cross",
+     text="S+",
+     style=shape.labelup,
+     location=location.bottom,
+     color=color.green,
+     textcolor=color.white,
+     size=size.tiny
+)
+
+plotshape(
+     showSortinoCrosses and
+     sortinoCrossDown,
+     title="Sortino Bear Cross",
+     text="S-",
+     style=shape.labeldown,
+     location=location.top,
+     color=color.red,
+     textcolor=color.white,
+     size=size.tiny
+)
+
+
+// =====================================================
+// OPTIONAL OHLC4 RSI CROSS MARKERS
+// =====================================================
+
+plotshape(
+     showNormalRsiCrosses and
+     normalRsiCrossDown,
+     title="OHLC4 RSI Cross Down",
+     text="R-",
+     style=shape.circle,
+     location=location.top,
+     color=color.red,
+     size=size.tiny
+)
+
+plotshape(
+     showNormalRsiCrosses and
+     normalRsiCrossUp,
+     title="OHLC4 RSI Cross Up",
+     text="R+",
+     style=shape.circle,
+     location=location.bottom,
+     color=color.green,
+     size=size.tiny
+)
+
+
+// =====================================================
+// BUY REASON IN PANE
+// =====================================================
+
+if showReasons and
+   buySignal
+
+    buyReason =
+         "BUY\n" +
+         "Sortino RSI crossed UP\n" +
+         "DD: " +
+         str.tostring(
+             ddScore,
+             "#.####"
+         ) +
+         " > 0\n" +
+         "Ulcer: " +
+         str.tostring(
+             ulcerIndex,
+             "#.##"
+         ) +
+         " > " +
+         str.tostring(
+             ulcerMinimum,
+             "#.0"
+         )
+
+    label.new(
+         bar_index,
+         ddScore,
+         buyReason,
+         style=label.style_label_up,
+         color=color.new(
+             color.green,
+             10
+         ),
+         textcolor=color.white,
+         size=size.small
+    )
+
+
+// =====================================================
+// NORMAL SELL REASON IN PANE
+// =====================================================
+
+if showReasons and
+   normalSellSignal and
+   not hardDDSell
+
+    sellReason =
+         "SELL\n" +
+         "Sortino RSI crossed DOWN\n" +
+         "OHLC4 RSI confirmed bearish\n" +
+         "OHLC4 RSI: " +
+         str.tostring(
+             normalRSI,
+             "#.##"
+         ) +
+         " < EMA " +
+         str.tostring(
+             normalRsiEMA,
+             "#.##"
+         ) +
+         "\nDD: " +
+         str.tostring(
+             ddScore,
+             "#.####"
+         ) +
+         " < 0"
+
+    label.new(
+         bar_index,
+         ddScore,
+         sellReason,
+         style=label.style_label_down,
+         color=color.new(
+             color.red,
+             10
+         ),
+         textcolor=color.white,
+         size=size.small
+    )
+
+
+// =====================================================
+// HARD DD3 SELL REASON
+// =====================================================
+
+if showReasons and
+   hardDDSell
+
+    hardSellReason =
+         "DD3 SELL\n" +
+         "DD Score: " +
+         str.tostring(
+             ddScore,
+             "#.####"
+         ) +
+         " >= " +
+         str.tostring(
+             ddHardSell,
+             "#.0"
+         )
+
+    label.new(
+         bar_index,
+         ddScore,
+         hardSellReason,
+         style=label.style_label_down,
+         color=color.new(
+             color.orange,
+             5
+         ),
+         textcolor=color.black,
+         size=size.small
+    )
+
+
+// =====================================================
+// MAIN PANE - DD SCORE
+// =====================================================
+
+plot(
+     showDD
+     ? ddScore
+     : na,
+     title="DD Downside Score",
+     color=color.blue,
+     linewidth=2
+)
+
+hline(
+     0,
+     title="DD Zero",
+     color=color.gray,
+     linestyle=hline.style_dotted
+)
+
+plot(
+     showDD
+     ? ddHardSell
+     : na,
+     title="DD Hard Sell Level",
+     color=color.orange,
+     linewidth=1
+)
+
+
+// =====================================================
+// OPTIONAL ULCER
+// =====================================================
+
+plot(
+     showUlcer
+     ? ulcerIndex
+     : na,
+     title="Ulcer Index",
+     color=color.fuchsia,
+     linewidth=2
+)
+
+plot(
+     showUlcer
+     ? ulcerMinimum
+     : na,
+     title="Ulcer BUY Minimum",
+     color=color.gray,
+     linewidth=1
+)
+
+
+// =====================================================
+// DATA WINDOW ONLY
+// =====================================================
+//
+// Sortino and RSI aren't drawn in the pane,
+// but you can inspect exact values in Data Window.
+//
+
+plot(
+     currentSortinoRatio,
+     title="Raw Rolling Sortino 14",
+     display=display.data_window
+)
+
+plot(
+     smoothedSortino,
+     title="SMA 14 Smoothed Sortino",
+     display=display.data_window
+)
+
+plot(
+     sortinoRSI,
+     title="RSI 14 of Sortino",
+     display=display.data_window
+)
+
+plot(
+     sortinoRsiEMA,
+     title="EMA 14 of Sortino RSI",
+     display=display.data_window
+)
+
+plot(
+     normalRSI,
+     title="RSI 14 OHLC4",
+     display=display.data_window
+)
+
+plot(
+     normalRsiEMA,
+     title="EMA 14 of RSI 14 OHLC4",
+     display=display.data_window
+)
+
+plot(
+     ddScore,
+     title="Exact DD Score Used",
+     display=display.data_window
+)
+
+plot(
+     ulcerIndex,
+     title="Exact Ulcer Index Used",
+     display=display.data_window
+)
