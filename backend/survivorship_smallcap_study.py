@@ -1359,7 +1359,7 @@ def build():
             regime_lookback=6, regime_signal="vs", regime_hyst=0, no_cash=False, book="value",
             conv=None, conc_regime=None, entry=None, entry_k=5, flow_gate=False, live=False, conv_signal="ad",
             wait_entry=None, small_max=None, lev_regime=None, small_min=0.0, min_dvol=None, rebal=1,
-            exclude_si_pct=None, sel_regime=None, rank_panel=None):
+            exclude_si_pct=None, sel_regime=None, rank_panel=None, lc_fill_below=None):
         rets, spies, dl_picks, mrets = [], [], 0, []
         _step = int(rebal) if rebal else 1                 # rebalance cadence in months (1=monthly, 3=quarterly)
         _min_dvol = float(min_dvol) if min_dvol is not None else MIN_DVOL   # $/day liquidity floor (executability)
@@ -1740,6 +1740,7 @@ def build():
                 return v <= pb_ceiling
 
             held = set(); wsum = rr = 0.0
+            _lc_deferred = []      # (etf, cheap-large-cap candidates) from skipped large-cap-only sectors, for conditional fill
             tr = None
             if trace is not None:
                 def _fwd(e):     # the sleeve ETF's OWN return over the hold month (buy date -> sell date)
@@ -1791,6 +1792,8 @@ def build():
                 if largecap_mode and _lc_only and not _lc_exempt:
                     # LARGE-CAP FALLBACK FIX (loser analysis: 58% of big losses were cheap-large-cap fallbacks).
                     if largecap_mode == "skip":
+                        if lc_fill_below is not None:   # save the cheap large-caps for a conditional thin-month fill
+                            _lc_deferred.append((etf, list(g0)))
                         sm = []; g0 = []               # skip large-cap-only sectors (concentrate elsewhere)
                     elif largecap_mode == "quality":   # require ROE>0 among the large-caps (drop value traps)
                         _q = [x for x in g0 if pd.notna(roe.loc[date, x]) and roe.loc[date, x] > 0]
@@ -2086,6 +2089,42 @@ def build():
                                         "weight": float(w), "ret": (float(r) if ndate is not None else None), "delisted": p in delisted_sector,
                                         "mae": (_pick_mae(p, date, ndate) if ndate is not None else None),
                                         "conviction": bool(accumulating(p, date))})
+            # CONDITIONAL LARGE-CAP FILL (user test 2026-09-30): if the small-cap book is too THIN this month
+            # (< lc_fill_below names), allow the cheapest-value LARGE-CAP from the highest-accel skipped sectors to
+            # fill up to lc_fill_below. Off by default (deployed unchanged); only bites in commodity-led months
+            # where the small-cap pool collapses to 0-1 names (avoids single-name concentration like the MUX month).
+            if lc_fill_below is not None and len(held) < lc_fill_below and _lc_deferred:
+                for _etf, _g0 in _lc_deferred:
+                    if len(held) >= lc_fill_below:
+                        break
+                    _cand = [x for x in _g0 if x not in held]
+                    if not _cand:
+                        continue
+                    p = _entry_pick(_cand)
+                    held.add(p)
+                    _dly = (stock_daily[p]["Close"] if (p in stock_daily and "Close" in stock_daily[p]) else None)
+                    r = 0.0 if ndate is None else _ret_delist(px_usd[p], date, ndate, daily=_dly)
+                    if ndate is not None and p in bankrupt_tk:
+                        _pn = px_usd[p]
+                        if not ((ndate in _pn.index) and pd.notna(_pn.loc[ndate]) and _pn.loc[ndate] > 0):
+                            r = -1.0
+                    if r is None or not np.isfinite(r):
+                        held.discard(p); continue
+                    _cv = accumulating(p, date); w = _conv if _cv else 1.0
+                    if ndate is not None:
+                        wsum += w; rr += w * float(r)
+                    if tr is not None:
+                        tr["picks"].append({"sector": etf_name.get(_etf, _etf) + " (lc-fill)", "etf": _etf, "ticker": p,
+                                            "company": NAMEMAP.get(p), "pb": _f(pb.loc[date, p]),
+                                            "pe": _f(pe_ttm.loc[date, p]), "roe": _f(roe_ttm.loc[date, p]),
+                                            "de": _f(de.loc[date, p]), "gpa": _f(gpa.loc[date, p]),
+                                            "rev_g": _f(rev_g.loc[date, p]), "ni": _f(ttm_ni.loc[date, p]),
+                                            "revenue": _f(revp.loc[date, p]), "mktcap_usd": _f(mktcap_usd.loc[date, p]),
+                                            "dvol_usd": _f(dvol_usd.loc[date, p]),
+                                            "weight": float(w), "ret": (float(r) if ndate is not None else None),
+                                            "delisted": p in delisted_sector,
+                                            "mae": (_pick_mae(p, date, ndate) if ndate is not None else None),
+                                            "conviction": bool(_cv)})
             if wsum <= 0 and no_cash:
                 # NEVER sit in full cash (user): when the whole month would be cash (every top sector skipped =
                 # deep risk-off), park in the top-accelerating BOND ETF. GAUNTLET 2026-09-14: BONDS-ONLY beats the
@@ -4865,6 +4904,9 @@ def build():
         _vk = os.environ.get("VALUE_KEY")
         if _vk:
             _kw = dict(_kw, value_key=_vk)          # override the within-sector selector (e.g. rswk30) for a trace dump
+        _lcf = os.environ.get("LC_FILL_BELOW")
+        if _lcf:
+            _kw = dict(_kw, lc_fill_below=int(_lcf))    # conditional large-cap thin-month fill A/B
         perf = run(True, True, country_ok=_is_usca, trace=tr, entry="tl_support", **_kw)  # tl_support ungated (REGAUNTLET 2026-09-14: +27% net, ties/wins 4/5 periods)
         out = {"computed_at": pd.Timestamp.utcnow().isoformat(), "arm": f"usca_small_{_ck}", "config": _ck,
                "perf": {k: perf.get(k) for k in ("total", "annual", "vs_spy", "sharpe", "dd", "t_stat", "months",
@@ -4876,6 +4918,8 @@ def build():
         suffix = "" if _ck == "adaptive" else f"_{_ck}"
         if _vk:
             suffix += f"_{_vk}"                      # keep the deployed flagship_history.json untouched
+        if _lcf:
+            suffix += f"_lcf{_lcf}"                  # conditional large-cap-fill A/B -> own file
         fp = Path(f"/app/.data/studies/flagship_history{suffix}.json")
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(json.dumps(out, indent=2, default=str))

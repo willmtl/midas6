@@ -44,10 +44,14 @@ DD_SMOOTH   = int(os.environ.get("DD_SMOOTH", 3))       # DD score: final EMA sm
 DD_HARD     = float(os.environ.get("DD_HARD", 3.0))     # hard-sell DD score
 ULCER_LEN   = int(os.environ.get("ULCER_LEN", 14))      # ulcer averaging length
 ULCER_PEAK  = int(os.environ.get("ULCER_PEAK", 14))     # ulcer peak lookback
-ULCER_MIN   = float(os.environ.get("ULCER_MIN", 10.0))  # minimum ulcer for a BUY (Pine gate = the user's chart)
+ULCER_MIN   = float(os.environ.get("ULCER_MIN", 0.0))   # USER 2026-09-25: REMOVE ulcer -> 0 disables the Pine ulcer entry gate
 
 MINVOL      = float(os.environ.get("MINVOL", 5e6))      # 63d median $ volume floor (scanner realism)
 MCAP_FLOOR  = float(os.environ.get("MCAP_FLOOR", 1e9))  # HARD PIT market-cap floor at entry (user: focus on $1B+ = tradeable)
+MKT_GATE    = int(os.environ.get("MKT_GATE", 1))        # USER 2026-09-25: only BUY when SPY's RSI is ABOVE its own moving average
+MKT_RSI_LEN = int(os.environ.get("MKT_RSI_LEN", 14))    # SPY RSI length
+MKT_MA_LEN  = int(os.environ.get("MKT_MA_LEN", 14))     # length of the RSI's moving average
+MKT_MA_TYPE = os.environ.get("MKT_MA_TYPE", "sma")      # sma | ema
 START_DATE  = os.environ.get("START_DATE", "2016-01-01")
 TOP_MCAP    = int(os.environ.get("TOP_MCAP", 0))        # 0 = whole universe; else PIT top-N by mcap
 SECTOR_FILTER = os.environ.get("SECTOR_FILTER", "")     # e.g. "XLK,XLC" to restrict
@@ -59,7 +63,7 @@ OUT_DIR     = "/app/.data/studies"
 #     The big trades (round-trip >= +50%) concentrate MONOTONICALLY in HIGH-ULCER x SMALLER-CAP names: ulcer>=30
 #     turns 1-in-4 into a +50% trade; mega-cap has NO tails (AMZN max ulcer ever = 11). So: ULCER FLOOR + drop
 #     mega. DD ceiling only dodges the dd>=3 one-bar traps (within high-ulcer it barely filters). ---
-SCAN_ULCER_MIN = float(os.environ.get("SCAN_ULCER_MIN", 14.0))   # TAIL lever: 14=wide net (catches 33% of all big trades), 20=concentrated (median +18%)
+SCAN_ULCER_MIN = float(os.environ.get("SCAN_ULCER_MIN", 5.0))    # USER 2026-09-25: try ulcer>5 (milder than the 14 tail lever)
 SCAN_DD_CEIL   = float(os.environ.get("SCAN_DD_CEIL", 2.5))      # only dodge the near-euphoric dd>=3 one-bar traps (keeps 100% of the tail)
 SCAN_MAXBAC    = int(os.environ.get("SCAN_MAXBAC", 0))           # 0 = off (bars_after_cross is NOT a tail lever)
 SCAN_EX_MICRO  = int(os.environ.get("SCAN_EX_MICRO", 0))         # 0 = off (MCAP_FLOOR already sets the bottom = $1B)
@@ -391,6 +395,17 @@ def main():
 
     start_i = int(np.searchsorted(days.values, np.datetime64(START_DATE)))
     n = len(days)
+    # MARKET GATE: only buy when SPY's own RSI is above its moving average (user 2026-09-25)
+    mkt_ok = np.ones(n, bool)
+    if MKT_GATE:
+        _spy = load_candles(["SPY"]).get("SPY", {}).get("Close")
+        if _spy is not None:
+            _spy = _spy.dropna(); _spy = _spy[_spy > 0]
+            _sr = wilder_rsi(_spy, MKT_RSI_LEN)                        # RSI on SPY's NATIVE bars (not reindexed)
+            _ma = ema(_sr, MKT_MA_LEN) if MKT_MA_TYPE == "ema" else _sr.rolling(MKT_MA_LEN).mean()
+            mkt_ok = (_sr > _ma).reindex(days, method="ffill").fillna(False).to_numpy()  # map to trading days
+            _win = days >= pd.Timestamp(START_DATE)                    # report buyable% over the ACTUAL entry window (SPY exists 2015+)
+            print(f"MKT_GATE on: SPY RSI{MKT_RSI_LEN} > {MKT_MA_TYPE.upper()}{MKT_MA_LEN} -> buyable on {mkt_ok[_win].mean()*100:.0f}% of days (>= {START_DATE})", flush=True)
     last_valid = np.where(valid_np.any(axis=0), n - 1 - np.argmax(valid_np[::-1], axis=0), -1)  # last real bar per name
     entries = []
     port_trips = []                                                   # (c, ei, xi, is_bank, ulcer) for TUNED entries (momentum-gated) -> portfolio
@@ -414,6 +429,8 @@ def main():
             mc_ei = capd_np[ei, c] if capd is not None else np.nan
             if MCAP_FLOOR > 0 and not (np.isfinite(mc_ei) and mc_ei >= MCAP_FLOOR):
                 continue                                              # HARD $1B+ PIT floor (tradeable universe)
+            if MKT_GATE and not mkt_ok[ei]:
+                continue                                              # only buy when SPY RSI > its average
             ep = close_np[ei, c]
             if not (ep > 0):
                 continue
@@ -471,7 +488,8 @@ def main():
         gates_ok = (dd[last, c] > 0) and (ulcer[last, c] > ULCER_MIN) and (s_[last] > se_[last])
         mc_last = capd_np[last, c] if capd is not None else np.nan
         liq_ok = (dvol_np[last, c] >= MINVOL and (top_ok is None or top_ok[last, c])
-                  and (MCAP_FLOOR <= 0 or (np.isfinite(mc_last) and mc_last >= MCAP_FLOOR)))
+                  and (MCAP_FLOOR <= 0 or (np.isfinite(mc_last) and mc_last >= MCAP_FLOOR))
+                  and (not MKT_GATE or mkt_ok[last]))
         row = dict(ticker=t, sector=SECTOR_NAME.get(sec, sec or "?"), date=str(days[last].date()),
                    dd_score=round(float(dd[last, c]), 3), ulcer=round(float(ulcer[last, c]), 2),
                    srsi=round(float(s_[last]), 1), srsi_ema=round(float(se_[last]), 1),
